@@ -81,7 +81,7 @@ import propagation as pipe
 import synthetic as syn
 
 
-APP_TITLE = "FI -> NO3 FB Propagation Dashboard"
+APP_TITLE = "Flow-Based Propagation Dashboard"
 DEFAULT_OUT_DIR = str(Path.home() / "fb_no3_output")
 
 
@@ -97,6 +97,10 @@ class App:
         self.results: dict | None = None
         self.last_jao_path: str = ""
         self.last_outage_path: str = ""
+
+        # Configurable source country and target zone
+        self.source_country = tk.StringVar(value="FI")
+        self.target_zone    = tk.StringVar(value="NO3")
 
         # styles
         s = ttk.Style(self.root)
@@ -207,9 +211,36 @@ class App:
                   style="Hint.TLabel", wraplength=900).grid(
             row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
+        # --- Analysis scope (source country + target zone) ---
+        scope = ttk.LabelFrame(f, text="Analysis scope  (what to study)", padding=10)
+        scope.grid(row=4, column=0, columnspan=3, sticky="ew", padx=12, pady=4)
+        scope.columnconfigure(1, weight=0); scope.columnconfigure(3, weight=0)
+
+        ttk.Label(scope, text="Outage source country (ENTSO-E code):").grid(
+            row=0, column=0, sticky="w")
+        src_cb = ttk.Combobox(scope, textvariable=self.source_country, width=8,
+                              state="normal",
+                              values=["FI","NO","SE","DK","EE","LV","LT","DE","PL","NL","GB"])
+        src_cb.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(scope,
+                  text="(e.g. FI = fetch Finnish outages; NO = Norwegian outages)",
+                  style="Hint.TLabel").grid(row=0, column=2, sticky="w", padx=8)
+
+        ttk.Label(scope, text="Target bidding zone (CNECs to analyse):").grid(
+            row=1, column=0, sticky="w", pady=(6,0))
+        tgt_cb = ttk.Combobox(scope, textvariable=self.target_zone, width=8,
+                              state="normal",
+                              values=["NO3","NO1","NO2","NO4","NO5",
+                                      "SE1","SE2","SE3","SE4",
+                                      "DK1","DK2","EE","LV","LT","FI","DE","PL","NL"])
+        tgt_cb.grid(row=1, column=1, sticky="w", padx=6, pady=(6,0))
+        ttk.Label(scope,
+                  text="(filters JAO CNECs and sets PTDF column; default NO3)",
+                  style="Hint.TLabel").grid(row=1, column=2, sticky="w", padx=8, pady=(6,0))
+
         # --- Output folder ---
         of = ttk.LabelFrame(f, text="Output folder", padding=10)
-        of.grid(row=4, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
+        of.grid(row=5, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
         of.columnconfigure(1, weight=1)
         self.out_dir_var = tk.StringVar(value=DEFAULT_OUT_DIR)
         ttk.Entry(of, textvariable=self.out_dir_var).grid(row=0, column=1, sticky="ew", padx=6)
@@ -218,7 +249,7 @@ class App:
 
         # --- Status panel ---
         sp = ttk.LabelFrame(f, text="Loaded data status", padding=10)
-        sp.grid(row=5, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
+        sp.grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
         self.status_jao = tk.StringVar(value="No JAO data loaded")
         self.status_out = tk.StringVar(value="No outage data")
         ttk.Label(sp, textvariable=self.status_jao).pack(anchor="w")
@@ -491,8 +522,10 @@ class App:
             log = self._outage_log
 
             if self.use_entsoe.get():
+                cc = self.source_country.get().strip().upper() or "FI"
                 df = pipe.fetch_entsoe_outages(
-                    self.start_utc.get(), self.end_utc.get(), log_cb=log)
+                    self.start_utc.get(), self.end_utc.get(),
+                    log_cb=log, country_code=cc)
                 if not df.empty: collected.append(df)
 
             if self.use_manual.get():
@@ -579,7 +612,10 @@ class App:
                 end_utc=self.end_utc.get(),
                 use_entsoe=self.use_entsoe.get(),
                 use_manual=self.use_manual.get(),
+                source_country=self.source_country.get().strip().upper() or "FI",
+                target_zone=self.target_zone.get().strip().upper() or "NO3",
             )
+            self._log(f"Analysis scope: source={cfg.source_country}  target={cfg.target_zone}")
             res = pipe.run_pipeline(cfg, jao_df=self.jao_df,
                                     outages_df=self.outages_df,
                                     log_cb=self._log)
@@ -853,14 +889,20 @@ class App:
 
     def _plot_violin(self):
         no3 = self.results["no3"]
-        if "fi_forced_outage_active" not in no3.columns:
+        # Use dynamic source prefix from results
+        _src_v = self.results.get("source_country", self.source_country.get() or "FI").lower()
+        forced_col = f"{_src_v}_forced_outage_active"
+        if forced_col not in no3.columns:
+            # fallback
+            forced_col = next((c for c in no3.columns if c.endswith("_forced_outage_active")), None)
+        if forced_col is None:
             self.fig.text(0.5, 0.5, "Run analysis first", ha="center")
             return
         ax_specs = [("f0","F0 (MW)"), ("ptdf_FI","PTDF_FI"), ("ram","RAM (MW)")]
         for i, (col, label) in enumerate(ax_specs):
             ax = self.fig.add_subplot(1, 3, i+1)
-            data_no = no3.loc[no3["fi_forced_outage_active"]==0, col].dropna().values
-            data_yes = no3.loc[no3["fi_forced_outage_active"]==1, col].dropna().values
+            data_no = no3.loc[no3[forced_col]==0, col].dropna().values
+            data_yes = no3.loc[no3[forced_col]==1, col].dropna().values
             if len(data_no) == 0 and len(data_yes) == 0:
                 ax.text(0.5, 0.5, "no data", ha="center"); continue
             data = []
@@ -880,12 +922,16 @@ class App:
     def _plot_scatter(self):
         no3 = self.results["no3"]
         ax = self.fig.add_subplot(111)
-        if "fi_gen_outage_mw_lost" not in no3.columns:
+        _src_s = self.results.get("source_country", self.source_country.get() or "FI").lower()
+        gen_col  = f"{_src_s}_gen_outage_mw_lost"
+        hvdc_col = f"{_src_s}_hvdc_outage_mw_lost"
+        ac_col   = f"{_src_s}_ac_outage_mw_lost"
+        if gen_col not in no3.columns:
             ax.text(0.5, 0.5, "Run analysis first", ha="center"); return
         df = no3.copy()
-        df["total_mw"] = (df.get("fi_gen_outage_mw_lost",0).fillna(0) +
-                          df.get("fi_hvdc_outage_mw_lost",0).fillna(0) +
-                          df.get("fi_ac_outage_mw_lost",0).fillna(0))
+        df["total_mw"] = (df.get(gen_col,  pd.Series(0, index=df.index)).fillna(0) +
+                          df.get(hvdc_col, pd.Series(0, index=df.index)).fillna(0) +
+                          df.get(ac_col,   pd.Series(0, index=df.index)).fillna(0))
         if df["total_mw"].max() < 1:
             ax.text(0.5, 0.5, "No outages active in JAO window", ha="center"); return
         if "f0" not in df.columns:
@@ -898,9 +944,10 @@ class App:
             s = sub[sub["cneName"] == c]
             ax.scatter(s["total_mw"], s["dF0"], s=12, alpha=0.5,
                        color=cmap(i % 10), label=c[:40])
-        ax.set_xlabel("Total MW lost (FI outages)")
+        _tgt_s = self.results.get("target_zone", self.target_zone.get() or "NO3")
+        ax.set_xlabel(f"Total MW lost ({_src_s.upper()} outages)")
         ax.set_ylabel("ΔF0 vs CNEC median (MW)")
-        ax.set_title("ΔF0 on NO3 CNECs vs FI outage MW lost")
+        ax.set_title(f"ΔF0 on {_tgt_s} CNECs vs {_src_s.upper()} outage MW lost")
         ax.grid(True, ls=":", alpha=0.4)
         ax.legend(fontsize=7, loc="best", ncol=2)
 
@@ -1304,6 +1351,11 @@ class App:
         logit = res.get("logit", {})
         t     = self.explain_text
 
+        # Dynamic column-name prefix from source country
+        _src = res.get("source_country", self.source_country.get() or "FI").lower()
+        _tgt = res.get("target_zone",    self.target_zone.get()    or "NO3")
+        _SRC = _src.upper()
+
         # ── helpers ─────────────────────────────────────────────────────────
         def _coef(reg_name, param):
             """Return (beta, p) or (None, None)."""
@@ -1349,23 +1401,23 @@ class App:
         n_cnecs  = no3["cneName"].nunique() if no3 is not None else 0
         n_obs    = len(no3) if no3 is not None else 0
 
-        # ── extract key coefficients ─────────────────────────────────────────
-        b_hvdc_fall, p_hvdc_fall = _coef("fall_signed", "fi_hvdc_outage_active")
-        b_ac_fall,   p_ac_fall   = _coef("fall_signed", "fi_ac_line_outage_active")
-        b_gen_fall,  p_gen_fall  = _coef("fall_signed", "fi_gen_outage_mw_lost")
+        # ── extract key coefficients (dynamic: use _src prefix) ─────────────
+        b_hvdc_fall, p_hvdc_fall = _coef("fall_signed", f"{_src}_hvdc_outage_active")
+        b_ac_fall,   p_ac_fall   = _coef("fall_signed", f"{_src}_ac_line_outage_active")
+        b_gen_fall,  p_gen_fall  = _coef("fall_signed", f"{_src}_gen_outage_mw_lost")
 
-        b_hvdc_ptdf, p_hvdc_ptdf = _coef("ptdf_FI_abs", "fi_hvdc_outage_active")
-        b_ac_ptdf,   p_ac_ptdf   = _coef("ptdf_FI_abs", "fi_ac_line_outage_active")
+        b_hvdc_ptdf, p_hvdc_ptdf = _coef("ptdf_FI_abs", f"{_src}_hvdc_outage_active")
+        b_ac_ptdf,   p_ac_ptdf   = _coef("ptdf_FI_abs", f"{_src}_ac_line_outage_active")
 
-        b_hvdc_ram,  p_hvdc_ram  = _coef("ram", "fi_hvdc_outage_active")
-        b_ac_ram,    p_ac_ram    = _coef("ram", "fi_ac_line_outage_active")
-        b_gen_ram,   p_gen_ram   = _coef("ram", "fi_gen_outage_mw_lost")
+        b_hvdc_ram,  p_hvdc_ram  = _coef("ram", f"{_src}_hvdc_outage_active")
+        b_ac_ram,    p_ac_ram    = _coef("ram", f"{_src}_ac_line_outage_active")
+        b_gen_ram,   p_gen_ram   = _coef("ram", f"{_src}_gen_outage_mw_lost")
 
-        b_hvdc_sp,   p_hvdc_sp   = _coef("shadowPrice", "fi_hvdc_outage_active")
-        b_forced_sp, p_forced_sp = _coef("shadowPrice", "fi_forced_outage_active")
+        b_hvdc_sp,   p_hvdc_sp   = _coef("shadowPrice", f"{_src}_hvdc_outage_active")
+        b_forced_sp, p_forced_sp = _coef("shadowPrice", f"{_src}_forced_outage_active")
 
-        b_frm_hvdc,  p_frm_hvdc  = _coef("frm", "fi_hvdc_outage_active")
-        b_frm_ac,    p_frm_ac    = _coef("frm", "fi_ac_line_outage_active")
+        b_frm_hvdc,  p_frm_hvdc  = _coef("frm", f"{_src}_hvdc_outage_active")
+        b_frm_ac,    p_frm_ac    = _coef("frm", f"{_src}_ac_line_outage_active")
 
         # ── count supported hypotheses for headline ───────────────────────────
         supported = sum(
@@ -1381,11 +1433,11 @@ class App:
         t.delete("1.0", "end")
 
         # ── TITLE ────────────────────────────────────────────────────────────
-        w("FI → NO3 Propagation  —  Plain-language findings\n", "title"); nl()
-        w(f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} NO3 CNECs  |  "
+        w(f"{_SRC} → {_tgt} Propagation  —  Plain-language findings\n", "title"); nl()
+        w(f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} {_tgt} CNECs  |  "
           f"Avg RAM {avg_ram:.0f} MW  |  "
           f"Avg |fall| {avg_fall:.0f} MW\n" if avg_ram and avg_fall else
-          f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} NO3 CNECs\n", "muted")
+          f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} {_tgt} CNECs\n", "muted")
         nl()
 
         # ── OVERALL FINDING ───────────────────────────────────────────────────
@@ -1401,28 +1453,28 @@ class App:
             if b_hvdc_fall is not None and p_hvdc_fall < 0.10:
                 direction = "increases" if b_hvdc_fall > 0 else "decreases"
                 lines.append(
-                    f"FI HVDC outages {direction} reference flow on NO3 CNECs "
+                    f"{_SRC} HVDC outages {direction} reference flow on {_tgt} CNECs "
                     f"by {abs(b_hvdc_fall):.1f} MW on average "
                     f"({_pct(b_hvdc_fall, avg_fall)} of typical loading)")
             if b_ac_ptdf is not None and p_ac_ptdf < 0.10:
                 lines.append(
-                    f"FI AC line outages shift NO3 PTDF sensitivities to Finnish "
-                    f"injections by {abs(b_ac_ptdf):.4f} p.u. — the topology "
-                    f"change redistributes AC flows through the NO3 corridor")
+                    f"{_SRC} AC line outages shift {_tgt} PTDF sensitivities "
+                    f"by {abs(b_ac_ptdf):.4f} p.u. — the topology "
+                    f"change redistributes AC flows through the {_tgt} corridor")
             if b_hvdc_ram is not None and p_hvdc_ram < 0.10:
                 direction = "reduces" if b_hvdc_ram < 0 else "increases"
                 lines.append(
-                    f"Available margin (RAM) on NO3 {direction} by "
-                    f"{abs(b_hvdc_ram):.1f} MW during FI HVDC outages "
+                    f"Available margin (RAM) on {_tgt} {direction} by "
+                    f"{abs(b_hvdc_ram):.1f} MW during {_SRC} HVDC outages "
                     f"({_pct(b_hvdc_ram, avg_ram)} of avg RAM)")
             if lines:
                 w(f"{supported} of {total_testable} testable hypotheses are supported. ", "body")
                 w("  ".join(lines) + ".\n", "body")
             else:
                 w(f"{supported} of {total_testable} testable hypotheses supported. "
-                  "No propagation channel reached statistical significance at p<0.10 "
-                  "— either the effect is too small for the available sample, or FI "
-                  "outages do not systematically load the NO3 corridor in this window.\n",
+                  f"No propagation channel reached statistical significance at p<0.10 "
+                  f"— either the effect is too small for the available sample, or {_SRC} "
+                  f"outages do not systematically load the {_tgt} corridor in this window.\n",
                   "body")
         nl()
 
@@ -1431,15 +1483,15 @@ class App:
         w("SCORECARD\n", "section")
         rule()
         scorecard = [
-            ("H1", "HVDC outage → F_allReference shift",
+            ("H1", f"{_SRC} HVDC outage → F_allReference shift",
              b_hvdc_fall, p_hvdc_fall),
-            ("H2", "AC line outage → |PTDF_FI| shift",
+            ("H2", f"{_SRC} AC line outage → |PTDF_{_SRC}| shift",
              b_ac_ptdf,   p_ac_ptdf),
-            ("H3", "HVDC outage → RAM change",
+            ("H3", f"{_SRC} HVDC outage → RAM change",
              b_hvdc_ram,  p_hvdc_ram),
-            ("H4", "Forced outage → shadow price change",
+            ("H4", f"{_SRC} forced outage → shadow price change",
              b_forced_sp, p_forced_sp),
-            ("H5", "Forced > planned → IVA trigger (logit)",
+            ("H5", f"{_SRC} forced > planned → IVA trigger (logit)",
              None, None),   # handled separately
             ("H6", "FRM unchanged [placebo]",
              b_frm_hvdc,  p_frm_hvdc),
@@ -1466,24 +1518,24 @@ class App:
         # ── PER-HYPOTHESIS DEEP DIVES ─────────────────────────────────────────
         # ── H1 ───────────────────────────────────────────────────────────────
         rule()
-        w("H1  —  Does a FI HVDC outage shift F_allReference on NO3 CNECs?\n", "section")
+        w(f"H1  —  Does a {_SRC} HVDC outage shift F_allReference on {_tgt} CNECs?\n", "section")
         rule()
         icon, tag, lbl = _tier(b_hvdc_fall, p_hvdc_fall)
         w(f"  Verdict: {icon} {lbl}\n", tag); nl()
         w("  Physical mechanism\n", "label")
-        w("  When Fenno-Skan or Estlink trips, the AC network must absorb the\n"
-          "  power imbalance. Depending on the FI net position at the time:\n"
-          "  • FI was net importer → sudden loss of import → FI price spikes,\n"
-          "    AC flows from NO4/SE1 increase → NO3 corridor loads up.\n"
-          "  • FI was net exporter → export disrupted → less transit through\n"
-          "    SE1/SE2/NO3 → corridor relieves.\n"
-          "  The sign of β tells you which regime dominated in your dataset.\n\n",
+        w(f"  When a {_SRC} HVDC link trips, the AC network must absorb the\n"
+          f"  power imbalance. Depending on the {_SRC} net position at the time:\n"
+          f"  • {_SRC} was net importer → sudden loss of import → {_SRC} price spikes,\n"
+          f"    AC flows reroute → {_tgt} corridor may load up.\n"
+          f"  • {_SRC} was net exporter → export disrupted → less AC transit\n"
+          f"    through {_tgt} → corridor relieves.\n"
+          f"  The sign of β tells you which regime dominated in your dataset.\n\n",
           "body")
         w("  What the numbers say\n", "label")
         for param, label, beta, p in [
-            ("fi_hvdc_outage_active",   "HVDC outage (binary)",  b_hvdc_fall, p_hvdc_fall),
-            ("fi_ac_line_outage_active","AC line outage (binary)",b_ac_fall,   p_ac_fall),
-            ("fi_gen_outage_mw_lost",   "Generator MW lost",     b_gen_fall,  p_gen_fall),
+            (f"{_src}_hvdc_outage_active",   "HVDC outage (binary)",  b_hvdc_fall, p_hvdc_fall),
+            (f"{_src}_ac_line_outage_active","AC line outage (binary)",b_ac_fall,   p_ac_fall),
+            (f"{_src}_gen_outage_mw_lost",   "Generator MW lost",     b_gen_fall,  p_gen_fall),
         ]:
             if beta is None:
                 w(f"    {label:35s}  —  no result\n", "muted")
@@ -1495,29 +1547,29 @@ class App:
         w("  Operational implication\n", "label")
         if b_hvdc_fall is not None and p_hvdc_fall < 0.10:
             direction = "tightens" if b_hvdc_fall > 0 else "relieves"
-            w(f"  The NO3 corridor {direction} during FI HVDC outages. "
-              f"TSOs should pre-check NO3 CNEC headroom before approving "
-              f"maintenance schedules that coincide with high FI net import.\n\n", "body")
+            w(f"  The {_tgt} corridor {direction} during {_SRC} HVDC outages. "
+              f"TSOs should pre-check {_tgt} CNEC headroom before approving "
+              f"maintenance schedules that coincide with high {_SRC} net import.\n\n", "body")
         else:
-            w("  No statistically detectable systematic loading of the NO3 corridor "
-              "was found for HVDC outages in this dataset window.\n\n", "body")
+            w(f"  No statistically detectable systematic loading of the {_tgt} corridor "
+              f"was found for {_SRC} HVDC outages in this dataset window.\n\n", "body")
 
         # ── H2 ───────────────────────────────────────────────────────────────
         rule()
-        w("H2  —  Does a FI AC line outage shift |PTDF_FI| on NO3 CNECs?\n", "section")
+        w(f"H2  —  Does a {_SRC} AC line outage shift |PTDF_{_SRC}| on {_tgt} CNECs?\n", "section")
         rule()
         icon, tag, lbl = _tier(b_ac_ptdf, p_ac_ptdf)
         w(f"  Verdict: {icon} {lbl}\n", tag); nl()
         w("  Physical mechanism\n", "label")
-        w("  A FI internal 400 kV line outage changes the Finnish network\n"
-          "  impedance matrix. ENTSO-E recomputes PTDFs for the next MTU.\n"
-          "  If the lost line carried significant transit, NO3 CNECs may\n"
-          "  become more sensitive (larger |PTDF_FI|) to Finnish injections\n"
-          "  — meaning future FI outages will have greater NO3 impact.\n\n", "body")
+        w(f"  A {_SRC} internal transmission line outage changes the network\n"
+          f"  impedance matrix. ENTSO-E recomputes PTDFs for the next MTU.\n"
+          f"  If the lost line carried significant transit, {_tgt} CNECs may\n"
+          f"  become more sensitive (larger |PTDF_{_SRC}|) to {_SRC} injections\n"
+          f"  — meaning future {_SRC} outages will have greater {_tgt} impact.\n\n", "body")
         w("  What the numbers say\n", "label")
         for param, label, beta, p in [
-            ("fi_ac_line_outage_active","AC line outage (binary)", b_ac_ptdf,  p_ac_ptdf),
-            ("fi_hvdc_outage_active",   "HVDC outage (binary)",   b_hvdc_ptdf, p_hvdc_ptdf),
+            (f"{_src}_ac_line_outage_active","AC line outage (binary)", b_ac_ptdf,  p_ac_ptdf),
+            (f"{_src}_hvdc_outage_active",   "HVDC outage (binary)",   b_hvdc_ptdf, p_hvdc_ptdf),
         ]:
             if beta is None:
                 w(f"    {label:35s}  —  no result\n", "muted")
@@ -1527,29 +1579,29 @@ class App:
         nl()
         w("  Operational implication\n", "label")
         if b_ac_ptdf is not None and p_ac_ptdf < 0.10:
-            w(f"  FI AC line outages measurably change PTDF_FI on NO3 CNECs. "
-              f"This means the sensitivity of NO3 capacity to Finnish scheduling "
-              f"changes with FI topology — relevant for the FB domain computation.\n\n", "body")
+            w(f"  {_SRC} AC line outages measurably change PTDF_{_SRC} on {_tgt} CNECs. "
+              f"This means the sensitivity of {_tgt} capacity to {_SRC} scheduling "
+              f"changes with {_SRC} topology — relevant for the FB domain computation.\n\n", "body")
         else:
-            w("  No significant PTDF shift detected. FI AC outages in this sample "
-              "did not systematically alter NO3 sensitivity to FI injections.\n\n", "body")
+            w(f"  No significant PTDF shift detected. {_SRC} AC outages in this sample "
+              f"did not systematically alter {_tgt} sensitivity to {_SRC} injections.\n\n", "body")
 
         # ── H3 ───────────────────────────────────────────────────────────────
         rule()
-        w("H3  —  Does a FI outage change Available Margin (RAM) on NO3 CNECs?\n", "section")
+        w(f"H3  —  Does a {_SRC} outage change Available Margin (RAM) on {_tgt} CNECs?\n", "section")
         rule()
         icon, tag, lbl = _tier(b_hvdc_ram, p_hvdc_ram)
         w(f"  Verdict: {icon} {lbl}\n", tag); nl()
         w("  Physical mechanism\n", "label")
-        w("  RAM = Fmax − FRM − fall + fnrao + AMR − FAAC − IVA\n"
-          "  A FI outage that loads the corridor (fall↑) directly reduces RAM.\n"
-          "  A FI outage that relieves the corridor (fall↓) increases RAM.\n"
-          "  Forced outages may also trigger IVA adjustments (see H5).\n\n", "body")
+        w(f"  RAM = Fmax − FRM − fall + fnrao + AMR − FAAC − IVA\n"
+          f"  A {_SRC} outage that loads the corridor (fall↑) directly reduces RAM.\n"
+          f"  A {_SRC} outage that relieves the corridor (fall↓) increases RAM.\n"
+          f"  Forced outages may also trigger IVA adjustments (see H5).\n\n", "body")
         w("  What the numbers say\n", "label")
         for param, label, beta, p in [
-            ("fi_hvdc_outage_active",   "HVDC outage",   b_hvdc_ram, p_hvdc_ram),
-            ("fi_ac_line_outage_active","AC line outage", b_ac_ram,   p_ac_ram),
-            ("fi_gen_outage_mw_lost",   "Generator MW lost", b_gen_ram, p_gen_ram),
+            (f"{_src}_hvdc_outage_active",   "HVDC outage",       b_hvdc_ram, p_hvdc_ram),
+            (f"{_src}_ac_line_outage_active","AC line outage",     b_ac_ram,   p_ac_ram),
+            (f"{_src}_gen_outage_mw_lost",   "Generator MW lost", b_gen_ram,  p_gen_ram),
         ]:
             if beta is None:
                 w(f"    {label:35s}  —  no result\n", "muted")
@@ -1562,18 +1614,18 @@ class App:
         if b_hvdc_ram is not None and p_hvdc_ram < 0.10:
             if b_hvdc_ram < 0:
                 w(f"  RAM shrinks by {abs(b_hvdc_ram):.1f} MW ({_pct(b_hvdc_ram, avg_ram)} "
-                  f"of avg) during FI HVDC outages. If RAM was already near zero, the CNEC\n"
+                  f"of avg) during {_SRC} HVDC outages. If RAM was already near zero, the CNEC\n"
                   f"  becomes binding, restricting cross-border capacity and raising prices.\n\n",
                   "body")
             else:
-                w(f"  RAM grows by {b_hvdc_ram:.1f} MW during FI HVDC outages — "
+                w(f"  RAM grows by {b_hvdc_ram:.1f} MW during {_SRC} HVDC outages — "
                   f"the outage relieves the corridor, potentially un-binding CNECs.\n\n", "body")
         else:
-            w("  No significant RAM change detected for HVDC outages.\n\n", "body")
+            w(f"  No significant RAM change detected for {_SRC} HVDC outages.\n\n", "body")
 
         # ── H4 ───────────────────────────────────────────────────────────────
         rule()
-        w("H4  —  Does a FI outage change shadow prices on binding NO3 CNECs?\n", "section")
+        w(f"H4  —  Does a {_SRC} outage change shadow prices on binding {_tgt} CNECs?\n", "section")
         rule()
         icon, tag, lbl = _tier(b_forced_sp, p_forced_sp)
         w(f"  Verdict: {icon} {lbl}\n", tag); nl()
@@ -1598,7 +1650,7 @@ class App:
 
         # ── H5 ───────────────────────────────────────────────────────────────
         rule()
-        w("H5  —  Are forced FI outages more likely to trigger IVA on NO3 CNECs?\n", "section")
+        w(f"H5  —  Are forced {_SRC} outages more likely to trigger IVA on {_tgt} CNECs?\n", "section")
         rule()
         if not logit:
             w("  Verdict: — No data\n", "nodata"); nl()
@@ -1618,7 +1670,7 @@ class App:
 
         # ── H6 ───────────────────────────────────────────────────────────────
         rule()
-        w("H6  —  PLACEBO: Does FRM move with FI outages? (it should NOT)\n", "section")
+        w(f"H6  —  PLACEBO: Does FRM move with {_SRC} outages? (it should NOT)\n", "section")
         rule()
         if b_frm_hvdc is None:
             w("  Verdict: — No data\n", "nodata"); nl()

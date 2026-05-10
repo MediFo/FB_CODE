@@ -158,13 +158,102 @@ def load_jao_csv(path: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # 2. NO3 filter
 # ---------------------------------------------------------------------------
-DEFAULT_NO3_PATTERNS: tuple = (
-    r"klæbu.*surna", r"klaebu.*surna",
-    r"klæbu.*orkdal", r"klaebu.*orkdal",
-    r"refsdal.*modalen", r"aurland",
-    r"tunnsjødal", r"tunnsjodal",
-    r"viklandet", r"namsos", r"verdal",
-)
+_ZONE_PATTERNS: dict = {
+    "NO3": (r"klæbu.*surna", r"klaebu.*surna",
+            r"klæbu.*orkdal", r"klaebu.*orkdal",
+            r"refsdal.*modalen", r"aurland",
+            r"tunnsjødal", r"tunnsjodal",
+            r"viklandet", r"namsos", r"verdal"),
+    "NO1": (r"hasle", r"kristiansand", r"flesaker", r"tegneby", r"furuset"),
+    "NO2": (r"kristiansand", r"kvilldal", r"tonstad"),
+    "NO4": (r"ofoten", r"kvandal", r"balsfjord", r"lyfjord"),
+    "NO5": (r"haugaland", r"sauda"),
+    "SE1": (r"hallsberg", r"nässjö", r"västerås", r"hagby"),
+    "SE2": (r"svartnäs", r"sundsvall"),
+    "SE3": (r"hallsberg", r"borgvik", r"midnordic"),
+    "SE4": (r"hurva", r"sege", r"trelleborg"),
+    "DK1": (r"kassø", r"tjele", r"fraugde"),
+    "DK2": (r"sjælland", r"zealand", r"amager"),
+    "EE":  (r"estlink", r"harku", r"kiisa"),
+    "LV":  (r"kurzeme", r"riga"),
+    "LT":  (r"kruonis", r"vilnius"),
+    "FI":  (r"fenno.*skan", r"suomi", r"helsinki", r"tampere"),
+    "DE":  (r"herdecke", r"osterath", r"oberzier"),
+    "PL":  (r"krajnik", r"polska"),
+    "NL":  (r"maasvlakte", r"norned"),
+}
+DEFAULT_NO3_PATTERNS: tuple = _ZONE_PATTERNS["NO3"]
+
+
+def zone_patterns(target_zone: str) -> tuple:
+    """Return CNEC name regex patterns for a given bidding zone code."""
+    return _ZONE_PATTERNS.get(target_zone.upper(), ())
+
+
+# ---------- A78 cross-border query configuration ----------------------------
+_KNOWN_BORDERS: dict = {
+    "FI":  [("FI","SE_1"),("SE_1","FI"),("FI","SE_3"),("SE_3","FI"),
+            ("FI","EE"),("EE","FI"),("FI","NO_4"),("NO_4","FI")],
+    "NO":  [("NO_2","DE"),("DE","NO_2"),("NO_2","NL"),("NL","NO_2"),
+            ("NO_2","DK_1"),("DK_1","NO_2"),("NO_2","GB"),("GB","NO_2"),
+            ("NO_3","SE_1"),("SE_1","NO_3"),("NO_4","SE_1"),("SE_1","NO_4"),
+            ("NO_4","SE_2"),("SE_2","NO_4"),("NO_5","SE_3"),("SE_3","NO_5"),
+            ("NO_1","SE_3"),("SE_3","NO_1")],
+    "SE":  [("SE_3","FI"),("FI","SE_3"),("SE_1","FI"),("FI","SE_1"),
+            ("SE_4","LT"),("LT","SE_4"),("SE_4","DE"),("DE","SE_4"),
+            ("SE_4","PL"),("PL","SE_4"),("SE_3","DK_1"),("DK_1","SE_3")],
+    "DK":  [("DK_1","NO_2"),("NO_2","DK_1"),("DK_1","SE_3"),("SE_3","DK_1"),
+            ("DK_1","DE"),("DE","DK_1"),("DK_2","DE"),("DE","DK_2"),
+            ("DK_2","SE_4"),("SE_4","DK_2"),("DK_2","NL"),("NL","DK_2")],
+    "EE":  [("EE","FI"),("FI","EE"),("EE","LV"),("LV","EE")],
+    "LV":  [("LV","EE"),("EE","LV"),("LV","LT"),("LT","LV")],
+    "LT":  [("LT","LV"),("LV","LT"),("LT","SE_4"),("SE_4","LT"),
+            ("LT","PL"),("PL","LT")],
+    "DE":  [("DE","DK_1"),("DK_1","DE"),("DE","DK_2"),("DK_2","DE"),
+            ("DE","SE_4"),("SE_4","DE"),("DE","NO_2"),("NO_2","DE")],
+    "PL":  [("PL","SE_4"),("SE_4","PL"),("PL","LT"),("LT","PL")],
+    "NL":  [("NL","NO_2"),("NO_2","NL"),("NL","DK_2"),("DK_2","NL")],
+    "GB":  [("GB","NO_2"),("NO_2","GB")],
+}
+_HVDC_PAIRS: set = {
+    frozenset({"FI","EE"}), frozenset({"FI","SE_3"}),
+    frozenset({"SE_4","LT"}), frozenset({"SE_4","DE"}), frozenset({"SE_4","PL"}),
+    frozenset({"NO_2","DE"}), frozenset({"NO_2","NL"}),
+    frozenset({"NO_2","DK_1"}), frozenset({"DK_2","NL"}),
+    frozenset({"NO_2","GB"}),
+}
+
+
+def _country_borders(country_code: str) -> list:
+    """Return list of (from, to) border pairs for ENTSO-E A78 queries."""
+    cc = country_code.upper()
+    if cc in _KNOWN_BORDERS:
+        return _KNOWN_BORDERS[cc]
+    # prefix match: "NO" matches "NO" key
+    for k, v in _KNOWN_BORDERS.items():
+        if k.startswith(cc[:2]):
+            return v
+    return []
+
+
+def _outage_cols(src: str) -> tuple:
+    """Return (BIN_COLS, MW_COLS) tuples using the given source-country prefix."""
+    p = src.lower()
+    bin_cols = (f"{p}_planned_outage_active", f"{p}_forced_outage_active",
+                f"{p}_hvdc_outage_active",    f"{p}_ac_line_outage_active")
+    mw_cols  = (f"{p}_gen_outage_mw_lost", f"{p}_hvdc_outage_mw_lost",
+                f"{p}_ac_outage_mw_lost")
+    return bin_cols, mw_cols
+
+
+def _default_indep(src: str = "fi") -> list:
+    """Default independent variable names for panel regression."""
+    p = src.lower()
+    return [f"{p}_planned_outage_active", f"{p}_forced_outage_active",
+            f"{p}_hvdc_outage_active",    f"{p}_ac_line_outage_active",
+            f"{p}_gen_outage_mw_lost",    f"{p}_hvdc_outage_mw_lost",
+            f"{p}_ac_outage_mw_lost"]
+
 
 def filter_no3(df: pd.DataFrame, patterns: Sequence[str] = DEFAULT_NO3_PATTERNS,
                zone_label: str = "NO3") -> pd.DataFrame:
@@ -188,8 +277,10 @@ ENTSOE_TOKEN = "3c9307bd-c6e8-4f0c-99de-f9d754ff6488"
 
 
 def fetch_entsoe_outages(start_utc: str, end_utc: str,
-                         log_cb: LogCallback = _noop) -> pd.DataFrame:
-    """Fetch ENTSO-E A77 (production) + A78 (transmission) outages for FI.
+                         log_cb: LogCallback = _noop,
+                         country_code: str = "FI") -> pd.DataFrame:
+    """Fetch ENTSO-E A77 (production) + A78 (transmission) outages.
+    country_code: ENTSO-E two-letter country code, e.g. "FI", "NO", "SE", "DK".
     Uses the hard-coded ENTSOE_TOKEN constant."""
     if EntsoePandasClient is None:
         log_cb("ENTSO-E: 'entsoe-py' library NOT INSTALLED.")
@@ -205,9 +296,9 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
 
     # ----- A77: production unavailability -----
     try:
-        log_cb("ENTSO-E: query_unavailability_of_production_units (FI)")
+        log_cb(f"ENTSO-E: query_unavailability_of_production_units ({country_code})")
         df = client.query_unavailability_of_production_units(
-            country_code="FI", start=start, end=end, docstatus=None,
+            country_code=country_code, start=start, end=end, docstatus=None,
         )
         for i, row in df.reset_index().iterrows():
             try:
@@ -237,8 +328,8 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                     "voltage_kv": None,
                     "capacity_mw": cap_lost,
                     "planned_or_forced": p_or_f,
-                    "bidding_zone": "FI",
-                    "control_area": "FI",
+                    "bidding_zone": country_code,
+                    "control_area": country_code,
                     "source": "entsoe_a77",
                     "raw_payload": json.dumps({k: str(v) for k, v in row.items()}, default=str)[:2000],
                 })
@@ -248,8 +339,7 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         log_cb(f"ENTSO-E A77 failed: {e}")
 
     # ----- A78: transmission unavailability -----
-    borders = (("FI","SE_1"),("SE_1","FI"),("FI","SE_3"),("SE_3","FI"),
-               ("FI","EE"),("EE","FI"),("FI","NO_4"),("NO_4","FI"))
+    borders = _country_borders(country_code)
     for fr, to in borders:
         try:
             log_cb(f"ENTSO-E: A78 {fr} -> {to}")
@@ -261,7 +351,7 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
             for i, row in df.reset_index().iterrows():
                 try:
                     cap = float(row.get("avail_qty", 0) or 0)
-                    is_hvdc = ("EE" in (fr,to)) or ("SE_3" in (fr,to))
+                    is_hvdc = frozenset({fr, to}) in _HVDC_PAIRS
                     # Skip implausibly long records (>30 days = ENTSO-E status
                     # updates stored as new events, not real outages)
                     try:
@@ -283,8 +373,8 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                         "voltage_kv": None,
                         "capacity_mw": cap,
                         "planned_or_forced": "forced",  # entsoe-py issue #137
-                        "bidding_zone": "FI",
-                        "control_area": "FI",
+                        "bidding_zone": country_code,
+                        "control_area": country_code,
                         "source": "entsoe_a78",
                         "raw_payload": json.dumps({"from": fr, "to": to}),
                     })
@@ -428,10 +518,7 @@ def load_cached_outages(con: sqlite3.Connection) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # 5. Covariate construction
 # ---------------------------------------------------------------------------
-OUTAGE_BIN_COLS = ("fi_planned_outage_active", "fi_forced_outage_active",
-                   "fi_hvdc_outage_active", "fi_ac_line_outage_active")
-OUTAGE_MW_COLS = ("fi_gen_outage_mw_lost", "fi_hvdc_outage_mw_lost",
-                  "fi_ac_outage_mw_lost")
+OUTAGE_BIN_COLS, OUTAGE_MW_COLS = _outage_cols("fi")  # default; overridden per-call
 
 def _interval_active(times: np.ndarray, starts: np.ndarray,
                      ends: np.ndarray) -> np.ndarray:
@@ -462,11 +549,17 @@ def _interval_mw(times: np.ndarray, starts: np.ndarray, ends: np.ndarray,
 
 
 def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
-                     log_cb: LogCallback = _noop) -> pd.DataFrame:
+                     log_cb: LogCallback = _noop,
+                     src: str = "fi") -> pd.DataFrame:
+    """Build outage covariate columns. src sets the column-name prefix, e.g.
+    src='fi'  → fi_hvdc_outage_active, fi_gen_outage_mw_lost, …
+    src='no'  → no_hvdc_outage_active, no_gen_outage_mw_lost, …"""
+    p = src.lower()
+    bin_cols, mw_cols = _outage_cols(p)
     jao = jao.copy()
     if outages is None or outages.empty:
         log_cb("No outages provided; covariates set to zero")
-        for c in OUTAGE_BIN_COLS + OUTAGE_MW_COLS:
+        for c in bin_cols + mw_cols:
             jao[c] = 0.0
     else:
         # ensure datetime
@@ -488,23 +581,23 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
                     df["end_utc"].values.astype("datetime64[ns]"),
                     df["capacity_mw"].values.astype(float))
 
-        log_cb(f"Building covariates for {len(jao)} JAO rows...")
+        log_cb(f"Building covariates for {len(jao)} JAO rows (src={p.upper()})...")
         s,e,c = subset_ndarrays(outg[outg["planned_or_forced"]=="planned"])
-        jao["fi_planned_outage_active"] = _interval_active(ts, s, e)
+        jao[f"{p}_planned_outage_active"] = _interval_active(ts, s, e)
         s,e,c = subset_ndarrays(outg[outg["planned_or_forced"]=="forced"])
-        jao["fi_forced_outage_active"] = _interval_active(ts, s, e)
+        jao[f"{p}_forced_outage_active"] = _interval_active(ts, s, e)
         s,e,c = subset_ndarrays(outg[outg["asset_type"]=="hvdc"])
-        jao["fi_hvdc_outage_active"] = _interval_active(ts, s, e)
-        jao["fi_hvdc_outage_mw_lost"] = _interval_mw(ts, s, e, c)
+        jao[f"{p}_hvdc_outage_active"]  = _interval_active(ts, s, e)
+        jao[f"{p}_hvdc_outage_mw_lost"] = _interval_mw(ts, s, e, c)
         s,e,c = subset_ndarrays(outg[outg["asset_type"]=="ac_line"])
-        jao["fi_ac_line_outage_active"] = _interval_active(ts, s, e)
-        jao["fi_ac_outage_mw_lost"] = _interval_mw(ts, s, e, c)
+        jao[f"{p}_ac_line_outage_active"] = _interval_active(ts, s, e)
+        jao[f"{p}_ac_outage_mw_lost"]     = _interval_mw(ts, s, e, c)
         s,e,c = subset_ndarrays(outg[outg["asset_type"]=="generator"])
-        jao["fi_gen_outage_mw_lost"] = _interval_mw(ts, s, e, c)
+        jao[f"{p}_gen_outage_mw_lost"] = _interval_mw(ts, s, e, c)
 
     # Lagged versions
     jao = jao.sort_values(["cneName", "dateTimeUtc"])
-    for col in OUTAGE_BIN_COLS + ("fi_gen_outage_mw_lost",):
+    for col in bin_cols + (f"{p}_gen_outage_mw_lost",):
         jao[f"{col}_lag1h"]  = jao.groupby("cneName")[col].shift(4).fillna(0.0)
         jao[f"{col}_lag24h"] = jao.groupby("cneName")[col].shift(96).fillna(0.0)
 
@@ -546,9 +639,13 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     else:
         jao["fall_signed"] = np.nan
 
-    # H2: |PTDF_FI| — topology shift is sign-agnostic; AC outage changes the
+    # H2: |PTDF_{SRC}| — topology shift is sign-agnostic; AC outage changes the
     #     admittance matrix in magnitude, not necessarily direction.
-    if "ptdf_FI" in jao.columns:
+    # Try source-specific PTDF column first, then fall back to ptdf_FI.
+    ptdf_src_col = f"ptdf_{src.upper()}"
+    if ptdf_src_col in jao.columns:
+        jao["ptdf_FI_abs"] = jao[ptdf_src_col].abs()
+    elif "ptdf_FI" in jao.columns:
         jao["ptdf_FI_abs"] = jao["ptdf_FI"].abs()
     else:
         jao["ptdf_FI_abs"] = np.nan
@@ -575,17 +672,15 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # 6. Regressions
 # ---------------------------------------------------------------------------
-DEFAULT_INDEP = ["fi_planned_outage_active", "fi_forced_outage_active",
-                 "fi_hvdc_outage_active", "fi_ac_line_outage_active",
-                 "fi_gen_outage_mw_lost", "fi_hvdc_outage_mw_lost",
-                 "fi_ac_outage_mw_lost"]
+DEFAULT_INDEP = _default_indep("fi")
 
 
 def run_panel_regression(df: pd.DataFrame, dep_var: str,
                          indep: Sequence[str] | None = None,
                          add_time_fe: bool = True,
                          cluster: str = "time",   # "time" | "entity" | "two_way"
-                         log_cb: LogCallback = _noop) -> dict:
+                         log_cb: LogCallback = _noop,
+                         src: str = "fi") -> dict:
     """
     Panel OLS with entity fixed effects and configurable clustered SE.
 
@@ -599,7 +694,7 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     if PanelOLS is None or sm is None:
         log_cb("linearmodels/statsmodels missing; skip")
         return {}
-    indep = list(indep) if indep else list(DEFAULT_INDEP)
+    indep = list(indep) if indep else _default_indep(src)
     keep = ["dateTimeUtc","cneName",dep_var] + indep + ["hour","dow","month","date"]
     keep = [c for c in keep if c in df.columns]
     if dep_var not in keep:
@@ -740,7 +835,8 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     }
 
 
-def run_logit_iva(df: pd.DataFrame, log_cb: LogCallback = _noop) -> dict:
+def run_logit_iva(df: pd.DataFrame, log_cb: LogCallback = _noop,
+                  src: str = "fi") -> dict:
     if sm is None:
         return {}
     sub = df.copy()
@@ -750,11 +846,12 @@ def run_logit_iva(df: pd.DataFrame, log_cb: LogCallback = _noop) -> dict:
     sub["iva_active"] = (sub["iva"].fillna(0).abs() > 1e-6).astype(int)
     n_pos = int(sub["iva_active"].sum())
     if n_pos < 5:
-        log_cb(f"H5 logit skipped: only {n_pos} IVA-active rows in NO3 window. "
+        log_cb(f"H5 logit skipped: only {n_pos} IVA-active rows in target zone window. "
                f"Need a longer JAO window or curated outages overlapping IVA events.")
         return {}
-    feat = ["fi_planned_outage_active","fi_forced_outage_active",
-            "fi_hvdc_outage_active","fi_ac_line_outage_active"]
+    p = src.lower()
+    feat = [f"{p}_planned_outage_active", f"{p}_forced_outage_active",
+            f"{p}_hvdc_outage_active",    f"{p}_ac_line_outage_active"]
     feat = [f for f in feat if f in sub.columns]
     if not feat:
         return {}
@@ -848,66 +945,60 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
 # ---------------------------------------------------------------------------
 # 8. Hypothesis verdicts
 # ---------------------------------------------------------------------------
-HYPOTHESES = [
-    # H1: FI HVDC outage → F0 shifts on NO3 CNECs
-    # Sign is NOT a priori deterministic: direction depends on whether the HVDC
-    # normally exports FI power (Fenno-Skan southward) or imports to FI (Estlink).
-    # A southward-flow HVDC outage forces AC rerouting FI→SE1→SE2→NO4→NO3,
-    # increasing F0 on northbound CNECs but decreasing it on southbound ones.
-    # We test for SIGNIFICANCE of the shift regardless of direction.
-    {"id": "H1", "dep": "fall_signed",
-     "var": "fi_hvdc_outage_active",
-     "expected_sign": None,  # direction is physically ambiguous
-     "text": "fall (sign-normalised F_allReference) shifts during FI HVDC outages "
-             "(sign depends on HVDC normal flow direction)"},
+def _build_hypotheses(src: str = "fi", tgt: str = "NO3") -> list:
+    """Build the hypothesis list for a given source country and target zone.
 
-    # H2: FI AC line outage → PTDF_FI shifts on NO3 CNECs
-    # Only AC topology changes can move PTDFs. Generator and HVDC outages leave
-    # the admittance matrix unchanged so PTDF_FI should be unaffected.
-    {"id": "H2", "dep": "ptdf_FI_abs",
-     "var": "fi_ac_line_outage_active",
-     "expected_sign": None,  # direction depends on specific line and network topology
-     "text": "|PTDF_FI| on NO3 CNECs shifts during FI AC line outages (not gen/HVDC)"},
+    All variable names and display text are derived from src/tgt so that the
+    same analytical pipeline works for any bidding-zone pair.
+    """
+    p   = src.lower()
+    SRC = src.upper()
+    return [
+        # H1: SRC HVDC outage → F_allReference shifts on TGT CNECs
+        {"id": "H1", "dep": "fall_signed",
+         "var": f"{p}_hvdc_outage_active",
+         "expected_sign": None,
+         "text": (f"fall (sign-normalised F_allReference) shifts during {SRC} HVDC outages "
+                  f"on {tgt} CNECs (sign depends on HVDC normal flow direction)")},
 
-    # H3: FI outage → RAM changes on NO3 CNECs
-    # Sign is outage-type-dependent:
-    #  - HVDC outage: removes cross-border transit → LESS load on NO3 corridor → RAM INCREASES
-    #  - AC outage: changes impedance matrix → redistributes flows → sign unclear
-    #  - Generator outage: forces re-dispatch → may load or unload NO3 corridor
-    # We test for any significant change without prescribing direction.
-    {"id": "H3", "dep": "ram",
-     "var": "fi_forced_outage_active",
-     "expected_sign": None,  # direction depends on outage type (HVDC often increases RAM)
-     "text": "RAM on NO3 CNECs changes significantly during forced FI outages "
-             "(direction depends on outage type)"},
+        # H2: SRC AC line outage → |PTDF_SRC| shifts on TGT CNECs
+        {"id": "H2", "dep": "ptdf_FI_abs",
+         "var": f"{p}_ac_line_outage_active",
+         "expected_sign": None,
+         "text": (f"|PTDF_{SRC}| on {tgt} CNECs shifts during {SRC} AC line outages "
+                  f"(only AC topology changes can move PTDFs — not gen/HVDC outages)")},
 
-    # H4: FI outage → shadow price changes on NO3 CNECs
-    # Same reasoning as H3. HVDC outage typically REDUCES congestion on NO3
-    # corridor → shadow price FALLS. Only outages that reroute flow onto already
-    # congested NO3 CNECs would increase shadow price.
-    # Note: shadow price regression is restricted to binding MTUs (shadowPrice > 0).
-    {"id": "H4", "dep": "shadowPrice",
-     "var": "fi_forced_outage_active",
-     "expected_sign": None,  # direction is outage-type-dependent
-     "text": "Shadow price on binding NO3 CNECs changes during FI outages "
-             "(sign depends on whether outage relieves or adds congestion)"},
+        # H3: SRC outage → RAM changes on TGT CNECs
+        {"id": "H3", "dep": "ram",
+         "var": f"{p}_forced_outage_active",
+         "expected_sign": None,
+         "text": (f"RAM on {tgt} CNECs changes significantly during forced {SRC} outages "
+                  f"(direction depends on outage type: HVDC often increases RAM)")},
 
-    # H5: IVA application is more frequent under forced than planned FI outages.
-    # Rationale: forced outages are not in the D-2 IGM; the CGM does not capture
-    # them; Statnett must apply IVA to correct the FB domain during validation.
-    {"id": "H5", "dep": None, "var": None,
-     "text": "IVA more frequent on NO3 CNECs under forced than planned FI outages",
-     "expected_sign": None},
+        # H4: SRC outage → shadow price changes on TGT CNECs (binding MTUs)
+        {"id": "H4", "dep": "shadowPrice",
+         "var": f"{p}_forced_outage_active",
+         "expected_sign": None,
+         "text": (f"Shadow price on binding {tgt} CNECs changes during {SRC} outages "
+                  f"(sign depends on whether outage relieves or adds congestion)")},
 
-    # H6: FRM does NOT move with individual FI outage events.
-    # FRM is a statistical margin calibrated annually (Nordic CCM Art. 22).
-    # Individual outages cannot update FRM within a delivery year.
-    # This is a PLACEBO TEST: any significant result indicates misspecification.
-    {"id": "H6", "dep": "frm", "var": "fi_forced_outage_active",
-     "expected_sign": 0,
-     "text": "FRM is structural (annual calibration); no MTU-level FI-outage propagation "
-             "[PLACEBO — significant result = model misspecification]"},
-]
+        # H5: IVA more frequent under forced than planned SRC outages
+        {"id": "H5", "dep": None, "var": None,
+         "expected_sign": None,
+         "text": (f"IVA more frequent on {tgt} CNECs under forced than planned {SRC} outages "
+                  f"(forced outages absent from D-2 IGM → TSO must apply IVA correction)")},
+
+        # H6 placebo: FRM must NOT move with individual SRC outage events
+        {"id": "H6", "dep": "frm",
+         "var": f"{p}_forced_outage_active",
+         "expected_sign": 0,
+         "text": (f"FRM is structural (annual calibration); no MTU-level {SRC}-outage "
+                  f"propagation [PLACEBO — significant result = model misspecification]")},
+    ]
+
+
+# Backward-compatible constant — used by code that still references HYPOTHESES directly
+HYPOTHESES = _build_hypotheses("fi", "NO3")
 
 
 def _holm_bonferroni(p_values: list[float | None], alpha: float = 0.05) -> list[bool]:
@@ -927,31 +1018,31 @@ def _holm_bonferroni(p_values: list[float | None], alpha: float = 0.05) -> list[
     return reject
 
 
-def summarize_hypotheses(reg_results: dict, logit_result: dict) -> list[dict]:
-    """Summarise verdicts. When the primary test variable is absorbed by
-    fixed effects, fall back to alternative channel variables and report
-    why the original test wasn't possible."""
-    # For H1-H4, we have a primary test variable but also alternative
-    # channel-specific variables we can fall back to.
+def summarize_hypotheses(reg_results: dict, logit_result: dict,
+                          src: str = "fi", tgt: str = "NO3") -> list[dict]:
+    """Summarise verdicts for the given source country and target zone.
+    When the primary test variable is absorbed by fixed effects, falls back to
+    alternative channel variables and reports why the original test wasn't possible."""
+    p = src.lower()
     fallback_vars = {
-        "H1": ["fi_hvdc_outage_active", "fi_forced_outage_active",
-               "fi_hvdc_outage_mw_lost", "fi_planned_outage_active"],
-        "H2": ["fi_ac_line_outage_active", "fi_ac_outage_mw_lost",
-               "fi_planned_outage_active"],
-        "H3": ["fi_forced_outage_active", "fi_planned_outage_active",
-               "fi_hvdc_outage_active"],
-        "H4": ["fi_forced_outage_active", "fi_planned_outage_active",
-               "fi_hvdc_outage_active"],
+        "H1": [f"{p}_hvdc_outage_active", f"{p}_forced_outage_active",
+               f"{p}_hvdc_outage_mw_lost", f"{p}_planned_outage_active"],
+        "H2": [f"{p}_ac_line_outage_active", f"{p}_ac_outage_mw_lost",
+               f"{p}_planned_outage_active"],
+        "H3": [f"{p}_forced_outage_active", f"{p}_planned_outage_active",
+               f"{p}_hvdc_outage_active"],
+        "H4": [f"{p}_forced_outage_active", f"{p}_planned_outage_active",
+               f"{p}_hvdc_outage_active"],
     }
     out = []
-    for h in HYPOTHESES:
+    for h in _build_hypotheses(src, tgt):
         verdict = "n/a"
         if h["id"] == "H5":
             if logit_result and "coefs" in logit_result:
                 cf = logit_result["coefs"].set_index("param")
                 try:
-                    bp = cf.loc["fi_planned_outage_active"]
-                    bf = cf.loc["fi_forced_outage_active"]
+                    bp = cf.loc[f"{p}_planned_outage_active"]
+                    bf = cf.loc[f"{p}_forced_outage_active"]
                     verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
                                f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
                                f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
@@ -1055,7 +1146,9 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
     a(".v-supported{color:#27ae60;font-weight:600}.v-no{color:#c0392b;font-weight:600}")
     a("img{max-width:100%;margin:12px 0;border:1px solid #ccc}")
     a("</style></head><body>")
-    a(f"<h1>FI → NO3 Flow-Based Propagation: Validation Report</h1>")
+    src_lbl = ctx.get("source_country", "FI")
+    tgt_lbl = ctx.get("target_zone", "NO3")
+    a(f"<h1>{src_lbl} → {tgt_lbl} Flow-Based Propagation: Validation Report</h1>")
     a(f"<p><em>Generated {ctx.get('ts','')}.</em> "
       f"JAO rows: {ctx.get('n_jao',0)} | NO3 rows analysed: {ctx.get('n_no3',0)} | "
       f"outage events: {ctx.get('n_outages',0)}</p>")
@@ -1119,15 +1212,24 @@ def main_cli() -> None:
 
 @dataclass
 class PipelineConfig:
-    jao_csv:    str  = ""
-    out_dir:    str  = "./fb_output"
-    cache_db:   str  = "./fb_output/outage_cache.sqlite"
-    manual_csv: str  = "./manual_outages.csv"
-    start_utc:  str  = "2024-10-29T00:00:00Z"
-    end_utc:    str  = "2026-05-06T00:00:00Z"
-    use_entsoe: bool = True
-    use_manual: bool = True
-    no3_patterns: tuple = DEFAULT_NO3_PATTERNS
+    jao_csv:        str   = ""
+    out_dir:        str   = "./fb_output"
+    cache_db:       str   = "./fb_output/outage_cache.sqlite"
+    manual_csv:     str   = "./manual_outages.csv"
+    start_utc:      str   = "2024-10-29T00:00:00Z"
+    end_utc:        str   = "2026-05-06T00:00:00Z"
+    use_entsoe:     bool  = True
+    use_manual:     bool  = True
+    source_country: str   = "FI"    # ENTSO-E country code for the outage source
+    target_zone:    str   = "NO3"   # Bidding zone to analyse (CNEC filter)
+    no3_patterns:   tuple = DEFAULT_NO3_PATTERNS  # auto-updated in __post_init__
+
+    def __post_init__(self):
+        # If no3_patterns is the default, auto-populate from target_zone
+        if self.no3_patterns is DEFAULT_NO3_PATTERNS:
+            pats = zone_patterns(self.target_zone)
+            if pats:
+                self.no3_patterns = pats
 
 
 def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
@@ -1142,8 +1244,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     else:
         jao = jao_df.copy()
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")
-    no3 = filter_no3(jao, cfg.no3_patterns)
-    log_cb(f"  NO3 rows: {len(no3)}, NO3 CNECs: {no3['cneName'].nunique()}")
+    no3 = filter_no3(jao, cfg.no3_patterns, zone_label=cfg.target_zone)
+    log_cb(f"  {cfg.target_zone} rows: {len(no3)}, {cfg.target_zone} CNECs: {no3['cneName'].nunique()}")
 
     jao_start = no3["dateTimeUtc"].min()
     jao_end   = no3["dateTimeUtc"].max()
@@ -1155,7 +1257,9 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         con = open_cache(cfg.cache_db)
         all_events = []
         if cfg.use_entsoe:
-            df_es = fetch_entsoe_outages(cfg.start_utc, cfg.end_utc, log_cb=log_cb)
+            df_es = fetch_entsoe_outages(cfg.start_utc, cfg.end_utc,
+                                         log_cb=log_cb,
+                                         country_code=cfg.source_country)
             if not df_es.empty:
                 upsert_events(con, df_es.to_dict("records"))
                 all_events.append(df_es)
@@ -1205,7 +1309,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
                        f"{r['end_utc'].strftime('%Y-%m-%d')}")
 
     # 3. Covariates (includes RAM formula check, fall_signed, SP cleaning)
-    no3_cov = build_covariates(no3, outages, log_cb=log_cb)
+    _src = cfg.source_country.lower()
+    no3_cov = build_covariates(no3, outages, log_cb=log_cb, src=_src)
     no3_cov.to_csv(Path(cfg.out_dir) / "no3_with_outage_covariates.csv", index=False)
 
     # 4. Regressions
@@ -1213,19 +1318,19 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # fall is the correct reference flow in the RAM formula (verified R²=1.000).
     # Sign-normalised per CNEC so positive = loading in the congested direction.
     # fref (=f0 in JAO) is the flow at CGMA NP — NOT in the RAM formula.
-    log_cb("Running fall (F_allReference, sign-normalised) regression [H1]...")
+    log_cb(f"Running fall (F_allReference, sign-normalised) regression [H1] (src={_src.upper()})...")
     h1_dep = "fall_signed" if "fall_signed" in no3_cov.columns else "fall"
-    res_fall = run_panel_regression(no3_cov, h1_dep, log_cb=log_cb, cluster="time")
+    res_fall = run_panel_regression(no3_cov, h1_dep, log_cb=log_cb, cluster="time", src=_src)
 
-    # ── H2: |PTDF_FI| ────────────────────────────────────────────────────────
+    # ── H2: |PTDF_{SRC}| ─────────────────────────────────────────────────────
     # Absolute value: AC topology change shifts PTDF regardless of sign convention.
-    log_cb("Running |PTDF_FI| regression [H2]...")
+    log_cb(f"Running |PTDF_{_src.upper()}| regression [H2]...")
     h2_dep = "ptdf_FI_abs" if "ptdf_FI_abs" in no3_cov.columns else "ptdf_FI"
-    res_ptdf = run_panel_regression(no3_cov, h2_dep, log_cb=log_cb, cluster="time")
+    res_ptdf = run_panel_regression(no3_cov, h2_dep, log_cb=log_cb, cluster="time", src=_src)
 
     # ── H3: RAM ──────────────────────────────────────────────────────────────
     log_cb("Running RAM regression [H3]...")
-    res_ram = run_panel_regression(no3_cov, "ram", log_cb=log_cb, cluster="time")
+    res_ram = run_panel_regression(no3_cov, "ram", log_cb=log_cb, cluster="time", src=_src)
 
     # ── H4: shadow price (binding MTUs only) ─────────────────────────────────
     # Use shadowPrice_clean (1e-8 → 0) then restrict to truly binding rows.
@@ -1240,22 +1345,20 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         res_sp = {}
     else:
         res_sp = run_panel_regression(
-            no3_binding, sp_col, log_cb=log_cb, cluster="time")
+            no3_binding, sp_col, log_cb=log_cb, cluster="time", src=_src)
 
     # ── H6 placebo: FRM ──────────────────────────────────────────────────────
     log_cb("Running FRM placebo regression [H6]...")
-    res_frm = run_panel_regression(no3_cov, "frm", log_cb=log_cb, cluster="time")
+    res_frm = run_panel_regression(no3_cov, "frm", log_cb=log_cb, cluster="time", src=_src)
 
     # ── Bonus: fnrao (RA trigger channel) ────────────────────────────────────
-    # FI outages may trigger costly or non-costly RAs on NO3 CNECs (fnrao changes).
-    # This is an additional propagation channel not covered by H1-H6.
     log_cb("Running fnrao (RA trigger) regression [bonus]...")
-    res_fnrao = run_panel_regression(no3_cov, "fnrao", log_cb=log_cb, cluster="time") \
+    res_fnrao = run_panel_regression(no3_cov, "fnrao", log_cb=log_cb, cluster="time", src=_src) \
         if "fnrao" in no3_cov.columns and no3_cov["fnrao"].notna().any() else {}
 
     # ── H5: IVA logit ────────────────────────────────────────────────────────
     log_cb("Running IVA logit [H5]...")
-    res_logit = run_logit_iva(no3_cov, log_cb=log_cb)
+    res_logit = run_logit_iva(no3_cov, log_cb=log_cb, src=_src)
 
     reg_results = {
         "fall_signed":  res_fall,
@@ -1270,7 +1373,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         "frm":          res_frm,
         "fnrao":        res_fnrao,
     }
-    hypotheses = summarize_hypotheses(reg_results, res_logit)
+    hypotheses = summarize_hypotheses(reg_results, res_logit,
+                                      src=_src, tgt=cfg.target_zone)
 
     # 5. Save outages
     outages.to_csv(Path(cfg.out_dir) / "outages_unified.csv", index=False)
@@ -1280,6 +1384,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         "regressions": reg_results, "logit": res_logit,
         "hypotheses": hypotheses,
         "out_dir": cfg.out_dir,
+        "source_country": cfg.source_country,
+        "target_zone": cfg.target_zone,
         "overlapping_outages": overlapping if not outages.empty else pd.DataFrame(),
     }
 
