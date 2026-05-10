@@ -42,25 +42,13 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 
-# Local imports: add both the package directory and its parent (src/) so that
-# "from fi_no3 import ..." works whether the dashboard is run directly or
-# imported as part of the installed package.
-_HERE   = os.path.dirname(os.path.abspath(__file__))   # .../src/fi_no3/
-_PARENT = os.path.dirname(_HERE)                        # .../src/
-for _p in [_PARENT, _HERE]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+# All files live in the same folder as this script.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-try:
-    from fi_no3 import propagation as pipe
-    from fi_no3 import synthetic as syn
-except ModuleNotFoundError as _e:
-    raise ModuleNotFoundError(
-        f"Could not import fi_no3 package.\n"
-        f"Expected package layout: src/fi_no3/{{propagation,synthetic,dashboard}}.py\n"
-        f"Searched: {_PARENT}\n"
-        f"Original error: {_e}"
-    ) from _e
+import propagation as pipe
+import synthetic as syn
 
 
 APP_TITLE = "FI -> NO3 FB Propagation Dashboard"

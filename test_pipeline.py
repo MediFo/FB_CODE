@@ -1,7 +1,7 @@
 """
-tests/test_pipeline.py
+test_pipeline.py
 Full test suite for the FI -> NO3 propagation pipeline.
-Run with: pytest tests/ -v
+Run with: pytest test_pipeline.py -v
 
 All tests use synthetic data — no API keys required.
 """
@@ -10,10 +10,10 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-# Ensure the src package is importable regardless of where pytest is run from
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "src"))
-sys.path.insert(0, _ROOT)
+# All files are in the same folder as this script
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 import pytest
 import pandas as pd
@@ -21,8 +21,8 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-from fi_no3.synthetic import generate_demo_dataset
-from fi_no3.propagation import (
+from synthetic import generate_demo_dataset
+from propagation import (
     load_jao_csv, filter_no3, build_covariates, deduplicate_outages,
     run_panel_regression, run_logit_iva, decompose_delta_ram,
     summarize_hypotheses, PipelineConfig, run_pipeline,
