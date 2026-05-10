@@ -1706,6 +1706,20 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     post    = no3_df[(no3_df.dateTimeUtc >= e)           & (no3_df.dateTimeUtc < post_end)]
     window  = no3_df[(no3_df.dateTimeUtc >= pre_start)   & (no3_df.dateTimeUtc < post_end)]
 
+    n_cnecs = int(no3_df.cneName.nunique())
+    log_cb(f"  Periods (×{n_cnecs} CNECs):  "
+           f"pre={len(pre):,} rows "
+           f"({pre_start.date()} → {s.date()})  |  "
+           f"during={len(during):,} rows "
+           f"({s.date()} → {e.date()})  |  "
+           f"post={len(post):,} rows")
+    if len(during) == 0:
+        log_cb(f"  ⚠ During-period empty — event may be entirely outside JAO window, "
+               f"or JAO data has a gap at {s.date()} → {e.date()}.")
+    if len(pre) == 0:
+        log_cb(f"  ⚠ Pre-period empty — event starts before JAO data "
+               f"({jao_min.date()}). Δ cannot be computed.")
+
     # Final guard: if pre AND post are both empty there is no baseline at all
     if pre.empty and post.empty:
         raise ValueError(
@@ -1862,12 +1876,23 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "n_cnecs":     int(no3_df.cneName.nunique()),
         "n_pre_rows":  len(pre), "n_during_rows": len(during), "n_post_rows": len(post),
     }
+    def _safe_mean(df_subset, col):
+        """Return mean as float, or np.nan if subset is empty or all-NaN."""
+        if df_subset.empty: return np.nan
+        v = df_subset[col].mean()
+        return np.nan if (v is None or (hasattr(v, "__float__") and np.isnan(float(v)))) else round(float(v), 2)
+
     for col in ["f0", "ram", "shadowPrice", "frm", "iva"]:
         if col in no3_df.columns:
-            summary[f"pre_mean_{col}"]    = round(float(pre[col].mean()),   2) if not pre.empty    else np.nan
-            summary[f"during_mean_{col}"] = round(float(during[col].mean()), 2) if not during.empty else np.nan
-            summary[f"delta_{col}"]       = round(summary[f"during_mean_{col}"]
-                                                   - summary[f"pre_mean_{col}"], 2)
+            pm = _safe_mean(pre,    col)
+            dm = _safe_mean(during, col)
+            summary[f"pre_mean_{col}"]    = pm
+            summary[f"during_mean_{col}"] = dm
+            # delta is n/a whenever either side is missing
+            if np.isnan(pm) or np.isnan(dm):
+                summary[f"delta_{col}"] = np.nan
+            else:
+                summary[f"delta_{col}"] = round(dm - pm, 2)
     summary["did_estimates"] = did_estimates if _ptdf_raw_col in no3_df.columns else {}
 
     log_cb(f"Single event analysis complete: {summary['asset_name']} | "

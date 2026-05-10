@@ -1199,36 +1199,67 @@ class App:
             self._ev_summary_txt.insert("end",
                 f"⚠ Display error — check Log tab for details.\n\n{exc}")
 
+    @staticmethod
+    def _fv(v, width: int = 9) -> str:
+        """Format a scalar that may be NaN/None — returns 'n/a' instead of 'nan'."""
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return " " * (width - 3) + "n/a"
+        return f"{v:>{width}.2f}"
+
     def _display_single_event_inner(self, res: dict, outage_row):
         s = res["summary"]
 
+        # ── row-count warnings ────────────────────────────────────────────
+        n_pre    = s.get("n_pre_rows",    0)
+        n_during = s.get("n_during_rows", 0)
+        n_post   = s.get("n_post_rows",   0)
+        warnings = []
+        if n_pre == 0:
+            warnings.append("⚠ Pre-period is EMPTY — event starts before JAO data. "
+                            "Δ values cannot be computed.")
+        if n_during == 0:
+            warnings.append("⚠ During-period is EMPTY — event lies outside JAO window. "
+                            "No comparison possible.")
+
         # ── Summary text ──────────────────────────────────────────────────
         self._ev_summary_txt.delete("1.0", "end")
+        tgt = (self.results.get("target_zone") if self.results else None) or "NO3"
         lines = [
             f"Event:    {s['asset_name']} ({s['asset_type']}, {s['planned_or_forced']})",
             f"Window:   {s['start_utc'][:16]} → {s['end_utc'][:16]} UTC  "
             f"({s['duration_h']} h)",
             f"CNECs:    {s['n_cnecs']}  |  "
-            f"Pre rows: {s['n_pre_rows']:,}  During: {s['n_during_rows']:,}  "
-            f"Post: {s['n_post_rows']:,}",
+            f"Pre rows: {n_pre:,}  During: {n_during:,}  Post: {n_post:,}",
+        ]
+        if warnings:
+            lines.append("")
+            lines.extend(warnings)
+        lines += [
             "",
-            "── Average FB parameter shift (ALL NO3 CNECs) ────────────────",
+            f"── Average FB parameter shift (ALL {tgt} CNECs) ──────────────────",
         ]
         for col in ["f0", "ram", "shadowPrice", "frm", "iva"]:
             pre_k  = f"pre_mean_{col}"
             dur_k  = f"during_mean_{col}"
             dlt_k  = f"delta_{col}"
             if pre_k in s:
-                dlt = s[dlt_k]
-                if dlt is None or (isinstance(dlt, float) and math.isnan(dlt)):
+                pre_v = s[pre_k]
+                dur_v = s[dur_k]
+                dlt_v = s[dlt_k]
+                pre_s = self._fv(pre_v)
+                dur_s = self._fv(dur_v)
+                dlt_ok = (dlt_v is not None and not (isinstance(dlt_v, float)
+                                                      and math.isnan(dlt_v)))
+                if dlt_ok:
+                    arrow = "↑" if dlt_v > 0 else "↓"
                     lines.append(
-                        f"  {col:15s}: pre=      n/a  during={s[dur_k]:>9.2f}"
-                        f"  Δ=      n/a (no pre-period data)")
+                        f"  {col:15s}: pre={pre_s}  during={dur_s}"
+                        f"  Δ={dlt_v:>+9.2f} MW {arrow}")
                 else:
-                    arrow = "↑" if dlt > 0 else "↓"
+                    reason = "(no pre-period data)" if n_pre == 0 else "(no during data)" if n_during == 0 else ""
                     lines.append(
-                        f"  {col:15s}: pre={s[pre_k]:>9.2f}  during={s[dur_k]:>9.2f}"
-                        f"  Δ={dlt:>+9.2f} MW {arrow}")
+                        f"  {col:15s}: pre={pre_s}  during={dur_s}"
+                        f"  Δ=      n/a {reason}")
         if s.get("did_estimates"):
             lines += ["", "── DiD estimates (high − low PTDF_FI effect) ────────────────"]
             for col, val in s["did_estimates"].items():
