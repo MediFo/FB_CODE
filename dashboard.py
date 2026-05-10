@@ -20,6 +20,36 @@ or import:
 """
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# Auto-install missing dependencies before any other imports
+# ---------------------------------------------------------------------------
+import subprocess, sys as _sys
+
+def _ensure(*packages):
+    """Install packages that are not yet importable."""
+    import importlib
+    for pip_name, import_name in packages:
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            print(f"[setup] installing {pip_name}...")
+            subprocess.check_call(
+                [_sys.executable, "-m", "pip", "install", "--quiet", pip_name],
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+            )
+
+_ensure(
+    ("pandas",       "pandas"),
+    ("numpy",        "numpy"),
+    ("matplotlib",   "matplotlib"),
+    ("statsmodels",  "statsmodels"),
+    ("linearmodels", "linearmodels"),
+    ("requests",     "requests"),
+    ("entsoe-py",    "entsoe"),
+)
+del _ensure, subprocess
+# ---------------------------------------------------------------------------
+
 import os
 import sys
 import threading
