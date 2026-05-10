@@ -50,6 +50,7 @@ _ensure(
 del _ensure, subprocess
 # ---------------------------------------------------------------------------
 
+import math
 import os
 import sys
 import threading
@@ -1216,10 +1217,16 @@ class App:
             dur_k  = f"during_mean_{col}"
             dlt_k  = f"delta_{col}"
             if pre_k in s:
-                arrow = "↑" if s[dlt_k] > 0 else "↓"
-                lines.append(
-                    f"  {col:15s}: pre={s[pre_k]:>9.2f}  during={s[dur_k]:>9.2f}"
-                    f"  Δ={s[dlt_k]:>+9.2f} MW {arrow}")
+                dlt = s[dlt_k]
+                if dlt is None or (isinstance(dlt, float) and math.isnan(dlt)):
+                    lines.append(
+                        f"  {col:15s}: pre=      n/a  during={s[dur_k]:>9.2f}"
+                        f"  Δ=      n/a (no pre-period data)")
+                else:
+                    arrow = "↑" if dlt > 0 else "↓"
+                    lines.append(
+                        f"  {col:15s}: pre={s[pre_k]:>9.2f}  during={s[dur_k]:>9.2f}"
+                        f"  Δ={dlt:>+9.2f} MW {arrow}")
         if s.get("did_estimates"):
             lines += ["", "── DiD estimates (high − low PTDF_FI effect) ────────────────"]
             for col, val in s["did_estimates"].items():

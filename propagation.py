@@ -1313,14 +1313,16 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
 
     if no3.empty:
         # Produce a helpful diagnostic before aborting
-        all_zones = sorted(jao["biddingZoneFrom"].dropna().unique().tolist() +
-                           jao["biddingZoneTo"].dropna().unique().tolist())
-        zone_hint = ", ".join(dict.fromkeys(all_zones))  # dedup, preserve order
+        zones_in_file: list = []
+        for col in ("biddingZoneFrom", "biddingZoneTo"):
+            if col in jao.columns:
+                zones_in_file.extend(jao[col].dropna().unique().tolist())
+        zone_hint = ", ".join(dict.fromkeys(zones_in_file))  # dedup, preserve order
         raise ValueError(
             f"No CNECs found for target zone '{cfg.target_zone}' in the loaded JAO data.\n"
             f"Check that your JAO CSV contains {cfg.target_zone} CNECs.\n"
-            f"Bidding zones present in this file: {zone_hint or '(none detected)'}\n"
-            f"CNEC patterns used: {cfg.no3_patterns}"
+            f"Bidding zones detected in this file: {zone_hint or '(none detected)'}\n"
+            f"CNEC name patterns tried: {cfg.no3_patterns}"
         )
 
     jao_start = no3["dateTimeUtc"].min()
