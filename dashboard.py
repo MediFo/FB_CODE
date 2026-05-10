@@ -1175,12 +1175,14 @@ class App:
 
     def _single_event_worker(self, outage_row):
         no3 = self.results["no3"]
+        _src = (self.results.get("source_country") or self.source_country.get() or "FI").lower()
         try:
             res = pipe.single_event_analysis(
                 no3, outage_row,
                 baseline_days=int(self.baseline_days.get()),
                 post_days=int(self.post_days.get()),
                 log_cb=self._log,
+                src=_src,
             )
             self.root.after(0, self._display_single_event, res, outage_row)
         except Exception as e:

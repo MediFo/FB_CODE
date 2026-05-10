@@ -634,6 +634,26 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
         outg["capacity_mw"] = pd.to_numeric(outg["capacity_mw"],
                                             errors="coerce").fillna(0.0)
 
+        # ── Filter to source-country outages only ────────────────────────────
+        # bidding_zone in outage rows is the 2-letter country code (e.g. "FI",
+        # "NO") or a bidding-zone code starting with those letters (e.g. "NO_2",
+        # "NO3").  Keep only outages whose zone starts with src.upper() so that
+        # FI events don't pollute NO covariates and vice versa.
+        src_prefix = p.upper()  # "FI", "NO", "SE", …
+        if "bidding_zone" in outg.columns:
+            bz = outg["bidding_zone"].fillna("").str.upper()
+            n_before = len(outg)
+            outg = outg[bz.str.startswith(src_prefix)]
+            n_after = len(outg)
+            if n_after < n_before:
+                log_cb(f"  Filtered outages to {src_prefix} source: "
+                       f"{n_after}/{n_before} events kept "
+                       f"({n_before - n_after} non-{src_prefix} events excluded from covariates)")
+            if outg.empty:
+                log_cb(f"  ⚠ No {src_prefix} outage events in dataset — "
+                       f"all {src_prefix} covariate columns will be zero. "
+                       f"Fetch outages with source country = {src_prefix} for meaningful results.")
+
         ts = jao["dateTimeUtc"].values.astype("datetime64[ns]")
 
         def subset_ndarrays(df: pd.DataFrame):
@@ -705,14 +725,19 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
 
     # H2: |PTDF_{SRC}| — topology shift is sign-agnostic; AC outage changes the
     #     admittance matrix in magnitude, not necessarily direction.
-    # Try source-specific PTDF column first, then fall back to ptdf_FI.
-    ptdf_src_col = f"ptdf_{src.upper()}"
+    # Column is named ptdf_{SRC}_abs (e.g. ptdf_FI_abs, ptdf_NO_abs).
+    # ptdf_FI_abs is kept as an alias so downstream code that hardcodes "ptdf_FI_abs"
+    # still works when src != "fi".
+    ptdf_src_col     = f"ptdf_{src.upper()}"
+    ptdf_src_abs_col = f"ptdf_{src.upper()}_abs"   # e.g. "ptdf_NO_abs"
     if ptdf_src_col in jao.columns:
-        jao["ptdf_FI_abs"] = jao[ptdf_src_col].abs()
+        jao[ptdf_src_abs_col] = jao[ptdf_src_col].abs()
     elif "ptdf_FI" in jao.columns:
-        jao["ptdf_FI_abs"] = jao["ptdf_FI"].abs()
+        jao[ptdf_src_abs_col] = jao["ptdf_FI"].abs()
     else:
-        jao["ptdf_FI_abs"] = np.nan
+        jao[ptdf_src_abs_col] = np.nan
+    if ptdf_src_abs_col != "ptdf_FI_abs":          # backward-compat alias
+        jao["ptdf_FI_abs"] = jao[ptdf_src_abs_col]
 
     # Shadow price cleaning: JAO encodes non-binding as 1e-8 (not truly 0).
     # Treat anything < 1e-6 as non-binding (shadow price = 0).
@@ -1026,7 +1051,7 @@ def _build_hypotheses(src: str = "fi", tgt: str = "NO3") -> list:
                   f"on {tgt} CNECs (sign depends on HVDC normal flow direction)")},
 
         # H2: SRC AC line outage → |PTDF_SRC| shifts on TGT CNECs
-        {"id": "H2", "dep": "ptdf_FI_abs",
+        {"id": "H2", "dep": f"ptdf_{SRC}_abs",
          "var": f"{p}_ac_line_outage_active",
          "expected_sign": None,
          "text": (f"|PTDF_{SRC}| on {tgt} CNECs shifts during {SRC} AC line outages "
@@ -1403,7 +1428,10 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # ── H2: |PTDF_{SRC}| ─────────────────────────────────────────────────────
     # Absolute value: AC topology change shifts PTDF regardless of sign convention.
     log_cb(f"Running |PTDF_{_src.upper()}| regression [H2]...")
-    h2_dep = "ptdf_FI_abs" if "ptdf_FI_abs" in no3_cov.columns else "ptdf_FI"
+    _ptdf_abs_col = f"ptdf_{_src.upper()}_abs"
+    h2_dep = (_ptdf_abs_col if _ptdf_abs_col in no3_cov.columns
+              else "ptdf_FI_abs" if "ptdf_FI_abs" in no3_cov.columns
+              else "ptdf_FI")
     res_ptdf = run_panel_regression(no3_cov, h2_dep, log_cb=log_cb, cluster="time", src=_src)
 
     # ── H3: RAM ──────────────────────────────────────────────────────────────
@@ -1443,7 +1471,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         "fall":         res_fall,    # backward compatibility
         "fref_signed":  res_fall,    # backward compatibility (was wrong variable)
         "f0":           res_fall,    # backward compatibility
-        "ptdf_FI_abs":  res_ptdf,
+        _ptdf_abs_col:  res_ptdf,    # e.g. "ptdf_NO_abs" or "ptdf_FI_abs"
+        "ptdf_FI_abs":  res_ptdf,    # backward-compat alias
         "ptdf_FI":      res_ptdf,
         "ram":          res_ram,
         "shadowPrice":  res_sp,
@@ -1624,9 +1653,10 @@ def run_event_study(df: pd.DataFrame, dep_var: str,
 def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
                            baseline_days: int = 7,
                            post_days: int = 3,
-                           log_cb: LogCallback = _noop) -> dict:
+                           log_cb: LogCallback = _noop,
+                           src: str = "fi") -> dict:
     """
-    Deep-dive analysis for one specific FI maintenance event.
+    Deep-dive analysis for one specific maintenance event.
 
     Returns:
       summary      : dict of scalar statistics
@@ -1756,9 +1786,14 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     # treatment intensities and doesn't require a discretisation assumption.
     did = pd.DataFrame()
     did_estimates = {}
-    if "ptdf_FI" in no3_df.columns and sm is not None:
-        # Compute per-CNEC mean |PTDF_FI| (time-stable for the window)
-        ptdf_fi_abs = no3_df.groupby("cneName")["ptdf_FI"].mean().abs()
+    # Use source-specific PTDF column (ptdf_FI, ptdf_NO, …).
+    # Fall back to ptdf_FI for backward compatibility.
+    _ptdf_raw_col = f"ptdf_{src.upper()}"
+    if _ptdf_raw_col not in no3_df.columns:
+        _ptdf_raw_col = "ptdf_FI"   # fallback
+    if _ptdf_raw_col in no3_df.columns and sm is not None:
+        # Compute per-CNEC mean |PTDF_{SRC}| (time-stable for the window)
+        ptdf_fi_abs = no3_df.groupby("cneName")[_ptdf_raw_col].mean().abs()
         no3_work = window.copy()
         no3_work["ptdf_fi_abs"] = no3_work["cneName"].map(ptdf_fi_abs)
         no3_work["d_outage"] = ((no3_work.dateTimeUtc >= s) &
@@ -1833,7 +1868,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             summary[f"during_mean_{col}"] = round(float(during[col].mean()), 2) if not during.empty else np.nan
             summary[f"delta_{col}"]       = round(summary[f"during_mean_{col}"]
                                                    - summary[f"pre_mean_{col}"], 2)
-    summary["did_estimates"] = did_estimates if "ptdf_FI" in no3_df.columns else {}
+    summary["did_estimates"] = did_estimates if _ptdf_raw_col in no3_df.columns else {}
 
     log_cb(f"Single event analysis complete: {summary['asset_name']} | "
            f"Δf0={summary.get('delta_f0','n/a')} MW | "
