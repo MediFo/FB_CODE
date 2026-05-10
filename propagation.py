@@ -1440,6 +1440,23 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     pre_start = s - pd.Timedelta(days=baseline_days)
     post_end  = e + pd.Timedelta(days=post_days)
 
+    # ── Guard: event window must overlap JAO data ───────────────────────────
+    jao_min = no3_df["dateTimeUtc"].min()
+    jao_max = no3_df["dateTimeUtc"].max()
+    if s > jao_max or e < jao_min:
+        raise ValueError(
+            f"Event window {s.date()} → {e.date()} is entirely outside the "
+            f"JAO data range {jao_min.date()} → {jao_max.date()}.\n"
+            f"Load a JAO CSV that covers the event date, or pick a different event."
+        )
+    if pre_start < jao_min:
+        log_cb(f"  ⚠ Pre-period clipped: JAO data starts {jao_min.date()} "
+               f"(need {pre_start.date()}). Baseline may be short.")
+    if post_end > jao_max:
+        log_cb(f"  ⚠ Post-period clipped: JAO data ends {jao_max.date()} "
+               f"(need {post_end.date()}). Recovery window may be short.")
+    # ───────────────────────────────────────────────────────────────────────
+
     pre     = no3_df[(no3_df.dateTimeUtc >= pre_start) & (no3_df.dateTimeUtc < s)]
     during  = no3_df[(no3_df.dateTimeUtc >= s)          & (no3_df.dateTimeUtc < e)]
     post    = no3_df[(no3_df.dateTimeUtc >= e)           & (no3_df.dateTimeUtc < post_end)]
