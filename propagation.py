@@ -440,7 +440,12 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 except Exception as e:
                     log_cb(f"  A78 row err: {e}")
         except Exception as e:
-            log_cb(f"ENTSO-E A78 {fr}->{to} failed: {e}")
+            err_str = str(e)
+            if "400" in err_str or "No matching data found" in err_str:
+                # 400 = border not published in ENTSO-E TP (normal for many FI borders)
+                log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
+            else:
+                log_cb(f"ENTSO-E A78 {fr}->{to} failed: {e}")
 
     log_cb(f"ENTSO-E events recorded: {len(events)}")
     return pd.DataFrame(events)
@@ -1305,6 +1310,18 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")
     no3 = filter_no3(jao, cfg.no3_patterns, zone_label=cfg.target_zone)
     log_cb(f"  {cfg.target_zone} rows: {len(no3)}, {cfg.target_zone} CNECs: {no3['cneName'].nunique()}")
+
+    if no3.empty:
+        # Produce a helpful diagnostic before aborting
+        all_zones = sorted(jao["biddingZoneFrom"].dropna().unique().tolist() +
+                           jao["biddingZoneTo"].dropna().unique().tolist())
+        zone_hint = ", ".join(dict.fromkeys(all_zones))  # dedup, preserve order
+        raise ValueError(
+            f"No CNECs found for target zone '{cfg.target_zone}' in the loaded JAO data.\n"
+            f"Check that your JAO CSV contains {cfg.target_zone} CNECs.\n"
+            f"Bidding zones present in this file: {zone_hint or '(none detected)'}\n"
+            f"CNEC patterns used: {cfg.no3_patterns}"
+        )
 
     jao_start = no3["dateTimeUtc"].min()
     jao_end   = no3["dateTimeUtc"].max()

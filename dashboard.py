@@ -1187,6 +1187,16 @@ class App:
             import traceback; self._log(traceback.format_exc())
 
     def _display_single_event(self, res: dict, outage_row):
+        try:
+            self._display_single_event_inner(res, outage_row)
+        except Exception as exc:
+            import traceback
+            self._log(f"[Tab6 display error] {exc}\n{traceback.format_exc()}")
+            self._ev_summary_txt.delete("1.0", "end")
+            self._ev_summary_txt.insert("end",
+                f"⚠ Display error — check Log tab for details.\n\n{exc}")
+
+    def _display_single_event_inner(self, res: dict, outage_row):
         s = res["summary"]
 
         # ── Summary text ──────────────────────────────────────────────────
@@ -1213,7 +1223,14 @@ class App:
         if s.get("did_estimates"):
             lines += ["", "── DiD estimates (high − low PTDF_FI effect) ────────────────"]
             for col, val in s["did_estimates"].items():
-                lines.append(f"  {col:15s}: ATT = {val:>+9.2f} MW")
+                if isinstance(val, dict):
+                    beta = val.get("beta", float("nan"))
+                    p    = val.get("p",    float("nan"))
+                    interp = val.get("interpretation", "")
+                    lines.append(
+                        f"  {col:15s}: β={beta:>+9.4f}  p={p:.3f}  {interp}")
+                else:
+                    lines.append(f"  {col:15s}: ATT = {float(val):>+9.2f} MW")
         self._ev_summary_txt.insert("end", "\n".join(lines))
 
         # ── ITS plot ──────────────────────────────────────────────────────
@@ -1276,7 +1293,15 @@ class App:
             if s.get("did_estimates"):
                 self._ev_did_txt.insert("end", "\n\n── ATT estimates ──\n")
                 for col, val in s["did_estimates"].items():
-                    self._ev_did_txt.insert("end", f"  {col}: {val:+.2f} MW\n")
+                    if isinstance(val, dict):
+                        beta   = val.get("beta", float("nan"))
+                        p      = val.get("p",    float("nan"))
+                        interp = val.get("interpretation", "")
+                        self._ev_did_txt.insert("end",
+                            f"  {col}: β={beta:+.4f}  p={p:.3f}  {interp}\n")
+                    else:
+                        self._ev_did_txt.insert("end",
+                            f"  {col}: ATT={float(val):+.2f} MW\n")
 
         # ── Per-CNEC table ────────────────────────────────────────────────
         for it in self._ev_cnec_tree.get_children():
