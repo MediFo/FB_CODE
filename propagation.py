@@ -1430,16 +1430,12 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
       did          : DiD table (high vs low PTDF_FI CNECs)
       cnec_table   : per-CNEC before/after table
     """
-    s = pd.Timestamp(outage_row["start_utc"], tz="UTC") \
-        if hasattr(outage_row["start_utc"], "isoformat") \
-        else pd.Timestamp(outage_row["start_utc"]).tz_localize("UTC") \
-        if pd.Timestamp(outage_row["start_utc"]).tzinfo is None \
-        else pd.Timestamp(outage_row["start_utc"]).tz_convert("UTC")
-    e = pd.Timestamp(outage_row["end_utc"], tz="UTC") \
-        if hasattr(outage_row["end_utc"], "isoformat") \
-        else pd.Timestamp(outage_row["end_utc"]).tz_localize("UTC") \
-        if pd.Timestamp(outage_row["end_utc"]).tzinfo is None \
-        else pd.Timestamp(outage_row["end_utc"]).tz_convert("UTC")
+    def _to_utc(val):
+        ts = pd.Timestamp(val)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+    s = _to_utc(outage_row["start_utc"])
+    e = _to_utc(outage_row["end_utc"])
 
     pre_start = s - pd.Timedelta(days=baseline_days)
     post_end  = e + pd.Timedelta(days=post_days)
