@@ -42,17 +42,18 @@ try:
     from statsmodels.stats.diagnostic import het_breuschpagan
     from statsmodels.stats.outliers_influence import variance_inflation_factor
     from statsmodels.stats.stattools import durbin_watson
-except ImportError:
+except (ImportError, AttributeError, Exception):
+    # AttributeError covers statsmodels<0.14 using removed np.MachAr on NumPy 2.x
     sm = None
 
 try:
     from linearmodels.panel import PanelOLS
-except ImportError:
+except (ImportError, AttributeError, Exception):
     PanelOLS = None
 
 try:
     from entsoe import EntsoePandasClient
-except ImportError:
+except (ImportError, AttributeError, Exception):
     EntsoePandasClient = None
 
 
