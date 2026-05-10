@@ -349,8 +349,21 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
     log_cb(f"ENTSO-E: fetching with token {ENTSOE_TOKEN[:8]}...{ENTSOE_TOKEN[-4:]}")
 
     client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
-    start = pd.Timestamp(start_utc).tz_convert("UTC")
-    end   = pd.Timestamp(end_utc).tz_convert("UTC")
+    # Use the same safe helper once it is defined below.
+    # start_utc / end_utc come from user input (ISO strings) so they may be naive.
+    _s_ts = pd.Timestamp(start_utc)
+    _e_ts = pd.Timestamp(end_utc)
+    start = _s_ts.tz_localize("UTC") if _s_ts.tzinfo is None else _s_ts.tz_convert("UTC")
+    end   = _e_ts.tz_localize("UTC") if _e_ts.tzinfo is None else _e_ts.tz_convert("UTC")
+    def _ts_utc(val) -> pd.Timestamp:
+        """Convert any timestamp value to UTC-aware Timestamp.
+        Handles: UTC-aware, any-tz-aware (converts), and naive (assumes UTC).
+        Safe against tz_convert() raising TypeError on naive inputs."""
+        ts = pd.Timestamp(val)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")   # naive → assume UTC (ENTSO-E API default)
+        return ts.tz_convert("UTC")
+
     events = []
 
     # ----- A77: production unavailability -----
@@ -379,8 +392,8 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                     pass
                 events.append({
                     "outage_id": f"entsoe_a77:{row.get('mrid', i)}:{row.get('start')}",
-                    "start_utc": pd.Timestamp(row["start"]).tz_convert("UTC").isoformat(),
-                    "end_utc":   pd.Timestamp(row["end"]).tz_convert("UTC").isoformat(),
+                    "start_utc": _ts_utc(row["start"]).isoformat(),
+                    "end_utc":   _ts_utc(row["end"]).isoformat(),
                     "asset_id":  row.get("production_resource_id"),
                     "asset_name": row.get("production_resource_name"),
                     "asset_type": "generator",
@@ -424,8 +437,8 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                         pass
                     events.append({
                         "outage_id": f"entsoe_a78:{fr}-{to}:{row.get('mrid', i)}:{row.get('start')}",
-                        "start_utc": pd.Timestamp(row["start"]).tz_convert("UTC").isoformat(),
-                        "end_utc":   pd.Timestamp(row["end"]).tz_convert("UTC").isoformat(),
+                        "start_utc": _ts_utc(row["start"]).isoformat(),
+                        "end_utc":   _ts_utc(row["end"]).isoformat(),
                         "asset_id":  None,
                         "asset_name": f"{fr}->{to}",
                         "asset_type": "hvdc" if is_hvdc else "ac_line",
