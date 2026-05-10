@@ -217,6 +217,16 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 if cap_lost <= 0: continue
                 btype = str(row.get("businesstype", "")).strip()
                 p_or_f = "forced" if btype == "A54" else "planned"
+                # Skip implausibly long records (>30 days = status updates)
+                try:
+                    dur_h = (pd.Timestamp(row["end"]) - pd.Timestamp(row["start"])
+                             ).total_seconds() / 3600
+                    if dur_h > 30 * 24:
+                        log_cb(f"  A77 skipped: {row.get('production_resource_name','')} "
+                               f"duration {dur_h/24:.0f} d (likely status update)")
+                        continue
+                except Exception:
+                    pass
                 events.append({
                     "outage_id": f"entsoe_a77:{row.get('mrid', i)}:{row.get('start')}",
                     "start_utc": pd.Timestamp(row["start"]).tz_convert("UTC").isoformat(),
@@ -252,6 +262,17 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 try:
                     cap = float(row.get("avail_qty", 0) or 0)
                     is_hvdc = ("EE" in (fr,to)) or ("SE_3" in (fr,to))
+                    # Skip implausibly long records (>30 days = ENTSO-E status
+                    # updates stored as new events, not real outages)
+                    try:
+                        dur_h = (pd.Timestamp(row["end"]) - pd.Timestamp(row["start"])
+                                 ).total_seconds() / 3600
+                        if dur_h > 30 * 24:
+                            log_cb(f"  A78 skipped: {fr}->{to} duration "
+                                   f"{dur_h/24:.0f} d (likely status update)")
+                            continue
+                    except Exception:
+                        pass
                     events.append({
                         "outage_id": f"entsoe_a78:{fr}-{to}:{row.get('mrid', i)}:{row.get('start')}",
                         "start_utc": pd.Timestamp(row["start"]).tz_convert("UTC").isoformat(),
@@ -1449,6 +1470,15 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             f"JAO data range {jao_min.date()} → {jao_max.date()}.\n"
             f"Load a JAO CSV that covers the event date, or pick a different event."
         )
+    # Warn if event duration looks implausible (> 30 days = likely bad ENTSO-E record)
+    duration_h = (e - s).total_seconds() / 3600
+    if duration_h > 30 * 24:
+        raise ValueError(
+            f"Event duration is {duration_h:.0f} h ({duration_h/24:.0f} days) — "
+            f"likely a spurious ENTSO-E record (status update stored as a new event).\n"
+            f"A {duration_h/24:.0f}-day forced outage would consume the entire JAO window "
+            f"leaving no pre/post baseline. Select a real short-duration event instead."
+        )
     if pre_start < jao_min:
         log_cb(f"  ⚠ Pre-period clipped: JAO data starts {jao_min.date()} "
                f"(need {pre_start.date()}). Baseline may be short.")
@@ -1461,6 +1491,14 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     during  = no3_df[(no3_df.dateTimeUtc >= s)          & (no3_df.dateTimeUtc < e)]
     post    = no3_df[(no3_df.dateTimeUtc >= e)           & (no3_df.dateTimeUtc < post_end)]
     window  = no3_df[(no3_df.dateTimeUtc >= pre_start)   & (no3_df.dateTimeUtc < post_end)]
+
+    # Final guard: if pre AND post are both empty there is no baseline at all
+    if pre.empty and post.empty:
+        raise ValueError(
+            f"Event {s.date()} → {e.date()} ({duration_h:.0f} h) covers the entire "
+            f"JAO window — no pre/post baseline rows exist. "
+            f"Load a longer JAO CSV or select a shorter event."
+        )
 
     fb_params = [c for c in ["f0","fref","ram","shadowPrice","frm","iva","ptdf_FI",
                               "ptdf_FI_FS","ptdf_FI_EL","amr","faac"]
