@@ -42,24 +42,23 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 
-# Local imports (the pipeline + synthetic generator)
-# Make the dashboard work regardless of the current working directory
-# by adding its own folder to sys.path before importing siblings.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# Local imports: add both the package directory and its parent (src/) so that
+# "from fi_no3 import ..." works whether the dashboard is run directly or
+# imported as part of the installed package.
+_HERE   = os.path.dirname(os.path.abspath(__file__))   # .../src/fi_no3/
+_PARENT = os.path.dirname(_HERE)                        # .../src/
+for _p in [_PARENT, _HERE]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 try:
     from fi_no3 import propagation as pipe
     from fi_no3 import synthetic as syn
 except ModuleNotFoundError as _e:
     raise ModuleNotFoundError(
-        f"Could not import fi_no3_propagation / fi_no3_synthetic.\n"
-        f"Looked in: {_HERE}\n"
-        f"Make sure all three files are in the same folder:\n"
-        f"  - fi_no3_propagation.py\n"
-        f"  - fi_no3_synthetic.py\n"
-        f"  - fi_no3_dashboard.py\n"
+        f"Could not import fi_no3 package.\n"
+        f"Expected package layout: src/fi_no3/{{propagation,synthetic,dashboard}}.py\n"
+        f"Searched: {_PARENT}\n"
         f"Original error: {_e}"
     ) from _e
 

@@ -78,22 +78,26 @@ The sign depends on CNEC orientation (which terminal is "from" and which is
 "to") set by each TSO when defining the CNEC. It is not a physical property.
 
 **Consequence.** Regressing raw PTDF_FI on outage covariates, or using raw
-`fref` across mixed-sign CNECs, produces coefficient attenuation. A FI outage
+`fall` across mixed-sign CNECs, produces coefficient attenuation. A FI outage
 that moves all CNECs in the physically-correct direction will produce near-zero
 coefficients because positive and negative PTDF CNECs partially cancel.
 
 **Fix applied:**
-1. Each CNEC gets a per-CNEC sign `σ_i = sign(median PTDF_FI over pre-period)`.
-2. The signed dependent variables `fref_signed = σ_i × fref` and
+1. Each CNEC gets a per-CNEC sign `σ_i = sign(median fall over pre-period)`.
+2. The signed dependent variables `fall_signed = σ_i × fall` and
    `ptdf_FI_abs = |PTDF_FI|` are computed before regression.
-3. Hypothesis H1 now tests `fref_signed` (sign-normalised Fref), H2 tests
-   `ptdf_FI_abs`.
-4. The `build_covariates` function adds `fref_signed` and `ptdf_FI_abs` columns.
+3. Hypothesis H1 now tests `fall_signed` (sign-normalised F_allReference),
+   H2 tests `ptdf_FI_abs`.
+4. The `build_covariates` function adds `fall_signed` and `ptdf_FI_abs` columns.
 
 **Physical interpretation after fix:** A positive β on `fi_hvdc_outage_active`
-for `fref_signed` means "the outage loads the CNE in the congested direction
+for `fall_signed` means "the outage loads the CNE in the congested direction
 for CNECs where FI normally loads that direction" — which is the correct
 physical hypothesis.
+
+**Note on `fref` / `f0` vs `fall`:** `fref` (identical to `f0` in JAO exports)
+is the flow at CGMA NP — it is NOT the reference flow in the RAM formula.
+`fall` (F_allReference) is the correct term. See Issue 1 for full details.
 
 ---
 
@@ -202,8 +206,8 @@ Y_{it} = Σ_k β_k · D_{k,it}      (event-time dummies, leads/lags in hours)
 Dependent variables and transformations:
 | Hypothesis | Dependent variable | Transformation |
 |---|---|---|
-| H1 | fref | Sign-normalised per CNEC (fref_signed) |
-| H2 | ptdf_FI | Absolute value per CNEC (ptdf_FI_abs) |
+| H1 | fall (F_allReference) | Sign-normalised per CNEC (`fall_signed`) |
+| H2 | ptdf_FI | Absolute value per CNEC (`ptdf_FI_abs`) |
 | H3 | ram | As published |
 | H4 | shadowPrice | Conditional on binding; note selection |
 | H5 | iva>0 (binary) | Logit |

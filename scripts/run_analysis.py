@@ -16,6 +16,12 @@ import os
 import sys
 from pathlib import Path
 
+# Ensure UTF-8 output on Windows consoles that default to cp1252
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Allow running from project root or scripts/ directory
 _HERE   = Path(__file__).resolve().parent
 _ROOT   = _HERE.parent
@@ -90,16 +96,13 @@ def main():
         args.end   = jao_df["dateTimeUtc"].max().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     cfg = PipelineConfig(
-        jao_csv        = args.jao or "",
-        out_dir        = args.out,
-        manual_csv     = args.outages,
-        start_utc      = args.start,
-        end_utc        = args.end,
-        fingrid_api_key= "" if args.no_fingrid else args.fingrid_key,
-        entsoe_api_key = "" if args.no_entsoe  else args.entsoe_key,
-        use_fingrid    = not args.no_fingrid,
-        use_entsoe     = not args.no_entsoe,
-        use_manual     = True,
+        jao_csv    = args.jao or "",
+        out_dir    = args.out,
+        manual_csv = args.outages,
+        start_utc  = args.start,
+        end_utc    = args.end,
+        use_entsoe = not args.no_entsoe,
+        use_manual = True,
     )
 
     # ── Run ────────────────────────────────────────────────────────────────
@@ -121,8 +124,11 @@ def main():
     print("=" * 65)
     print("REGRESSION SUMMARIES")
     print("=" * 65)
-    for name, label in [("f0","F0"), ("ptdf_FI","PTDF_FI"), ("ram","RAM"),
-                         ("shadowPrice","Shadow price"), ("frm","FRM (H6 placebo)")]:
+    for name, label in [("fall_signed", "fall_signed / F_allReference (H1)"),
+                         ("ptdf_FI_abs", "ptdf_FI_abs / |PTDF_FI| (H2)"),
+                         ("ram",         "RAM (H3)"),
+                         ("shadowPrice", "Shadow price (H4)"),
+                         ("frm",         "FRM (H6 placebo)")]:
         r = res["regressions"].get(name)
         if not r:
             print(f"  {label}: not available")
@@ -145,11 +151,50 @@ def main():
         print(f"  IVA logit: pseudo-R²={logit['pseudo_r2']:.3f}  "
               f"n_pos={logit['n_positive']}")
 
+    # ── HTML report ────────────────────────────────────────────────────────
+    def _reg_summary(name):
+        r = res["regressions"].get(name)
+        if not r:
+            return f"No result for {name}.\n"
+        lines = [f"Dependent: {r['dep']}",
+                 f"Observations: {r['n_obs']:,}  R2_within={r['rsquared_within']:.4f}"]
+        for _, row in r["coefs"].iterrows():
+            sig = ("**" if row.p < 0.01 else ("*" if row.p < 0.05
+                   else ("." if row.p < 0.10 else " ")))
+            lines.append(f"  {row.param:40s}  b={row.coef:>9.3f}  p={row.p:.4f} {sig}")
+        return "\n".join(lines)
+
+    import datetime as _dt
+    ctx = {
+        "ts":              _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "n_jao":           len(jao_df) if jao_df is not None else 0,
+        "n_no3":           len(res["no3"]),
+        "n_outages":       len(res["outages"]),
+        "hypotheses":      res["hypotheses"],
+        "summary_f0":      _reg_summary("fall_signed"),
+        "summary_ptdf_FI": _reg_summary("ptdf_FI_abs"),
+        "summary_ram":     _reg_summary("ram"),
+        "summary_shadowPrice": _reg_summary("shadowPrice"),
+        "summary_frm":     _reg_summary("frm"),
+        "summary_logit":   (f"pseudo-R2={logit['pseudo_r2']:.3f}  "
+                            f"n_pos={logit['n_positive']}" if logit else "not run"),
+        "figures": [],
+        "caveats": (
+            "Statistical power is heterogeneous across hypotheses: H1/H3 "
+            "have many treatment hours; H5 only a handful. Confounders include "
+            "Statnett's December 2024 FRM revision, seasonal Fmax derating on "
+            "Fenno-Skan, and planned FI line outages (best curated manually). "
+            "ENTSO-E A78 returns mostly forced events. FRM (H6) is a placebo: "
+            "a significant result indicates model mis-specification."
+        ),
+    }
+    report_path = render_html_report(res["out_dir"], ctx)
+
     print()
     print(f"Outputs saved to: {res['out_dir']}/")
     print("  no3_with_outage_covariates.csv")
     print("  outages_unified.csv")
-    print("  report.html  (open in browser)")
+    print(f"  report.html  (open in browser)  [{report_path}]")
 
 
 if __name__ == "__main__":

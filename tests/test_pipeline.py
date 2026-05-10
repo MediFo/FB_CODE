@@ -151,6 +151,24 @@ class TestOutageDedup:
         assert len(out) == 1
         assert out.iloc[0]["source"] == "entsoe_a78"
 
+    def test_dedup_keeps_non_overlapping_events_for_same_asset(self):
+        """Two outages of the SAME asset at DIFFERENT times must BOTH be kept.
+        The old drop_duplicates('_key') bug silently discarded the second event,
+        causing data loss for assets with recurring outages (e.g. Fenno-Skan)."""
+        base = {"asset_id": "FS", "asset_name": "Fenno-Skan", "asset_type": "hvdc",
+                "voltage_kv": 400.0, "capacity_mw": 800.0,
+                "planned_or_forced": "planned", "bidding_zone": "FI",
+                "control_area": "FI", "source": "manual", "raw_payload": "{}"}
+        rows = [
+            {**base, "outage_id": "fs_apr",
+             "start_utc": "2026-04-01T00:00:00Z", "end_utc": "2026-04-02T00:00:00Z"},
+            {**base, "outage_id": "fs_may",
+             "start_utc": "2026-05-15T00:00:00Z", "end_utc": "2026-05-16T00:00:00Z"},
+        ]
+        out = deduplicate_outages(pd.DataFrame(rows))
+        assert len(out) == 2, (
+            "Non-overlapping outages for the same asset must both be retained")
+
 
 # ── 4. Covariate building ─────────────────────────────────────────────────────
 

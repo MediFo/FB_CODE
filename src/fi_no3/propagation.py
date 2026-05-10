@@ -307,7 +307,12 @@ def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
 
 def deduplicate_outages(df: pd.DataFrame) -> pd.DataFrame:
     """Merge events from different sources by (asset, time-window) similarity.
-    Priority: entsoe_a78 > entsoe_a77 > entsoe_a80 > fingrid > manual."""
+    Priority: entsoe_a78 > entsoe_a77 > entsoe_a80 > fingrid > manual.
+
+    Only removes a lower-priority event when it overlaps in time with a
+    higher-priority event for the same asset. Non-overlapping outage periods
+    for the same asset (e.g., two Fenno-Skan outages months apart) are kept.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.copy()
@@ -315,16 +320,37 @@ def deduplicate_outages(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
     df = df.dropna(subset=["start_utc", "end_utc"]).reset_index(drop=True)
 
-    pri = {"entsoe_a78":4, "entsoe_a77":3, "entsoe_a80":2, "fingrid":1, "manual":0}
+    pri = {"entsoe_a78": 4, "entsoe_a77": 3, "entsoe_a80": 2, "fingrid": 1, "manual": 0}
     df["_pri"] = df["source"].map(pri).fillna(-1)
-    df["_key"] = (
+    df["_asset_key"] = (
         df["asset_id"].fillna("").astype(str) + "|" +
         df["asset_name"].fillna("").astype(str).str.lower().str.strip() + "|" +
         df["asset_type"].fillna("").astype(str)
     )
-    df = df.sort_values(["_key", "_pri"], ascending=[True, False])
-    df = df.drop_duplicates("_key", keep="first").drop(columns=["_key", "_pri"])
-    return df.reset_index(drop=True)
+    # Sort: same-asset rows together, highest priority first
+    df = df.sort_values(["_asset_key", "_pri", "start_utc"],
+                        ascending=[True, False, True]).reset_index(drop=True)
+
+    keep = np.ones(len(df), dtype=bool)
+    for _, grp in df.groupby("_asset_key", sort=False):
+        idxs = grp.index.tolist()
+        if len(idxs) == 1:
+            continue
+        # Within this asset group, suppress lower-priority rows that overlap
+        # with any already-kept higher-priority row.
+        for i in range(len(idxs)):
+            if not keep[idxs[i]]:
+                continue
+            si, ei = df.loc[idxs[i], "start_utc"], df.loc[idxs[i], "end_utc"]
+            for j in range(i + 1, len(idxs)):
+                if not keep[idxs[j]]:
+                    continue
+                sj, ej = df.loc[idxs[j], "start_utc"], df.loc[idxs[j], "end_utc"]
+                # Two intervals overlap iff neither ends before the other starts
+                if si < ej and sj < ei:
+                    keep[idxs[j]] = False  # j has lower or equal priority → drop
+
+    return df.loc[keep].drop(columns=["_asset_key", "_pri"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +984,30 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict) -> list[dict]:
                 else:
                     verdict = f"all candidate vars absorbed by FE: {tried}"
         out.append({"id": h["id"], "text": h["text"], "verdict": verdict})
+
+    # ── Multiple-testing correction (H1–H4 form the testable family) ─────────
+    # H5 is a logit (different distributional family); H6 is explicitly a
+    # placebo — significant H6 is already flagged as misspecification, not a
+    # finding, so it doesn't belong in the FWER pool.
+    fwer_pool = {"H1", "H2", "H3", "H4"}
+    p_vals: list[float | None] = []
+    pool_out = [h for h in out if h["id"] in fwer_pool]
+    for h in pool_out:
+        m = re.search(r",\s*p=([0-9.eE+\-]+)", h["verdict"])
+        p_vals.append(float(m.group(1)) if m else None)
+
+    if any(p is not None for p in p_vals):
+        reject = _holm_bonferroni(p_vals, alpha=0.05)
+        for h, rej, p in zip(pool_out, reject, p_vals):
+            if p is None:
+                continue
+            if "SIGNIFICANT" in h["verdict"] and not rej:
+                h["verdict"] += (
+                    "  ⚠ Holm–Bonferroni: p does NOT survive FWER correction "
+                    f"(raw p={p:.3g} > corrected threshold)")
+            elif "inconclusive" not in h["verdict"] and rej and p >= 0.05:
+                pass  # would be a contradiction — ignore
+
     return out
 
 
@@ -995,9 +1045,11 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
           f"<td class='{cls}'>{h['verdict']}</td></tr>")
     a("</table>")
 
-    for label, key in [("F0 regression","f0"), ("PTDF_FI regression","ptdf_FI"),
-                       ("RAM regression","ram"), ("Shadow price regression","shadowPrice"),
-                       ("FRM regression (placebo / H6)","frm"),
+    for label, key in [("fall_signed / F_allReference regression (H1)","f0"),
+                       ("PTDF_FI regression (H2)","ptdf_FI"),
+                       ("RAM regression (H3)","ram"),
+                       ("Shadow price regression (H4)","shadowPrice"),
+                       ("FRM regression — placebo (H6)","frm"),
                        ("Logit on IVA active (H5)","logit")]:
         text = ctx.get(f"summary_{key}", "n/a")
         a(f"<h2>{label}</h2><pre>{text}</pre>")
@@ -1020,6 +1072,29 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
 # ---------------------------------------------------------------------------
 # 10. End-to-end orchestrator (simple, called by dashboard)
 # ---------------------------------------------------------------------------
+def main_cli() -> None:
+    """pip console-script entry point for fi-no3-analyse.
+    Locates run_analysis.py relative to this file and delegates to its main()."""
+    import importlib.util
+    import sys as _sys
+    _here = Path(__file__).resolve().parent
+    _candidates = [
+        _here.parent.parent / "scripts" / "run_analysis.py",  # src/fi_no3/ layout
+        _here.parent / "scripts" / "run_analysis.py",
+        _here / "run_analysis.py",
+        _here.parent / "run_analysis.py",
+    ]
+    for _script in _candidates:
+        if _script.exists():
+            spec = importlib.util.spec_from_file_location("run_analysis", _script)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+            return
+    print("ERROR: run_analysis.py not found relative to propagation.py.", file=_sys.stderr)
+    _sys.exit(1)
+
+
 @dataclass
 class PipelineConfig:
     jao_csv:    str  = ""
