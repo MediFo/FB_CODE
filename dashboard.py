@@ -220,7 +220,7 @@ class App:
             row=0, column=0, sticky="w")
         src_cb = ttk.Combobox(scope, textvariable=self.source_country, width=8,
                               state="normal",
-                              values=["FI","NO","SE","DK","EE","LV","LT","DE","PL","NL","GB"])
+                              values=["FI","NO","SE","DK","EE","LV","LT"])
         src_cb.grid(row=0, column=1, sticky="w", padx=6)
         ttk.Label(scope,
                   text="(e.g. FI = fetch Finnish outages; NO = Norwegian outages)",
@@ -232,7 +232,8 @@ class App:
                               state="normal",
                               values=["NO3","NO1","NO2","NO4","NO5",
                                       "SE1","SE2","SE3","SE4",
-                                      "DK1","DK2","EE","LV","LT","FI","DE","PL","NL"])
+                                      "DK1","DK2",
+                                      "FI","EE","LV","LT"])
         tgt_cb.grid(row=1, column=1, sticky="w", padx=6, pady=(6,0))
         ttk.Label(scope,
                   text="(filters JAO CNECs and sets PTDF column; default NO3)",

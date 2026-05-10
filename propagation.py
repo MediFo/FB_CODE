@@ -159,28 +159,27 @@ def load_jao_csv(path: str) -> pd.DataFrame:
 # 2. NO3 filter
 # ---------------------------------------------------------------------------
 _ZONE_PATTERNS: dict = {
+    # ── Nordic bidding zones ──────────────────────────────────────────────────
     "NO3": (r"klæbu.*surna", r"klaebu.*surna",
             r"klæbu.*orkdal", r"klaebu.*orkdal",
             r"refsdal.*modalen", r"aurland",
             r"tunnsjødal", r"tunnsjodal",
             r"viklandet", r"namsos", r"verdal"),
-    "NO1": (r"hasle", r"kristiansand", r"flesaker", r"tegneby", r"furuset"),
-    "NO2": (r"kristiansand", r"kvilldal", r"tonstad"),
-    "NO4": (r"ofoten", r"kvandal", r"balsfjord", r"lyfjord"),
-    "NO5": (r"haugaland", r"sauda"),
-    "SE1": (r"hallsberg", r"nässjö", r"västerås", r"hagby"),
-    "SE2": (r"svartnäs", r"sundsvall"),
-    "SE3": (r"hallsberg", r"borgvik", r"midnordic"),
-    "SE4": (r"hurva", r"sege", r"trelleborg"),
-    "DK1": (r"kassø", r"tjele", r"fraugde"),
-    "DK2": (r"sjælland", r"zealand", r"amager"),
-    "EE":  (r"estlink", r"harku", r"kiisa"),
-    "LV":  (r"kurzeme", r"riga"),
-    "LT":  (r"kruonis", r"vilnius"),
-    "FI":  (r"fenno.*skan", r"suomi", r"helsinki", r"tampere"),
-    "DE":  (r"herdecke", r"osterath", r"oberzier"),
-    "PL":  (r"krajnik", r"polska"),
-    "NL":  (r"maasvlakte", r"norned"),
+    "NO1": (r"hasle", r"flesaker", r"tegneby", r"furuset", r"oslo.*fjord"),
+    "NO2": (r"kvilldal", r"tonstad", r"kristiansand", r"feda"),
+    "NO4": (r"ofoten", r"kvandal", r"balsfjord", r"lyfjord", r"nea"),
+    "NO5": (r"haugaland", r"sauda", r"fimreite"),
+    "SE1": (r"nässjö.*1", r"hagby", r"stornorrfors", r"luleå"),
+    "SE2": (r"svartnäs", r"sundsvall", r"midskog"),
+    "SE3": (r"hallsberg", r"borgvik", r"midnordic", r"nässjö.*3"),
+    "SE4": (r"hurva", r"sege", r"trelleborg", r"barsebäck"),
+    "DK1": (r"kassø", r"tjele", r"fraugde", r"revsing"),
+    "DK2": (r"sjælland", r"zealand", r"amager", r"ishøj"),
+    "FI":  (r"fenno.*skan", r"kymi", r"olkiluoto", r"vuosaari"),
+    # ── Baltic bidding zones (part of Nordic FB coupling) ────────────────────
+    "EE":  (r"estlink", r"harku", r"kiisa", r"balti"),
+    "LV":  (r"kurzeme", r"riga", r"augstceltne"),
+    "LT":  (r"kruonis", r"vilnius", r"ignalina"),
 }
 DEFAULT_NO3_PATTERNS: tuple = _ZONE_PATTERNS["NO3"]
 
@@ -190,49 +189,109 @@ def zone_patterns(target_zone: str) -> tuple:
     return _ZONE_PATTERNS.get(target_zone.upper(), ())
 
 
-# ---------- A78 cross-border query configuration ----------------------------
+# ---------- ENTSO-E A78 cross-border query configuration --------------------
+#
+# IMPORTANT: two different code formats are used depending on the query type:
+#
+#   A77 production unavailability  →  country code   "FI", "NO", "SE" …
+#   A78 transmission unavailability → bidding-zone codes  "FI", "SE_1", "NO_2", "DK_1" …
+#
+# Keys below are country codes (what the user selects, matches A77).
+# Values are lists of (from, to) bidding-zone pairs (what entsoe-py needs for A78).
+# Norway example: user selects "NO" → we query A78 for every NO_x ↔ neighbour pair.
+#
+# Bidding-zone codes used by entsoe-py (matches Area enum in the library):
+#   FI        Finland
+#   SE_1..4   Sweden North, North-Mid, South-Mid, South
+#   NO_1..5   Norway East/West/Mid/North/Far-North
+#   DK_1..2   Denmark West, East
+#   EE/LV/LT  Estonia, Latvia, Lithuania
+#   DE        Germany (single zone for cross-border purposes)
+#   PL        Poland
+#   NL        Netherlands
+#   GB        Great Britain
+#
 _KNOWN_BORDERS: dict = {
-    "FI":  [("FI","SE_1"),("SE_1","FI"),("FI","SE_3"),("SE_3","FI"),
-            ("FI","EE"),("EE","FI"),("FI","NO_4"),("NO_4","FI")],
-    "NO":  [("NO_2","DE"),("DE","NO_2"),("NO_2","NL"),("NL","NO_2"),
-            ("NO_2","DK_1"),("DK_1","NO_2"),("NO_2","GB"),("GB","NO_2"),
-            ("NO_3","SE_1"),("SE_1","NO_3"),("NO_4","SE_1"),("SE_1","NO_4"),
-            ("NO_4","SE_2"),("SE_2","NO_4"),("NO_5","SE_3"),("SE_3","NO_5"),
-            ("NO_1","SE_3"),("SE_3","NO_1")],
-    "SE":  [("SE_3","FI"),("FI","SE_3"),("SE_1","FI"),("FI","SE_1"),
-            ("SE_4","LT"),("LT","SE_4"),("SE_4","DE"),("DE","SE_4"),
-            ("SE_4","PL"),("PL","SE_4"),("SE_3","DK_1"),("DK_1","SE_3")],
-    "DK":  [("DK_1","NO_2"),("NO_2","DK_1"),("DK_1","SE_3"),("SE_3","DK_1"),
-            ("DK_1","DE"),("DE","DK_1"),("DK_2","DE"),("DE","DK_2"),
-            ("DK_2","SE_4"),("SE_4","DK_2"),("DK_2","NL"),("NL","DK_2")],
-    "EE":  [("EE","FI"),("FI","EE"),("EE","LV"),("LV","EE")],
-    "LV":  [("LV","EE"),("EE","LV"),("LV","LT"),("LT","LV")],
-    "LT":  [("LT","LV"),("LV","LT"),("LT","SE_4"),("SE_4","LT"),
-            ("LT","PL"),("PL","LT")],
-    "DE":  [("DE","DK_1"),("DK_1","DE"),("DE","DK_2"),("DK_2","DE"),
-            ("DE","SE_4"),("SE_4","DE"),("DE","NO_2"),("NO_2","DE")],
-    "PL":  [("PL","SE_4"),("SE_4","PL"),("PL","LT"),("LT","PL")],
-    "NL":  [("NL","NO_2"),("NO_2","NL"),("NL","DK_2"),("DK_2","NL")],
-    "GB":  [("GB","NO_2"),("NO_2","GB")],
+    # ── Finland ──────────────────────────────────────────────────────────────
+    # FI ↔ SE1 (AC), FI ↔ SE3 (Fenno-Skan HVDC), FI ↔ EE (Estlink HVDC),
+    # FI ↔ NO4 (AC — Rana–Tana 300 kV)
+    "FI":  [("FI","SE_1"),("SE_1","FI"),
+            ("FI","SE_3"),("SE_3","FI"),
+            ("FI","EE"),  ("EE","FI"),
+            ("FI","NO_4"),("NO_4","FI")],
+
+    # ── Norway ───────────────────────────────────────────────────────────────
+    # NO2 ↔ DE (NordLink HVDC), NO2 ↔ NL (NorNed HVDC),
+    # NO2 ↔ DK1 (Skagerrak HVDC), NO2 ↔ GB (North Sea Link HVDC),
+    # NO1 ↔ SE3 (AC), NO3 ↔ SE1 (AC), NO4 ↔ SE1 (AC), NO4 ↔ SE2 (AC),
+    # NO5 ↔ SE3 (AC)
+    "NO":  [("NO_2","DE"),  ("DE","NO_2"),
+            ("NO_2","NL"),  ("NL","NO_2"),
+            ("NO_2","DK_1"),("DK_1","NO_2"),
+            ("NO_2","GB"),  ("GB","NO_2"),
+            ("NO_1","SE_3"),("SE_3","NO_1"),
+            ("NO_3","SE_1"),("SE_1","NO_3"),
+            ("NO_4","SE_1"),("SE_1","NO_4"),
+            ("NO_4","SE_2"),("SE_2","NO_4"),
+            ("NO_5","SE_3"),("SE_3","NO_5")],
+
+    # ── Sweden ───────────────────────────────────────────────────────────────
+    # SE1 ↔ FI (AC), SE3 ↔ FI (Fenno-Skan HVDC),
+    # SE4 ↔ LT (SwePol/NordBalt HVDC), SE4 ↔ DE (Baltic Cable HVDC),
+    # SE4 ↔ PL (SwePol HVDC), SE3 ↔ DK1 (AC), SE4 ↔ DK2 (AC+HVDC)
+    "SE":  [("SE_1","FI"),  ("FI","SE_1"),
+            ("SE_3","FI"),  ("FI","SE_3"),
+            ("SE_4","LT"),  ("LT","SE_4"),
+            ("SE_4","DE"),  ("DE","SE_4"),
+            ("SE_4","PL"),  ("PL","SE_4"),
+            ("SE_3","DK_1"),("DK_1","SE_3"),
+            ("SE_4","DK_2"),("DK_2","SE_4")],
+
+    # ── Denmark ──────────────────────────────────────────────────────────────
+    # DK1 ↔ NO2 (Skagerrak HVDC), DK1 ↔ SE3 (AC),
+    # DK1 ↔ DE (AC+HVDC Kontek), DK2 ↔ DE (AC),
+    # DK2 ↔ SE4 (AC+HVDC), DK2 ↔ NL (Cobra Cable HVDC)
+    "DK":  [("DK_1","NO_2"),("NO_2","DK_1"),
+            ("DK_1","SE_3"),("SE_3","DK_1"),
+            ("DK_1","DE"),  ("DE","DK_1"),
+            ("DK_2","DE"),  ("DE","DK_2"),
+            ("DK_2","SE_4"),("SE_4","DK_2"),
+            ("DK_2","NL"),  ("NL","DK_2")],
+
+    # ── Baltic states ─────────────────────────────────────────────────────────
+    "EE":  [("EE","FI"),("FI","EE"),
+            ("EE","LV"),("LV","EE")],
+    "LV":  [("LV","EE"),("EE","LV"),
+            ("LV","LT"),("LT","LV")],
+    "LT":  [("LT","LV"),("LV","LT"),
+            ("LT","SE_4"),("SE_4","LT"),
+            ("LT","PL"),  ("PL","LT")],
 }
 _HVDC_PAIRS: set = {
-    frozenset({"FI","EE"}), frozenset({"FI","SE_3"}),
-    frozenset({"SE_4","LT"}), frozenset({"SE_4","DE"}), frozenset({"SE_4","PL"}),
-    frozenset({"NO_2","DE"}), frozenset({"NO_2","NL"}),
-    frozenset({"NO_2","DK_1"}), frozenset({"DK_2","NL"}),
-    frozenset({"NO_2","GB"}),
+    # Pairs where the A78 transmission type is HVDC (not AC)
+    frozenset({"FI",    "EE"}),      # Estlink 1 & 2
+    frozenset({"FI",    "SE_3"}),    # Fenno-Skan 1 & 2
+    frozenset({"SE_4",  "LT"}),      # NordBalt / LitPol
+    frozenset({"SE_4",  "DE"}),      # Baltic Cable
+    frozenset({"SE_4",  "PL"}),      # SwePol
+    frozenset({"NO_2",  "DE"}),      # NordLink
+    frozenset({"NO_2",  "NL"}),      # NorNed
+    frozenset({"NO_2",  "DK_1"}),    # Skagerrak
+    frozenset({"NO_2",  "GB"}),      # North Sea Link
+    frozenset({"DK_2",  "NL"}),      # Cobra Cable
 }
 
 
 def _country_borders(country_code: str) -> list:
-    """Return list of (from, to) border pairs for ENTSO-E A78 queries."""
+    """Return ENTSO-E A78 (from, to) bidding-zone pairs for a source country code.
+
+    The country_code is the two-letter code used for A77 queries (e.g. "FI", "NO").
+    The returned pairs use bidding-zone codes required by entsoe-py for A78 queries
+    (e.g. "NO_2", "SE_1") — these are NOT the same as the A77 country codes.
+    """
     cc = country_code.upper()
     if cc in _KNOWN_BORDERS:
         return _KNOWN_BORDERS[cc]
-    # prefix match: "NO" matches "NO" key
-    for k, v in _KNOWN_BORDERS.items():
-        if k.startswith(cc[:2]):
-            return v
     return []
 
 
