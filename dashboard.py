@@ -120,6 +120,7 @@ class App:
         self.tab_results  = ttk.Frame(self.nb)
         self.tab_plots    = ttk.Frame(self.nb)
         self.tab_event    = ttk.Frame(self.nb)
+        self.tab_explain  = ttk.Frame(self.nb)
         self.tab_export   = ttk.Frame(self.nb)
 
         self.nb.add(self.tab_setup,   text="1. Setup")
@@ -128,7 +129,8 @@ class App:
         self.nb.add(self.tab_results, text="4. Results")
         self.nb.add(self.tab_plots,   text="5. Plots")
         self.nb.add(self.tab_event,   text="6. Single event")
-        self.nb.add(self.tab_export,  text="7. Export")
+        self.nb.add(self.tab_explain, text="7. Explain")
+        self.nb.add(self.tab_export,  text="8. Export")
 
         self._build_setup_tab()
         self._build_outages_tab()
@@ -136,6 +138,7 @@ class App:
         self._build_results_tab()
         self._build_plots_tab()
         self._build_event_tab()
+        self._build_explain_tab()
         self._build_export_tab()
 
     # -----------------------------------------------------------------
@@ -625,6 +628,7 @@ class App:
     def _update_results_view(self):
         if not self.results: return
         self._populate_event_selector()
+        self._update_explain_view()
 
         # Hypotheses
         for it in self.hyp_tree.get_children():
@@ -1250,6 +1254,421 @@ class App:
         self.nb.select(self.tab_event)
         self._log(f"Single event analysis complete: {s['asset_name']}")
 
+    # -----------------------------------------------------------------
+    # Explain tab
+    # -----------------------------------------------------------------
+    def _build_explain_tab(self):
+        f = self.tab_explain
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+
+        ttk.Label(f, text="Plain-language explainability report",
+                  style="Header.TLabel").grid(row=0, column=0,
+                  sticky="w", padx=12, pady=(10, 4))
+
+        self.explain_text = scrolledtext.ScrolledText(
+            f, font=("Helvetica", 10), background="#fefefe",
+            wrap="word", state="disabled")
+        self.explain_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+
+        # colour tags
+        t = self.explain_text
+        t.tag_configure("title",     font=("Helvetica", 13, "bold"),
+                        foreground="#1a1a2e")
+        t.tag_configure("section",   font=("Helvetica", 11, "bold"),
+                        foreground="#16213e", spacing1=12)
+        t.tag_configure("confirmed", font=("Helvetica", 10, "bold"),
+                        foreground="#27ae60")
+        t.tag_configure("indicative",font=("Helvetica", 10, "bold"),
+                        foreground="#d4a017")
+        t.tag_configure("no_detect", font=("Helvetica", 10, "bold"),
+                        foreground="#c0392b")
+        t.tag_configure("nodata",    font=("Helvetica", 10, "bold"),
+                        foreground="#888")
+        t.tag_configure("label",     font=("Helvetica", 10, "bold"))
+        t.tag_configure("body",      font=("Helvetica", 10))
+        t.tag_configure("muted",     font=("Helvetica", 9, "italic"),
+                        foreground="#666")
+        t.tag_configure("warn",      font=("Helvetica", 9, "italic"),
+                        foreground="#c0392b")
+        t.tag_configure("rule",      font=("Helvetica", 8),
+                        foreground="#ccc")
+
+    def _update_explain_view(self):
+        if not self.results:
+            return
+        res   = self.results
+        regs  = res.get("regressions", {})
+        hyps  = {h["id"]: h for h in res.get("hypotheses", [])}
+        no3   = res.get("no3")
+        logit = res.get("logit", {})
+        t     = self.explain_text
+
+        # ── helpers ─────────────────────────────────────────────────────────
+        def _coef(reg_name, param):
+            """Return (beta, p) or (None, None)."""
+            r = regs.get(reg_name)
+            if not r or r.get("coefs") is None:
+                return None, None
+            cf = r["coefs"]
+            row = cf[cf.param == param]
+            if row.empty:
+                return None, None
+            return float(row.coef.iloc[0]), float(row.p.iloc[0])
+
+        def _pct(val, ref):
+            if ref and ref != 0:
+                return f"{abs(val/ref)*100:.1f}%"
+            return "n/a"
+
+        def _tier(beta, p):
+            """Return (icon, tag, label) confidence tier."""
+            if beta is None:
+                return "—", "nodata", "No data"
+            if p < 0.05:
+                return "✅", "confirmed", "Confirmed (p<0.05)"
+            if p < 0.10:
+                return "⚠", "indicative", "Indicative (p<0.10)"
+            return "✗", "no_detect", "Not detected (p≥0.10)"
+
+        def w(text, tag="body"):
+            t.insert("end", text, tag)
+
+        def nl(n=1):
+            t.insert("end", "\n" * n)
+
+        def rule():
+            t.insert("end", "─" * 80 + "\n", "rule")
+
+        # ── reference values for magnitude context ───────────────────────────
+        avg_ram  = float(no3["ram"].mean())  if no3 is not None and "ram"  in no3.columns else None
+        avg_fall = float(no3["fall"].abs().mean()) if no3 is not None and "fall" in no3.columns else None
+        avg_sp   = float(no3["shadowPrice"][no3["shadowPrice"] > 0].mean()) \
+                   if no3 is not None and "shadowPrice" in no3.columns \
+                   and (no3["shadowPrice"] > 0).any() else None
+        n_cnecs  = no3["cneName"].nunique() if no3 is not None else 0
+        n_obs    = len(no3) if no3 is not None else 0
+
+        # ── extract key coefficients ─────────────────────────────────────────
+        b_hvdc_fall, p_hvdc_fall = _coef("fall_signed", "fi_hvdc_outage_active")
+        b_ac_fall,   p_ac_fall   = _coef("fall_signed", "fi_ac_line_outage_active")
+        b_gen_fall,  p_gen_fall  = _coef("fall_signed", "fi_gen_outage_mw_lost")
+
+        b_hvdc_ptdf, p_hvdc_ptdf = _coef("ptdf_FI_abs", "fi_hvdc_outage_active")
+        b_ac_ptdf,   p_ac_ptdf   = _coef("ptdf_FI_abs", "fi_ac_line_outage_active")
+
+        b_hvdc_ram,  p_hvdc_ram  = _coef("ram", "fi_hvdc_outage_active")
+        b_ac_ram,    p_ac_ram    = _coef("ram", "fi_ac_line_outage_active")
+        b_gen_ram,   p_gen_ram   = _coef("ram", "fi_gen_outage_mw_lost")
+
+        b_hvdc_sp,   p_hvdc_sp   = _coef("shadowPrice", "fi_hvdc_outage_active")
+        b_forced_sp, p_forced_sp = _coef("shadowPrice", "fi_forced_outage_active")
+
+        b_frm_hvdc,  p_frm_hvdc  = _coef("frm", "fi_hvdc_outage_active")
+        b_frm_ac,    p_frm_ac    = _coef("frm", "fi_ac_line_outage_active")
+
+        # ── count supported hypotheses for headline ───────────────────────────
+        supported = sum(
+            1 for h in hyps.values()
+            if "SUPPORTED" in h["verdict"] or "CONSISTENT" in h["verdict"])
+        total_testable = sum(
+            1 for h in hyps.values()
+            if "n/a" not in h["verdict"] and "not run" not in h["verdict"]
+            and "did not converge" not in h["verdict"])
+
+        # ════════════════════════════════════════════════════════════════════
+        t.config(state="normal")
+        t.delete("1.0", "end")
+
+        # ── TITLE ────────────────────────────────────────────────────────────
+        w("FI → NO3 Propagation  —  Plain-language findings\n", "title"); nl()
+        w(f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} NO3 CNECs  |  "
+          f"Avg RAM {avg_ram:.0f} MW  |  "
+          f"Avg |fall| {avg_fall:.0f} MW\n" if avg_ram and avg_fall else
+          f"Dataset: {n_obs:,} MTU-CNEC rows  |  {n_cnecs} NO3 CNECs\n", "muted")
+        nl()
+
+        # ── OVERALL FINDING ───────────────────────────────────────────────────
+        rule()
+        w("OVERALL FINDING\n", "section")
+        rule()
+        if total_testable == 0:
+            w("Regressions could not run — linearmodels/statsmodels missing "
+              "or no outage events overlap the JAO window.\n", "warn")
+        else:
+            # Build a one-paragraph narrative
+            lines = []
+            if b_hvdc_fall is not None and p_hvdc_fall < 0.10:
+                direction = "increases" if b_hvdc_fall > 0 else "decreases"
+                lines.append(
+                    f"FI HVDC outages {direction} reference flow on NO3 CNECs "
+                    f"by {abs(b_hvdc_fall):.1f} MW on average "
+                    f"({_pct(b_hvdc_fall, avg_fall)} of typical loading)")
+            if b_ac_ptdf is not None and p_ac_ptdf < 0.10:
+                lines.append(
+                    f"FI AC line outages shift NO3 PTDF sensitivities to Finnish "
+                    f"injections by {abs(b_ac_ptdf):.4f} p.u. — the topology "
+                    f"change redistributes AC flows through the NO3 corridor")
+            if b_hvdc_ram is not None and p_hvdc_ram < 0.10:
+                direction = "reduces" if b_hvdc_ram < 0 else "increases"
+                lines.append(
+                    f"Available margin (RAM) on NO3 {direction} by "
+                    f"{abs(b_hvdc_ram):.1f} MW during FI HVDC outages "
+                    f"({_pct(b_hvdc_ram, avg_ram)} of avg RAM)")
+            if lines:
+                w(f"{supported} of {total_testable} testable hypotheses are supported. ", "body")
+                w("  ".join(lines) + ".\n", "body")
+            else:
+                w(f"{supported} of {total_testable} testable hypotheses supported. "
+                  "No propagation channel reached statistical significance at p<0.10 "
+                  "— either the effect is too small for the available sample, or FI "
+                  "outages do not systematically load the NO3 corridor in this window.\n",
+                  "body")
+        nl()
+
+        # ── SCORECARD ─────────────────────────────────────────────────────────
+        rule()
+        w("SCORECARD\n", "section")
+        rule()
+        scorecard = [
+            ("H1", "HVDC outage → F_allReference shift",
+             b_hvdc_fall, p_hvdc_fall),
+            ("H2", "AC line outage → |PTDF_FI| shift",
+             b_ac_ptdf,   p_ac_ptdf),
+            ("H3", "HVDC outage → RAM change",
+             b_hvdc_ram,  p_hvdc_ram),
+            ("H4", "Forced outage → shadow price change",
+             b_forced_sp, p_forced_sp),
+            ("H5", "Forced > planned → IVA trigger (logit)",
+             None, None),   # handled separately
+            ("H6", "FRM unchanged [placebo]",
+             b_frm_hvdc,  p_frm_hvdc),
+        ]
+        for hid, desc, beta, p in scorecard:
+            if hid == "H5":
+                if logit:
+                    icon, tag, lbl = "✅", "confirmed", "Logit converged"
+                else:
+                    icon, tag, lbl = "—", "nodata", "No data (insufficient IVA rows)"
+            elif hid == "H6":
+                # Placebo: NOT significant is the GOOD result
+                if beta is None:
+                    icon, tag, lbl = "—", "nodata", "No data"
+                elif p >= 0.10:
+                    icon, tag, lbl = "✅", "confirmed", "Placebo clean (p≥0.10) ✓"
+                else:
+                    icon, tag, lbl = "⚠", "warn", f"WARNING — FRM moves! (p={p:.3f})"
+            else:
+                icon, tag, lbl = _tier(beta, p)
+            w(f"  {icon}  {hid}  {desc:<45s}  {lbl}\n", tag)
+        nl()
+
+        # ── PER-HYPOTHESIS DEEP DIVES ─────────────────────────────────────────
+        # ── H1 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H1  —  Does a FI HVDC outage shift F_allReference on NO3 CNECs?\n", "section")
+        rule()
+        icon, tag, lbl = _tier(b_hvdc_fall, p_hvdc_fall)
+        w(f"  Verdict: {icon} {lbl}\n", tag); nl()
+        w("  Physical mechanism\n", "label")
+        w("  When Fenno-Skan or Estlink trips, the AC network must absorb the\n"
+          "  power imbalance. Depending on the FI net position at the time:\n"
+          "  • FI was net importer → sudden loss of import → FI price spikes,\n"
+          "    AC flows from NO4/SE1 increase → NO3 corridor loads up.\n"
+          "  • FI was net exporter → export disrupted → less transit through\n"
+          "    SE1/SE2/NO3 → corridor relieves.\n"
+          "  The sign of β tells you which regime dominated in your dataset.\n\n",
+          "body")
+        w("  What the numbers say\n", "label")
+        for param, label, beta, p in [
+            ("fi_hvdc_outage_active",   "HVDC outage (binary)",  b_hvdc_fall, p_hvdc_fall),
+            ("fi_ac_line_outage_active","AC line outage (binary)",b_ac_fall,   p_ac_fall),
+            ("fi_gen_outage_mw_lost",   "Generator MW lost",     b_gen_fall,  p_gen_fall),
+        ]:
+            if beta is None:
+                w(f"    {label:35s}  —  no result\n", "muted")
+            else:
+                icon2, tag2, _ = _tier(beta, p)
+                ctx = f"  ({_pct(beta, avg_fall)} of avg |fall|)" if avg_fall else ""
+                w(f"    {label:35s}  β={beta:+.2f} MW  p={p:.3f}  {icon2}{ctx}\n", tag2)
+        nl()
+        w("  Operational implication\n", "label")
+        if b_hvdc_fall is not None and p_hvdc_fall < 0.10:
+            direction = "tightens" if b_hvdc_fall > 0 else "relieves"
+            w(f"  The NO3 corridor {direction} during FI HVDC outages. "
+              f"TSOs should pre-check NO3 CNEC headroom before approving "
+              f"maintenance schedules that coincide with high FI net import.\n\n", "body")
+        else:
+            w("  No statistically detectable systematic loading of the NO3 corridor "
+              "was found for HVDC outages in this dataset window.\n\n", "body")
+
+        # ── H2 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H2  —  Does a FI AC line outage shift |PTDF_FI| on NO3 CNECs?\n", "section")
+        rule()
+        icon, tag, lbl = _tier(b_ac_ptdf, p_ac_ptdf)
+        w(f"  Verdict: {icon} {lbl}\n", tag); nl()
+        w("  Physical mechanism\n", "label")
+        w("  A FI internal 400 kV line outage changes the Finnish network\n"
+          "  impedance matrix. ENTSO-E recomputes PTDFs for the next MTU.\n"
+          "  If the lost line carried significant transit, NO3 CNECs may\n"
+          "  become more sensitive (larger |PTDF_FI|) to Finnish injections\n"
+          "  — meaning future FI outages will have greater NO3 impact.\n\n", "body")
+        w("  What the numbers say\n", "label")
+        for param, label, beta, p in [
+            ("fi_ac_line_outage_active","AC line outage (binary)", b_ac_ptdf,  p_ac_ptdf),
+            ("fi_hvdc_outage_active",   "HVDC outage (binary)",   b_hvdc_ptdf, p_hvdc_ptdf),
+        ]:
+            if beta is None:
+                w(f"    {label:35s}  —  no result\n", "muted")
+            else:
+                icon2, tag2, _ = _tier(beta, p)
+                w(f"    {label:35s}  β={beta:+.4f} p.u.  p={p:.3f}  {icon2}\n", tag2)
+        nl()
+        w("  Operational implication\n", "label")
+        if b_ac_ptdf is not None and p_ac_ptdf < 0.10:
+            w(f"  FI AC line outages measurably change PTDF_FI on NO3 CNECs. "
+              f"This means the sensitivity of NO3 capacity to Finnish scheduling "
+              f"changes with FI topology — relevant for the FB domain computation.\n\n", "body")
+        else:
+            w("  No significant PTDF shift detected. FI AC outages in this sample "
+              "did not systematically alter NO3 sensitivity to FI injections.\n\n", "body")
+
+        # ── H3 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H3  —  Does a FI outage change Available Margin (RAM) on NO3 CNECs?\n", "section")
+        rule()
+        icon, tag, lbl = _tier(b_hvdc_ram, p_hvdc_ram)
+        w(f"  Verdict: {icon} {lbl}\n", tag); nl()
+        w("  Physical mechanism\n", "label")
+        w("  RAM = Fmax − FRM − fall + fnrao + AMR − FAAC − IVA\n"
+          "  A FI outage that loads the corridor (fall↑) directly reduces RAM.\n"
+          "  A FI outage that relieves the corridor (fall↓) increases RAM.\n"
+          "  Forced outages may also trigger IVA adjustments (see H5).\n\n", "body")
+        w("  What the numbers say\n", "label")
+        for param, label, beta, p in [
+            ("fi_hvdc_outage_active",   "HVDC outage",   b_hvdc_ram, p_hvdc_ram),
+            ("fi_ac_line_outage_active","AC line outage", b_ac_ram,   p_ac_ram),
+            ("fi_gen_outage_mw_lost",   "Generator MW lost", b_gen_ram, p_gen_ram),
+        ]:
+            if beta is None:
+                w(f"    {label:35s}  —  no result\n", "muted")
+            else:
+                icon2, tag2, _ = _tier(beta, p)
+                ctx = f"  ({_pct(beta, avg_ram)} of avg RAM)" if avg_ram else ""
+                w(f"    {label:35s}  β={beta:+.2f} MW  p={p:.3f}  {icon2}{ctx}\n", tag2)
+        nl()
+        w("  Operational implication\n", "label")
+        if b_hvdc_ram is not None and p_hvdc_ram < 0.10:
+            if b_hvdc_ram < 0:
+                w(f"  RAM shrinks by {abs(b_hvdc_ram):.1f} MW ({_pct(b_hvdc_ram, avg_ram)} "
+                  f"of avg) during FI HVDC outages. If RAM was already near zero, the CNEC\n"
+                  f"  becomes binding, restricting cross-border capacity and raising prices.\n\n",
+                  "body")
+            else:
+                w(f"  RAM grows by {b_hvdc_ram:.1f} MW during FI HVDC outages — "
+                  f"the outage relieves the corridor, potentially un-binding CNECs.\n\n", "body")
+        else:
+            w("  No significant RAM change detected for HVDC outages.\n\n", "body")
+
+        # ── H4 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H4  —  Does a FI outage change shadow prices on binding NO3 CNECs?\n", "section")
+        rule()
+        icon, tag, lbl = _tier(b_forced_sp, p_forced_sp)
+        w(f"  Verdict: {icon} {lbl}\n", tag); nl()
+        w("  Physical mechanism\n", "label")
+        sp_pct = no3["shadowPrice"][no3["shadowPrice"] > 0].count() / len(no3) * 100 \
+                 if no3 is not None and "shadowPrice" in no3.columns else 0
+        w(f"  Only binding MTUs (shadow price > 0, {sp_pct:.1f}% of dataset) are\n"
+          f"  included in this regression. Shadow price measures how much the\n"
+          f"  market-clearing price would fall if the CNEC limit were relaxed by 1 MW.\n"
+          f"  A positive β means FI outages worsen existing congestion.\n"
+          f"  A negative β means they relieve it (or push the CNEC toward non-binding).\n\n",
+          "body")
+        w("  What the numbers say\n", "label")
+        if b_forced_sp is None:
+            w("    Regression not run or did not converge.\n", "muted")
+        else:
+            icon2, tag2, _ = _tier(b_forced_sp, p_forced_sp)
+            ctx = f"  (avg binding SP = {avg_sp:.2f} €/MWh)" if avg_sp else ""
+            w(f"    Forced outage (binary)              β={b_forced_sp:+.3f}  "
+              f"p={p_forced_sp:.3f}  {icon2}{ctx}\n", tag2)
+        nl()
+
+        # ── H5 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H5  —  Are forced FI outages more likely to trigger IVA on NO3 CNECs?\n", "section")
+        rule()
+        if not logit:
+            w("  Verdict: — No data\n", "nodata"); nl()
+            w("  IVA (Individual Validation Adjustment) is applied by TSOs when\n"
+              "  the CGMA model does not reflect a topology change. It requires\n"
+              "  IVA-active rows in the NO3 dataset — there were none in this window.\n"
+              "  Use a longer JAO CSV or include a window with a known forced outage.\n\n",
+              "body")
+        else:
+            w(f"  Verdict: ✅ Logit converged  |  pseudo-R²={logit.get('pseudo_r2',0):.3f}  "
+              f"|  n_positive={logit.get('n_positive',0)}\n", "confirmed"); nl()
+            w("  Physical mechanism\n", "label")
+            w("  Forced outages are not in the IGCC / individual grid model (IGM) used\n"
+              "  to compute PTDFs. TSOs apply IVA to correct the domain when an unplanned\n"
+              "  topology is detected. The logit tests whether forced outages predict IVA.\n\n",
+              "body")
+
+        # ── H6 ───────────────────────────────────────────────────────────────
+        rule()
+        w("H6  —  PLACEBO: Does FRM move with FI outages? (it should NOT)\n", "section")
+        rule()
+        if b_frm_hvdc is None:
+            w("  Verdict: — No data\n", "nodata"); nl()
+            w("  FRM is calibrated annually and should be flat within any single\n"
+              "  year. No result here means the regression did not run.\n\n", "body")
+        elif p_frm_hvdc >= 0.10:
+            w(f"  Verdict: ✅ Placebo clean  —  β={b_frm_hvdc:+.3f} MW, p={p_frm_hvdc:.3f}\n",
+              "confirmed"); nl()
+            w("  FRM did not move with FI outage covariates. This is the expected\n"
+              "  result and confirms the model is well-specified. FRM is a structural\n"
+              "  margin set once per year — it should not respond to individual events.\n\n",
+              "body")
+        else:
+            w(f"  Verdict: ⚠ WARNING — FRM IS MOVING  β={b_frm_hvdc:+.3f} MW, "
+              f"p={p_frm_hvdc:.3f}\n", "warn"); nl()
+            w("  FRM is correlated with FI outage covariates. This is a model\n"
+              "  misspecification flag — FRM should be structural. Possible causes:\n"
+              "  • The JAO window spans a December FRM recalibration (regime break)\n"
+              "  • Seasonal patterns in FRM are aliased with outage seasonality\n"
+              "  • Data quality issue in the JAO export\n"
+              "  Treat H1–H4 results with caution until this is resolved.\n\n", "warn")
+
+        # ── DATA QUALITY NOTES ────────────────────────────────────────────────
+        rule()
+        w("DATA QUALITY & METHODOLOGY NOTES\n", "section")
+        rule()
+        w("  Selection bias (H4):  ", "label")
+        w("Only binding MTUs (shadow price > 0) are included in the shadow\n"
+          "  price regression. Coefficients describe the effect conditional on\n"
+          "  the CNEC already being congested — not the general population effect.\n\n",
+          "body")
+        w("  FWER correction:  ", "label")
+        w("H1–H4 are tested as a family. Holm–Bonferroni correction is applied;\n"
+          "  results marked 'Confirmed' have survived family-wise error rate control.\n\n",
+          "body")
+        w("  Time clustering:  ", "label")
+        w("Standard errors are clustered by calendar date to account for the\n"
+          "  fact that a single FI outage hits all NO3 CNECs simultaneously.\n\n",
+          "body")
+        w("  Sign normalisation (H1):  ", "label")
+        w("fall_signed = σᵢ × fall, where σᵢ = sign(median fall in pre-period).\n"
+          "  This removes CNEC orientation artifacts — a positive β always means\n"
+          "  'the outage loads the CNE in its congested direction'.\n\n",
+          "body")
+
+        t.config(state="disabled")
+
+    # -----------------------------------------------------------------
+    # Export tab
+    # -----------------------------------------------------------------
     def _build_export_tab(self):
         f = self.tab_export
         for c in range(2): f.columnconfigure(c, weight=1)
