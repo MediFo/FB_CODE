@@ -61,6 +61,45 @@ LogCallback = Callable[[str], None]
 def _noop(msg: str) -> None: ...
 
 # ---------------------------------------------------------------------------
+# CET boundary helpers
+# ---------------------------------------------------------------------------
+# All internal storage and computation (JAO/ENTSO-E alignment, regressions,
+# CSV columns) stays in UTC — that's the only sane common clock for data from
+# multiple sources. CET is the convention at the human boundary only: what a
+# person types into the dashboard, and what they read back in logs, summaries
+# and reports. "CET" here means the Europe/Oslo zone, which correctly follows
+# CET in winter and CEST in summer (DST-aware), matching the Nordic
+# flow-based domain's own regional time convention.
+CET_ZONE = "Europe/Oslo"
+
+
+def cet_input_to_utc(val) -> pd.Timestamp:
+    """Parse a human-entered timestamp. An explicit offset/Z is always
+    respected and converted to UTC. A bare, offset-less value is interpreted
+    as CET/CEST local time (the convention for anything a person types),
+    then converted to UTC for internal use."""
+    ts = pd.Timestamp(val)
+    if ts.tzinfo is not None:
+        return ts.tz_convert("UTC")
+    return ts.tz_localize(CET_ZONE, ambiguous="infer",
+                           nonexistent="shift_forward").tz_convert("UTC")
+
+
+def utc_to_cet_str(ts_utc, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a UTC-aware (or naive-assumed-UTC) timestamp as a CET/CEST
+    wall-clock string for display to a person. Missing/unparseable input
+    returns 'n/a' rather than raising, since this is called from display code
+    that shouldn't crash a GUI over one malformed row."""
+    try:
+        ts = pd.Timestamp(ts_utc)
+        if pd.isna(ts):
+            return "n/a"
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        return ts.tz_convert(CET_ZONE).strftime(fmt)
+    except (ValueError, TypeError):
+        return "n/a"
+
+# ---------------------------------------------------------------------------
 # 1. JAO CSV loader
 # ---------------------------------------------------------------------------
 EXPECTED_NUMERIC = [
@@ -69,7 +108,7 @@ EXPECTED_NUMERIC = [
 ]
 EXPECTED_PTDF_PREFIXES = ("ptdf_",)
 
-def load_jao_csv(path: str) -> pd.DataFrame:
+def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     """Load a JAO CSV exported from the user's existing tool.
     Robust to missing columns - they are filled with NaN."""
     df = pd.read_csv(path, low_memory=False)
@@ -84,6 +123,8 @@ def load_jao_csv(path: str) -> pd.DataFrame:
     if dt_col is None:
         # try to construct from date + time
         if "date" in df.columns and "time" in df.columns:
+            log_cb("  JAO CSV has no explicit UTC datetime column — building it "
+                   "from date+time columns (CET/CEST local time).")
             df["dateTimeUtc"] = pd.to_datetime(
                 df["date"].astype(str) + " " + df["time"].astype(str),
                 errors="coerce", utc=False
@@ -356,12 +397,18 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
     start = _s_ts.tz_localize("UTC") if _s_ts.tzinfo is None else _s_ts.tz_convert("UTC")
     end   = _e_ts.tz_localize("UTC") if _e_ts.tzinfo is None else _e_ts.tz_convert("UTC")
     def _ts_utc(val) -> pd.Timestamp:
-        """Convert any timestamp value to UTC-aware Timestamp.
-        Handles: UTC-aware, any-tz-aware (converts), and naive (assumes UTC).
-        Safe against tz_convert() raising TypeError on naive inputs."""
+        """Convert any timestamp value to a UTC-aware Timestamp.
+        Confirmed live (see audit): entsoe-py returns tz-aware timestamps
+        localized to the queried country's own zone (e.g. Europe/Helsinki for
+        FI, Europe/Stockholm for SE, Europe/Tallinn for EE) for both A77 and
+        A78 — tz_convert("UTC") handles that correctly. The tz_localize
+        fallback below only covers a naive value the library has never
+        actually been observed to return; if it ever does, UTC is the safe
+        machine-data default (as opposed to human-entered values, which are
+        treated as CET — see cet_input_to_utc)."""
         ts = pd.Timestamp(val)
         if ts.tzinfo is None:
-            return ts.tz_localize("UTC")   # naive → assume UTC (ENTSO-E API default)
+            return ts.tz_localize("UTC")
         return ts.tz_convert("UTC")
 
     events = []
@@ -490,6 +537,19 @@ def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     df = pd.read_csv(p)
     if "raw_payload" not in df.columns:
         df["raw_payload"] = "{}"
+
+    # This file is hand-edited (see CLAUDE.md). A person typing or pasting a
+    # time here is thinking in CET/CEST, not UTC — and spreadsheet editors
+    # commonly strip the "Z"/offset suffix off ISO-8601 strings on save. So:
+    # a value with an explicit offset is respected as given; an offset-less
+    # value is treated as CET/CEST and converted to true UTC right here, once,
+    # so every downstream consumer gets a correct, unambiguous UTC string
+    # without needing to guess.
+    for col in ("start_utc", "end_utc"):
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda v: cet_input_to_utc(v).isoformat() if pd.notna(v) else v)
+
     log_cb(f"Manual outage rows loaded: {len(df)}")
     return df
 
@@ -704,13 +764,21 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     jao["month"] = jao["dateTimeUtc"].dt.month
     jao["date"]  = jao["dateTimeUtc"].dt.date.astype(str)
 
-    # ── CORRECT RAM FORMULA VERIFICATION ────────────────────────────────────
-    # Verified on real JAO data: RAM = Fmax - FRM + fnrao - AAC - fall  (R²=1.000)
-    # 'fall' (F_allReference) is the reference flow entering the formula.
-    # 'fref'/'f0' in JAO = flow at CGMA NP ≈ fall + PTDF*NP_CGMA; NOT in RAM formula.
+    # ── RAM FORMULA VERIFICATION ─────────────────────────────────────────────
+    # Full Nordic CCM identity (matches the project's own documented derivation,
+    # METHODOLOGY.md Issue 1): RAM = Fmax - FRM - Fref + fnrao + AMR - AAC - IVA.
+    # 'fall' (F_allReference) stands in for Fref per this pipeline's convention.
+    # AMR and IVA are INCLUDED here — a previous version of this formula omitted
+    # them, and the only in-repo check of that omission was circular on synthetic
+    # data (see audit L2-1: synthetic 'fall' used to be defined as an algebraic
+    # residual of the incomplete formula, so it could never fail). They are real,
+    # independently-observed terms and IVA in particular is expected to be
+    # nonzero exactly during forced outages (see H5) — dropping it here would
+    # misstate RAM specifically on the rows this pipeline is built to study.
     ram_check = (jao["fmax"].fillna(0) - jao["frm"].fillna(0)
-                 + jao["fnrao"].fillna(0) - jao["faac"].fillna(0)
-                 - jao["fall"].fillna(0))
+                 + jao["fnrao"].fillna(0) + jao["amr"].fillna(0)
+                 - jao["faac"].fillna(0) - jao["fall"].fillna(0)
+                 - jao["iva"].fillna(0))
     if "ram" in jao.columns and jao["ram"].notna().any():
         diff = (jao["ram"] - ram_check).abs()
         pct_ok = (diff < 1.0).mean()
@@ -719,6 +787,15 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
                    f"(expected ~100%). Columns may differ from JAO Nordic v1.5 schema.")
         else:
             log_cb(f"✓ RAM formula verified: {pct_ok*100:.1f}% of rows balance within 1 MW")
+        # Save as a checkable artifact (via DataFrame.attrs, written to disk by
+        # run_pipeline) rather than only a transient log line — see audit L2-3.
+        jao.attrs["ram_formula_check"] = {
+            "formula": "RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA",
+            "n_rows": int(len(jao)),
+            "pct_within_1mw": float(pct_ok),
+            "max_abs_diff_mw": float(diff.max()),
+            "mean_abs_diff_mw": float(diff.mean()),
+        }
 
     # ── DEPENDENT VARIABLE CONSTRUCTION ─────────────────────────────────────
     # H1: use 'fall' (F_allReference) — the actual Fref in the RAM formula.
@@ -775,6 +852,36 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
 # 6. Regressions
 # ---------------------------------------------------------------------------
 DEFAULT_INDEP = _default_indep("fi")
+
+
+def _prune_collinear_dose_pairs(X: pd.DataFrame, src: str,
+                                log_cb: LogCallback = _noop) -> pd.DataFrame:
+    """A binary outage-active dummy and its paired MW-lost dose variable are
+    near-perfectly collinear whenever there are too few independent episodes to
+    separate 'an outage occurred' from 'how large was it' (e.g. 2 HVDC events at
+    fixed, near-constant capacities over a short window). Left alone, the
+    estimator's own absorption logic arbitrarily assigns the whole combined
+    effect to whichever of the two survives — which flips the sign of the
+    headline coefficient depending on implementation details, not physics (see
+    audit findings on non-unique regression coefficients). Prefer the dose
+    variable, which nests the binary information, and drop the duplicate before
+    fitting so there is nothing left for the estimator to split arbitrarily."""
+    p = src.lower()
+    pairs = [(f"{p}_hvdc_outage_active", f"{p}_hvdc_outage_mw_lost"),
+             (f"{p}_ac_line_outage_active", f"{p}_ac_outage_mw_lost")]
+    for binary_col, mw_col in pairs:
+        if binary_col in X.columns and mw_col in X.columns:
+            mw = X[mw_col]
+            if mw.std(skipna=True) < 1e-12:
+                continue  # dose column has no variation of its own — keep the binary
+            corr = X[[binary_col, mw_col]].corr().iloc[0, 1]
+            if pd.notna(corr) and abs(corr) > 0.98:
+                log_cb(f"  Dropping {binary_col}: near-perfectly collinear with "
+                       f"{mw_col} (corr={corr:.4f}) — too few independent episodes "
+                       f"to identify both separately. Keeping the dose variable so "
+                       f"its coefficient isn't arbitrarily split between the two.")
+                X = X.drop(columns=[binary_col])
+    return X
 
 
 def run_panel_regression(df: pd.DataFrame, dep_var: str,
@@ -836,7 +943,17 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     # Drop columns with zero variance (constant dummies that didn't activate)
     nz = X.std(axis=0, skipna=True) > 1e-12
     X = X.loc[:, nz]
+    X = _prune_collinear_dose_pairs(X, src, log_cb=log_cb)
     X = sm.add_constant(X, has_constant="add")
+
+    # ── Identification diagnostics on the ACTUAL fitted design ───────────────
+    cond_number = float(np.linalg.cond(X.values))
+    design_rank = int(np.linalg.matrix_rank(X.values))
+    ill_conditioned = bool(cond_number > 1e10 or design_rank < X.shape[1])
+    if ill_conditioned:
+        log_cb(f"  ⚠ design matrix ill-conditioned: condition number={cond_number:.2e}, "
+               f"rank={design_rank}/{X.shape[1]} columns — coefficients on collinear "
+               f"variables may not be uniquely identified")
 
     # Build cluster arrays aligned to the model index
     # Time-clustering: group all CNECs on the same calendar date into one cluster.
@@ -893,10 +1010,15 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
         dw = float(durbin_watson(res.resids.values))
     except Exception:
         dw = float("nan")
+    # VIF computed on the ACTUAL fitted design (post FE dummies, post collinear-pair
+    # pruning) rather than the 7 raw covariates alone — otherwise this diagnostic
+    # doesn't reflect the model that was actually estimated.
     vifs = {}
     try:
-        Xv = sub[indep].astype(float).dropna().values
-        for i, c in enumerate(indep):
+        Xv = X.values
+        for i, c in enumerate(X.columns):
+            if c == "const":
+                continue
             if Xv.shape[0] > Xv.shape[1] + 5:
                 vifs[c] = float(variance_inflation_factor(Xv, i))
     except Exception:
@@ -934,6 +1056,10 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
         "bp_p":    float(bp_p)    if pd.notna(bp_p)    else None,
         "durbin_watson": dw,
         "vif": vifs,
+        "condition_number": cond_number,
+        "rank": design_rank,
+        "n_params": int(X.shape[1]),
+        "ill_conditioned": ill_conditioned,
     }
 
 
@@ -996,16 +1122,21 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     """For one CNEC and outage window, decompose ΔRAM into per-parameter
     contributions relative to the previous baseline_h hours.
 
-    Verified Nordic JAO RAM formula (R² = 1.000 on real data):
-        RAM = Fmax - FRM + fnrao - AAC - fall
+    Nordic JAO RAM formula (matches METHODOLOGY.md Issue 1 and the check in
+    build_covariates): RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA
 
     where:
         fall   = F_allReference (reference flow; negative = anti-congestion)
         fnrao  = Non-costly RA and other adjustments (positive = adds capacity)
-        AAC    = Already Allocated Capacity (aac column in JAO)
+        AAC    = Already Allocated Capacity (aac/faac column in JAO)
+        AMR    = Adjustment for Minimum RAM
+        IVA    = Individual Validation Adjustment (TSO discretionary)
 
     Note: fref/f0 are NOT in this formula (they represent a different quantity).
-    Note: AMR and IVA are zero for NO3 CNECs in the studied period (Apr-May 2026).
+    AMR and IVA are included unconditionally — assuming they're zero for any
+    given window is a dataset-specific observation, not a general truth, and
+    IVA specifically is expected to be nonzero exactly during forced outages
+    (see H5), i.e. on the windows this function is most often called for.
     """
     s = pd.Timestamp(outage_start, tz="UTC") if outage_start.tzinfo is None else outage_start
     e = pd.Timestamp(outage_end,   tz="UTC") if outage_end.tzinfo   is None else outage_end
@@ -1016,8 +1147,7 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     if pre.empty or during.empty:
         return pd.DataFrame()
 
-    # Verified columns
-    formula_cols = ["fmax", "frm", "fnrao", "faac", "fall", "ram"]
+    formula_cols = ["fmax", "frm", "fnrao", "amr", "faac", "fall", "iva", "ram"]
     cols = [c for c in formula_cols if c in sub.columns]
     means_pre = pre[cols].mean()
     means_dur = during[cols].mean()
@@ -1027,8 +1157,10 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     if "fmax"  in delta: contrib["+ Δfmax"]  = float( delta["fmax"])
     if "frm"   in delta: contrib["- Δfrm"]   = float(-delta["frm"])
     if "fnrao" in delta: contrib["+ Δfnrao"] = float( delta["fnrao"])   # RA channel
+    if "amr"   in delta: contrib["+ Δamr"]   = float( delta["amr"])
     if "faac"  in delta: contrib["- Δaac"]   = float(-delta["faac"])
     if "fall"  in delta: contrib["- Δfall"]  = float(-delta["fall"])    # reference flow channel
+    if "iva"   in delta: contrib["- Δiva"]   = float(-delta["iva"])
 
     sigma = float(sum(contrib.values()))
     obs   = float(delta.get("ram", float("nan")))
@@ -1125,7 +1257,9 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
     """Summarise verdicts for the given source country and target zone.
     When the primary test variable is absorbed by fixed effects, falls back to
     alternative channel variables and reports why the original test wasn't possible."""
-    p = src.lower()
+    p = src.lower()   # source-country column prefix — must survive the whole function;
+                      # do not reuse `p` as a loop-local for a p-value anywhere below
+                      # (that bug used to make H5 always report "vars absent").
     fallback_vars = {
         "H1": [f"{p}_hvdc_outage_active", f"{p}_forced_outage_active",
                f"{p}_hvdc_outage_mw_lost", f"{p}_planned_outage_active"],
@@ -1145,9 +1279,14 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                 try:
                     bp = cf.loc[f"{p}_planned_outage_active"]
                     bf = cf.loc[f"{p}_forced_outage_active"]
-                    verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
-                               f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
-                               f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
+                    if pd.isna(bf["p"]) or pd.isna(bp["p"]):
+                        verdict = ("estimation failed — logit Hessian singular / "
+                                   "p-value undefined (not a null result; re-check "
+                                   "sample size or collinearity)")
+                    else:
+                        verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
+                                   f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
+                                   f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
                 except KeyError:
                     verdict = "vars absent in logit (likely no IVA-active rows)"
             else:
@@ -1157,9 +1296,9 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
             if r and "coefs" in r:
                 cf = r["coefs"].set_index("param")
                 if h["var"] in cf.index:
-                    beta = cf.loc[h["var"], "coef"]; p = cf.loc[h["var"], "p"]
-                    verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                               f"{'CONSISTENT (no MTU effect)' if p>=0.05 else 'inconsistent (MTU effect detected)'}")
+                    beta = cf.loc[h["var"], "coef"]; pval = cf.loc[h["var"], "p"]
+                    verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                               f"{'CONSISTENT (no MTU effect)' if pval>=0.05 else 'inconsistent (MTU effect detected)'}")
                 else:
                     verdict = f"{h['var']} absorbed by FE; placebo inconclusive"
         else:
@@ -1171,29 +1310,33 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                 tried = []
                 for var in [h["var"]] + fallback_vars.get(h["id"], []):
                     if var in cf.index:
-                        beta = cf.loc[var, "coef"]; p = cf.loc[var, "p"]
+                        beta = cf.loc[var, "coef"]; pval = cf.loc[var, "p"]
                         used_label = ("" if var == h["var"] else f" [via {var}]")
+                        ill = r.get("ill_conditioned")
+                        ill_label = (f"  ⚠ design matrix ill-conditioned "
+                                     f"(cond={r.get('condition_number'):.2e}) — "
+                                     f"coefficient not reliably identified" if ill else "")
 
                         if h["expected_sign"] is None:
                             # Direction is physically ambiguous — any significant
                             # result is a finding; neither direction is "wrong"
-                            if p < 0.05:
+                            if pval < 0.05:
                                 direction = "positive" if beta > 0 else "negative"
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"SIGNIFICANT ({direction} direction){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"SIGNIFICANT ({direction} direction){used_label}{ill_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
                         else:
                             sign_ok = (np.sign(beta) == np.sign(h["expected_sign"]))
-                            if sign_ok and p < 0.05:
-                                verdict = f"β={beta:.3g}, p={p:.3g} → SUPPORTED{used_label}"
-                            elif p < 0.05:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"SIGNIFICANT but opposite direction{used_label}")
+                            if sign_ok and pval < 0.05:
+                                verdict = f"β={beta:.3g}, p={pval:.3g} → SUPPORTED{used_label}{ill_label}"
+                            elif pval < 0.05:
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"SIGNIFICANT but opposite direction{used_label}{ill_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
                         break
                     tried.append(var)
                 else:
@@ -1211,17 +1354,30 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
         m = re.search(r",\s*p=([0-9.eE+\-]+)", h["verdict"])
         p_vals.append(float(m.group(1)) if m else None)
 
-    if any(p is not None for p in p_vals):
+    if any(pv is not None for pv in p_vals):
         reject = _holm_bonferroni(p_vals, alpha=0.05)
-        for h, rej, p in zip(pool_out, reject, p_vals):
-            if p is None:
+        for h, rej, pv in zip(pool_out, reject, p_vals):
+            if pv is None:
                 continue
             if "SIGNIFICANT" in h["verdict"] and not rej:
-                h["verdict"] += (
-                    "  ⚠ Holm–Bonferroni: p does NOT survive FWER correction "
-                    f"(raw p={p:.3g} > corrected threshold)")
-            elif "inconclusive" not in h["verdict"] and rej and p >= 0.05:
-                pass  # would be a contradiction — ignore
+                # Lead with the corrected conclusion instead of appending a caveat
+                # after the word SIGNIFICANT, which a skim-read misses.
+                h["verdict"] = h["verdict"].replace(
+                    "SIGNIFICANT", "SIGNIFICANT-BUT-NOT-FWER-ROBUST", 1) + (
+                    f"  (raw p={pv:.3g} does not survive Holm–Bonferroni "
+                    f"family-wise correction across H1–H4)")
+
+    # ── Placebo gate: if H6 (FRM must not move) fails, the same design/window
+    # produced it as H1–H4, so their SIGNIFICANT verdicts may share the same
+    # confound. Flag rather than silently letting them stand unremarked.
+    h6 = next((h for h in out if h["id"] == "H6"), None)
+    if h6 and "inconsistent" in h6["verdict"]:
+        for h in out:
+            if h["id"] in fwer_pool and "SIGNIFICANT" in h["verdict"]:
+                h["verdict"] += ("  ⚠ H6 placebo FAILED in this run — FRM moved "
+                                  "with outage covariates, indicating an unmodeled "
+                                  "confound (e.g. a structural break) that could "
+                                  "also be driving this result; interpret with caution")
 
     return out
 
@@ -1289,29 +1445,6 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
 # ---------------------------------------------------------------------------
 # 10. End-to-end orchestrator (simple, called by dashboard)
 # ---------------------------------------------------------------------------
-def main_cli() -> None:
-    """pip console-script entry point for fi-no3-analyse.
-    Locates run_analysis.py relative to this file and delegates to its main()."""
-    import importlib.util
-    import sys as _sys
-    _here = Path(__file__).resolve().parent
-    _candidates = [
-        _here.parent.parent / "scripts" / "run_analysis.py",  # src/fi_no3/ layout
-        _here.parent / "scripts" / "run_analysis.py",
-        _here / "run_analysis.py",
-        _here.parent / "run_analysis.py",
-    ]
-    for _script in _candidates:
-        if _script.exists():
-            spec = importlib.util.spec_from_file_location("run_analysis", _script)
-            mod  = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            mod.main()
-            return
-    print("ERROR: run_analysis.py not found relative to propagation.py.", file=_sys.stderr)
-    _sys.exit(1)
-
-
 @dataclass
 class PipelineConfig:
     jao_csv:        str   = ""
@@ -1342,7 +1475,7 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # 1. JAO
     if jao_df is None:
         log_cb(f"Loading JAO CSV: {cfg.jao_csv}")
-        jao = load_jao_csv(cfg.jao_csv)
+        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb)
     else:
         jao = jao_df.copy()
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")
@@ -1428,6 +1561,10 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     _src = cfg.source_country.lower()
     no3_cov = build_covariates(no3, outages, log_cb=log_cb, src=_src)
     no3_cov.to_csv(Path(cfg.out_dir) / "no3_with_outage_covariates.csv", index=False)
+    ram_check_diag = no3_cov.attrs.get("ram_formula_check")
+    if ram_check_diag:
+        with open(Path(cfg.out_dir) / "ram_formula_check.json", "w") as _f:
+            json.dump(ram_check_diag, _f, indent=2)
 
     # 4. Regressions
     # ── H1: fall_signed (sign-normalised F_allReference) ────────────────────
@@ -1463,8 +1600,19 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         log_cb("  Too few truly-binding MTUs; skipping shadow price regression")
         res_sp = {}
     else:
+        # With ~5 covariates plus hour/dow/month dummies (~34 parameters), a
+        # binding subsample under ~500 rows gives a thin obs-per-parameter ratio
+        # even before any collinearity — drop the month/dow FE for H4 specifically
+        # so the parameter count stays proportionate to the (often small) binding
+        # sample size.
+        thin_sample = sp_mask.sum() < 500
+        if thin_sample:
+            log_cb(f"  Binding sample is thin ({sp_mask.sum():,} rows) — "
+                   f"dropping hour/dow/month fixed effects for H4 to preserve "
+                   f"obs-per-parameter ratio (entity FE only).")
         res_sp = run_panel_regression(
-            no3_binding, sp_col, log_cb=log_cb, cluster="time", src=_src)
+            no3_binding, sp_col, log_cb=log_cb, cluster="time", src=_src,
+            add_time_fe=not thin_sample)
 
     # ── H6 placebo: FRM ──────────────────────────────────────────────────────
     log_cb("Running FRM placebo regression [H6]...")
@@ -1482,8 +1630,6 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     reg_results = {
         "fall_signed":  res_fall,
         "fall":         res_fall,    # backward compatibility
-        "fref_signed":  res_fall,    # backward compatibility (was wrong variable)
-        "f0":           res_fall,    # backward compatibility
         _ptdf_abs_col:  res_ptdf,    # e.g. "ptdf_NO_abs" or "ptdf_FI_abs"
         "ptdf_FI_abs":  res_ptdf,    # backward-compat alias
         "ptdf_FI":      res_ptdf,
@@ -1515,43 +1661,65 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
 # ===========================================================================
 
 def build_event_time_dummies(df: pd.DataFrame, outages: pd.DataFrame,
-                              leads: int = 12, lags: int = 48,
-                              step_hours: int = 1) -> pd.DataFrame:
+                              leads: int = 24, lags: int = 48,
+                              scale: str = "hour") -> pd.DataFrame:
     """
-    For each JAO row, compute the event-time index k in HOURS relative to
-    the nearest overlapping outage start.
+    For each row, compute the event-time index k relative to the nearest
+    overlapping outage start, at the requested time scale:
 
-    k = -leads ... -1 : pre-event hours (pre-trend test)
-    k = 0             : first hour of the outage
-    k = 1 ... lags    : hours after outage start
+      scale='mtu'  — native 15-min resolution, k in MTUs
+      scale='hour' — bins MTUs into hourly means first, k in hours (default —
+                     15-min data has ~4x the degrees of freedom of hourly data
+                     without adding real information, and multi-hour recovery
+                     dynamics are the thing worth resolving)
+      scale='day'  — bins into daily means, k in days (for multi-day outages)
 
-    Uses hourly (not 15-min MTU) resolution because:
-    - Outage starts are typically rounded to the hour by ENTSO-E
-    - 15-min data has AC=0.63 → inflates degrees of freedom 4x
-    - Meaningful recovery dynamics occur over hours, not MTUs
+    k = -leads ... -1 : pre-event periods (pre-trend test)
+    k = 0             : first period of the outage
+    k = 1 ... lags    : periods after outage start
 
-    Rows not within (leads+lags+1) hours of any outage get event_k = NaN.
-    Dummy columns: D_km{leads} ... D_k{lags} (omit k=-1 as reference).
+    leads/lags are in the chosen scale's units. Rows not within
+    (leads+lags+1) units of any outage get event_k = NaN. Dummy columns:
+    D_km{leads} ... D_k{lags} (omit k=-1 as reference).
     """
-    df = df.copy()
+    if scale not in ("mtu", "hour", "day"):
+        raise ValueError(f"scale must be 'mtu', 'hour', or 'day', got {scale!r}")
+    step = {"mtu": pd.Timedelta(minutes=15),
+            "hour": pd.Timedelta(hours=1),
+            "day": pd.Timedelta(days=1)}[scale]
+
     if outages is None or outages.empty:
+        df = df.copy()
         df["event_k"] = np.nan
         return df
+
+    if scale == "mtu":
+        df = df.copy()
+    else:
+        # Bin to the requested resolution before computing event time, so
+        # leads/lags counts are in the chosen scale's units, not raw MTUs.
+        freq = {"hour": "h", "day": "D"}[scale]
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        df = (df.groupby(["cneName", pd.Grouper(key="dateTimeUtc", freq=freq)])[numeric_cols]
+                .mean().reset_index())
+
+    df["hour"]  = df["dateTimeUtc"].dt.hour
+    df["dow"]   = df["dateTimeUtc"].dt.dayofweek
+    df["month"] = df["dateTimeUtc"].dt.month
 
     out = outages.copy()
     for c in ("start_utc", "end_utc"):
         out[c] = pd.to_datetime(out[c], utc=True, errors="coerce")
     out = out.dropna(subset=["start_utc"])
 
-    step = pd.Timedelta(hours=step_hours)
-    ts   = df["dateTimeUtc"].values
+    ts = df["dateTimeUtc"].values
 
     event_k = np.full(len(df), np.nan)
     for _, row in out.iterrows():
         s = row["start_utc"]
         for k in range(-leads, lags + 1):
             target = s + k * step
-            # Match any row within ±step/2 of the target hour
+            # Match any row within ±step/2 of the target period
             half = step.total_seconds() * 1e9 / 2
             mask = np.abs((ts - target.to_datetime64()).astype("int64")) < half
             # Only assign if not yet assigned or if this is closer
@@ -1568,10 +1736,12 @@ def build_event_time_dummies(df: pd.DataFrame, outages: pd.DataFrame,
 
 
 def run_event_study(df: pd.DataFrame, dep_var: str,
-                    leads: int = 4, lags: int = 8,
+                    leads: int = 24, lags: int = 48,
                     log_cb: LogCallback = _noop) -> dict:
     """
-    Event study regression: estimate β_k for k = -leads ... lags.
+    Event study regression: estimate β_k for k = -leads ... lags, in whatever
+    scale (mtu/hour/day) build_event_time_dummies() used to build df's D_k*
+    columns — leads/lags here must match what was passed there.
     Returns a DataFrame with columns [k, beta, se, ci_lo, ci_hi, p].
     k < 0 are pre-trend; k >= 0 are post-event.
     Omits k = -1 as the reference period.
@@ -1741,8 +1911,9 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             f"Load a longer JAO CSV or select a shorter event."
         )
 
-    fb_params = [c for c in ["f0","fref","ram","shadowPrice","frm","iva","ptdf_FI",
-                              "ptdf_FI_FS","ptdf_FI_EL","amr","faac"]
+    fb_params = [c for c in ["fall_signed","fall","f0","fref","ram","shadowPrice",
+                              "frm","iva","ptdf_FI","ptdf_FI_FS","ptdf_FI_EL",
+                              "amr","faac"]
                  if c in no3_df.columns]
 
     # ── 1. Per-CNEC before/after table ─────────────────────────────────────
@@ -1766,7 +1937,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     # This is far superior to a linear trend for power-market data which
     # has strong diurnal and weekly seasonality dominating any linear drift.
     its_rows = []
-    for col in ["f0", "ram", "shadowPrice"]:
+    for col in ["fall_signed", "f0", "ram", "shadowPrice"]:
         if col not in no3_df.columns: continue
         pre_agg = pre.groupby("dateTimeUtc")[col].mean().reset_index()
         if len(pre_agg) < 4:
@@ -1829,7 +2000,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         no3_work["hour"] = no3_work.dateTimeUtc.dt.hour
         no3_work["dow"]  = no3_work.dateTimeUtc.dt.dayofweek
 
-        for col in ["f0", "ram", "shadowPrice"]:
+        for col in ["fall_signed", "f0", "ram", "shadowPrice"]:
             if col not in no3_work.columns: continue
             sub = no3_work[["cneName","dateTimeUtc",col,
                             "interaction","d_outage","ptdf_fi_abs",
@@ -1908,9 +2079,26 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
                 summary[f"delta_{col}"] = round(dm - pm, 2)
     summary["did_estimates"] = did_estimates if _ptdf_raw_col in no3_df.columns else {}
 
+    # ── 6. Event study: β_k for k = -24h..+48h around this specific event ──
+    # (build_event_time_dummies / run_event_study — previously defined but
+    # never called from anywhere; see audit L1-2.)
+    event_study = {}
+    try:
+        one_outage = pd.DataFrame([outage_row])
+        ev_leads, ev_lags = 24, 48
+        ev_df = build_event_time_dummies(no3_df, one_outage,
+                                         leads=ev_leads, lags=ev_lags, scale="hour")
+        for col in ["fall_signed", "ram"]:
+            if col in ev_df.columns:
+                r = run_event_study(ev_df, col, leads=ev_leads, lags=ev_lags, log_cb=log_cb)
+                if r:
+                    event_study[col] = r
+    except Exception as ex:
+        log_cb(f"  Event study skipped: {ex}")
+
     log_cb(f"Single event analysis complete: {summary['asset_name']} | "
            f"Δf0={summary.get('delta_f0','n/a')} MW | "
            f"ΔRAM={summary.get('delta_ram','n/a')} MW")
 
     return {"summary": summary, "its": its, "decomp": decomp,
-            "did": did, "cnec_table": cnec_table}
+            "did": did, "cnec_table": cnec_table, "event_study": event_study}

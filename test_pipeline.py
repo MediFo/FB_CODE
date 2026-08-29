@@ -26,7 +26,7 @@ from propagation import (
     load_jao_csv, filter_no3, build_covariates, deduplicate_outages,
     run_panel_regression, run_logit_iva, decompose_delta_ram,
     summarize_hypotheses, PipelineConfig, run_pipeline,
-    DEFAULT_NO3_PATTERNS,
+    DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str,
 )
 
 
@@ -466,3 +466,109 @@ class TestFullPipeline:
                              use_entsoe=False, use_manual=False)
         res = run_pipeline(cfg, jao_df=jao, outages_df=single)
         assert "hypotheses" in res
+
+
+# ── 10. Regressions for previously-fixed bugs (audit) ─────────────────────────
+
+class TestAuditFixes:
+    """Each test here reproduces a specific bug found in the strict audit and
+    would fail again if that bug were reintroduced."""
+
+    def test_h5_verdict_not_shadowed_by_pvalue(self):
+        """A loop-local p-value used to overwrite the `p` (source-prefix)
+        variable inside summarize_hypotheses, so H5's column lookup
+        ('{p}_planned_outage_active') always KeyError'd once H1-H4 had run —
+        producing 'vars absent in logit' even when the logit succeeded."""
+        logit_coefs = pd.DataFrame({
+            "param": ["const", "fi_planned_outage_active", "fi_forced_outage_active"],
+            "coef":  [-4.87, -1.77, 2.56],
+            "std_err": [0.27, 0.49, 0.18],
+            "z": [-18.4, -3.6, 14.2],
+            "p": [3.3e-75, 3.0e-4, 4.5e-46],
+        })
+        logit_result = {"coefs": logit_coefs, "n_obs": 43200, "n_positive": 513,
+                        "pseudo_r2": 0.11}
+        ram_coefs = pd.DataFrame({
+            "param": ["const", "fi_hvdc_outage_active"],
+            "coef":  [1100.0, 50.0],
+            "std_err": [1.0, 3.0],
+            "t": [1000.0, 16.0],
+            "p": [0.0, 0.0],
+        })
+        reg_results = {"ram": {"dep": "ram", "n_obs": 43200, "n_entities": 5,
+                               "rsquared": 0.5, "rsquared_within": 0.5,
+                               "summary_text": "", "coefs": ram_coefs}}
+        verdicts = summarize_hypotheses(reg_results, logit_result)
+        h5 = next(h for h in verdicts if h["id"] == "H5")
+        assert "vars absent" not in h5["verdict"], (
+            f"H5 verdict regressed to the shadowing bug: {h5['verdict']!r}")
+        assert "SUPPORTED" in h5["verdict"]
+        assert "forced" in h5["verdict"] and "planned" in h5["verdict"]
+
+    def test_ram_formula_check_is_not_circular(self):
+        """The RAM-formula balance check must actually be able to fail when
+        the formula is wrong — not just balance 100% by construction because
+        'fall' was defined as an algebraic residual of the same formula."""
+        n = 200
+        rng = np.random.default_rng(0)
+        dt = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
+        base = pd.DataFrame({
+            "dateTimeUtc": dt, "cneName": "TEST_CNEC",
+            "fmax": 1000.0, "frm": 100.0, "fnrao": 5.0,
+            "amr": rng.uniform(0, 50, n),      # independent, sometimes nonzero
+            "faac": 2.0,
+            "fall": rng.normal(50, 10, n),     # independent of amr/iva/ram
+            "iva": rng.uniform(0, 30, n),      # independent, sometimes nonzero
+        })
+        # Correct full formula: RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA
+        correct = base.copy()
+        correct["ram"] = (correct.fmax - correct.frm - correct.fall
+                          + correct.fnrao + correct.amr - correct.faac - correct.iva)
+        cov = build_covariates(correct, pd.DataFrame())
+        check = cov.attrs.get("ram_formula_check")
+        assert check is not None
+        assert check["pct_within_1mw"] > 0.99, (
+            "Correct formula should balance against build_covariates' own check")
+
+        # Now build RAM from the INCOMPLETE (amr/iva-omitting) formula on the
+        # same independently-varying amr/iva — the check must catch this.
+        wrong = base.copy()
+        wrong["ram"] = wrong.fmax - wrong.frm - wrong.fall + wrong.fnrao - wrong.faac
+        cov_wrong = build_covariates(wrong, pd.DataFrame())
+        check_wrong = cov_wrong.attrs.get("ram_formula_check")
+        assert check_wrong["pct_within_1mw"] < 0.5, (
+            "Check should FAIL to balance when amr/iva are dropped from a RAM "
+            "series that was built with them — otherwise the check is circular "
+            "and can never catch this class of bug again")
+
+    def test_regression_reports_condition_number(self, no3_cov):
+        """Identification diagnostics must reflect the actual fitted design,
+        not just the 7 raw covariates, so ill-conditioning is visible."""
+        r = run_panel_regression(no3_cov, "ram")
+        for key in ("condition_number", "rank", "n_params", "ill_conditioned"):
+            assert key in r, f"Missing diagnostic key: {key}"
+        assert r["condition_number"] > 0
+        assert r["rank"] <= r["n_params"]
+
+    def test_collinear_dose_pair_pruned(self, no3_cov):
+        """A binary outage-active dummy and its paired MW-lost dose variable,
+        when near-perfectly collinear, must not both survive into the fitted
+        coefficients — otherwise the split between them (and the sign of the
+        surviving one) is solver-dependent, not physical."""
+        r = run_panel_regression(no3_cov, "ram")
+        cf = r["coefs"]["param"].tolist()
+        for binary_col, mw_col in [("fi_hvdc_outage_active", "fi_hvdc_outage_mw_lost"),
+                                   ("fi_ac_line_outage_active", "fi_ac_outage_mw_lost")]:
+            assert not (binary_col in cf and mw_col in cf), (
+                f"{binary_col} and {mw_col} both survived — if they are "
+                f"collinear in this data, one must be pruned before fitting")
+
+    def test_cet_utc_roundtrip(self):
+        """A CET-entered time converts to the expected UTC instant and back."""
+        # 2025-06-15 12:00 CEST (UTC+2 in summer) == 2025-06-15 10:00 UTC
+        utc_ts = cet_input_to_utc("2025-06-15T12:00:00")
+        assert utc_ts.tz_convert("UTC").strftime("%H:%M") == "10:00"
+        assert utc_to_cet_str(utc_ts, "%H:%M") == "12:00"
+        # An explicit-offset input is respected, not reinterpreted as CET
+        explicit = cet_input_to_utc("2025-06-15T10:00:00Z")
+        assert explicit == utc_ts

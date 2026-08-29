@@ -283,7 +283,7 @@ class App:
             messagebox.showinfo("Pick a file", "Select a JAO CSV first.")
             return
         try:
-            df = pipe.load_jao_csv(path)
+            df = pipe.load_jao_csv(path, log_cb=self._log)
         except Exception as e:
             messagebox.showerror("Load failed", f"{e}")
             return
@@ -293,14 +293,15 @@ class App:
         dt_max = df["dateTimeUtc"].max()
         self.status_jao.set(
             f"Loaded {len(df):,} rows | {df['cneName'].nunique()} CNECs | "
-            f"{dt_min} → {dt_max}")
+            f"{pipe.utc_to_cet_str(dt_min)} → {pipe.utc_to_cet_str(dt_max)} CET")
         self._log(f"Loaded JAO CSV: {path} ({len(df)} rows)")
 
-        # Auto-update the outage fetch window to match JAO dates
-        self.start_utc.set(dt_min.strftime("%Y-%m-%dT%H:%M:%SZ"))
-        self.end_utc.set(dt_max.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        # Auto-update the outage fetch window to match JAO dates (shown in CET)
+        self.start_cet.set(pipe.utc_to_cet_str(dt_min, "%Y-%m-%dT%H:%M:%S"))
+        self.end_cet.set(pipe.utc_to_cet_str(dt_max, "%Y-%m-%dT%H:%M:%S"))
         self._log(f"  Outage fetch window auto-set to JAO range: "
-                  f"{dt_min.strftime('%Y-%m-%d')} → {dt_max.strftime('%Y-%m-%d')}")
+                  f"{pipe.utc_to_cet_str(dt_min, '%Y-%m-%d')} → "
+                  f"{pipe.utc_to_cet_str(dt_max, '%Y-%m-%d')} CET")
 
     def _generate_synthetic(self):
         out_dir = self.out_dir_var.get().strip() or DEFAULT_OUT_DIR
@@ -312,7 +313,7 @@ class App:
             messagebox.showerror("Generation failed", str(e))
             return
         # auto-load
-        self.jao_df = pipe.load_jao_csv(info["jao_path"])
+        self.jao_df = pipe.load_jao_csv(info["jao_path"], log_cb=self._log)
         self.last_jao_path = info["jao_path"]
         self.outages_df = pd.read_csv(info["outages_path"])
         self.last_outage_path = info["outages_path"]
@@ -372,15 +373,17 @@ class App:
                        filedialog.askopenfilename(filetypes=[("CSV","*.csv")]) or self.manual_path.get())
                    ).grid(row=1, column=3, sticky="w", padx=4)
 
-        # date window
-        dw = ttk.LabelFrame(f, text="Window (UTC) — auto-set when JAO CSV is loaded", padding=10)
+        # date window — entered and displayed in CET/CEST; converted to UTC
+        # internally right before use (see propagation.cet_input_to_utc).
+        dw = ttk.LabelFrame(f, text="Window (CET) — auto-set when JAO CSV is loaded", padding=10)
         dw.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
         ttk.Label(dw, text="Start:").grid(row=0, column=0)
-        self.start_utc = tk.StringVar(value="2024-10-29T00:00:00Z")
-        ttk.Entry(dw, textvariable=self.start_utc, width=24).grid(row=0, column=1, padx=4)
+        self.start_cet = tk.StringVar(value="2024-10-29T00:00:00")
+        ttk.Entry(dw, textvariable=self.start_cet, width=24).grid(row=0, column=1, padx=4)
         ttk.Label(dw, text="End:").grid(row=0, column=2)
-        self.end_utc = tk.StringVar(value=datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z"))
-        ttk.Entry(dw, textvariable=self.end_utc, width=24).grid(row=0, column=3, padx=4)
+        self.end_cet = tk.StringVar(
+            value=pipe.utc_to_cet_str(datetime.now(timezone.utc), "%Y-%m-%dT00:00:00"))
+        ttk.Entry(dw, textvariable=self.end_cet, width=24).grid(row=0, column=3, padx=4)
         ttk.Button(dw, text="Fetch outages (ENTSO-E + Manual)",
                    style="Big.TButton",
                    command=self._fetch_outages).grid(row=0, column=4, padx=20)
@@ -423,7 +426,7 @@ class App:
 
     def _outage_log(self, msg: str):
         """Log to both the Outages tab and the Run tab log."""
-        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
+        line = f"[{pipe.utc_to_cet_str(datetime.now(timezone.utc), '%H:%M:%S')} CET] {msg}\n"
         self.root.after(0, self._append_outage_log, line)
         self.root.after(0, self._append_log, line)
 
@@ -525,8 +528,10 @@ class App:
 
             if self.use_entsoe.get():
                 cc = self.source_country.get().strip().upper() or "FI"
+                start_utc = pipe.cet_input_to_utc(self.start_cet.get()).isoformat()
+                end_utc   = pipe.cet_input_to_utc(self.end_cet.get()).isoformat()
                 df = pipe.fetch_entsoe_outages(
-                    self.start_utc.get(), self.end_utc.get(),
+                    start_utc, end_utc,
                     log_cb=log, country_code=cc)
                 if not df.empty: collected.append(df)
 
@@ -579,7 +584,7 @@ class App:
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0,12))
 
     def _log(self, msg: str):
-        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
+        line = f"[{pipe.utc_to_cet_str(datetime.now(timezone.utc), '%H:%M:%S')} CET] {msg}\n"
         # threadsafe
         self.root.after(0, self._append_log, line)
 
@@ -610,8 +615,8 @@ class App:
                 jao_csv=self.last_jao_path,
                 out_dir=self.out_dir_var.get(),
                 manual_csv=self.manual_path.get(),
-                start_utc=self.start_utc.get(),
-                end_utc=self.end_utc.get(),
+                start_utc=pipe.cet_input_to_utc(self.start_cet.get()).isoformat(),
+                end_utc=pipe.cet_input_to_utc(self.end_cet.get()).isoformat(),
                 use_entsoe=self.use_entsoe.get(),
                 use_manual=self.use_manual.get(),
                 source_country=self.source_country.get().strip().upper() or "FI",
@@ -781,7 +786,8 @@ class App:
                 marker = "✓ " if r.get("outage_id") in is_overlap else "✗ "
                 label = (f"{marker}{r['source']} | {r['asset_type']} | "
                          f"{str(r['asset_name'])[:35]} | "
-                         f"{str(r['start_utc'])[:10]} → {str(r['end_utc'])[:10]}")
+                         f"{pipe.utc_to_cet_str(r['start_utc'], '%Y-%m-%d')} → "
+                         f"{pipe.utc_to_cet_str(r['end_utc'], '%Y-%m-%d')}")
                 ev_list.append(label)
 
         self.event_cb["values"] = ev_list
@@ -827,7 +833,8 @@ class App:
         for _, r in out.iterrows():
             label = (f"{r['source']} | {r['asset_type']} | "
                      f"{str(r['asset_name'])[:35]} | "
-                     f"{str(r['start_utc'])[:10]} → {str(r['end_utc'])[:10]}")
+                     f"{pipe.utc_to_cet_str(r['start_utc'], '%Y-%m-%d')} → "
+                     f"{pipe.utc_to_cet_str(r['end_utc'], '%Y-%m-%d')}")
             if label == stripped:
                 return pd.Timestamp(r["start_utc"]), pd.Timestamp(r["end_utc"])
         return None, None
@@ -1134,8 +1141,8 @@ class App:
             mark = "✓ " if r.get("outage_id") in is_overlap else "✗ "
             lbl  = (f"{mark}{r.get('source','')} | {r.get('asset_type','')} | "
                     f"{str(r.get('asset_name',''))[:40]} | "
-                    f"{str(r.get('start_utc',''))[:10]} → "
-                    f"{str(r.get('end_utc',''))[:10]}")
+                    f"{pipe.utc_to_cet_str(r['start_utc'], '%Y-%m-%d')} → "
+                    f"{pipe.utc_to_cet_str(r['end_utc'], '%Y-%m-%d')}")
             ev_list.append(lbl)
         self.event_sel_cb["values"] = ev_list
         # Auto-select first overlapping
@@ -1155,8 +1162,8 @@ class App:
         for _, r in outages.iterrows():
             lbl = (f"{r.get('source','')} | {r.get('asset_type','')} | "
                    f"{str(r.get('asset_name',''))[:40]} | "
-                   f"{str(r.get('start_utc',''))[:10]} → "
-                   f"{str(r.get('end_utc',''))[:10]}")
+                   f"{pipe.utc_to_cet_str(r['start_utc'], '%Y-%m-%d')} → "
+                   f"{pipe.utc_to_cet_str(r['end_utc'], '%Y-%m-%d')}")
             if lbl == label:
                 return r
         return None
@@ -1226,7 +1233,8 @@ class App:
         tgt = (self.results.get("target_zone") if self.results else None) or "NO3"
         lines = [
             f"Event:    {s['asset_name']} ({s['asset_type']}, {s['planned_or_forced']})",
-            f"Window:   {s['start_utc'][:16]} → {s['end_utc'][:16]} UTC  "
+            f"Window:   {pipe.utc_to_cet_str(s['start_utc'])} → "
+            f"{pipe.utc_to_cet_str(s['end_utc'])} CET  "
             f"({s['duration_h']} h)",
             f"CNECs:    {s['n_cnecs']}  |  "
             f"Pre rows: {n_pre:,}  During: {n_during:,}  Post: {n_post:,}",
@@ -1271,6 +1279,21 @@ class App:
                         f"  {col:15s}: β={beta:>+9.4f}  p={p:.3f}  {interp}")
                 else:
                     lines.append(f"  {col:15s}: ATT = {float(val):>+9.2f} MW")
+
+        event_study = res.get("event_study") or {}
+        if event_study:
+            lines += ["", "── Event study (β_k, hourly, -24h..+48h) ─────────────────────"]
+            for col, es in event_study.items():
+                coef_df = es.get("coefs")
+                if coef_df is None or coef_df.empty:
+                    continue
+                pre_ok = "ok" if es.get("pre_trend_ok") else "FAILED (pre-trend not flat)"
+                lines.append(f"  {col}  (n_obs={es.get('n_obs','n/a')}, pre-trend {pre_ok})")
+                post = coef_df[coef_df["k"] >= 0].head(6)
+                for _, row in post.iterrows():
+                    sig = "*" if row["p"] < 0.05 else " "
+                    lines.append(f"    k=+{int(row['k']):<3d}h  "
+                                 f"β={row['beta']:>+9.2f}  p={row['p']:.3f} {sig}")
         self._ev_summary_txt.insert("end", "\n".join(lines))
 
         # ── ITS plot ──────────────────────────────────────────────────────
@@ -1936,12 +1959,12 @@ class App:
 
         # Build context
         ctx = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": pipe.utc_to_cet_str(datetime.now(timezone.utc), "%Y-%m-%d %H:%M:%S") + " CET",
             "n_jao": len(self.jao_df) if self.jao_df is not None else 0,
             "n_no3": len(no3),
             "n_outages": len(outages) if outages is not None else 0,
             "hypotheses": self.results["hypotheses"],
-            "summary_f0":   self._build_reg_block("f0"),
+            "summary_f0":   self._build_reg_block("fall_signed"),
             "summary_ptdf_FI": self._build_reg_block("ptdf_FI"),
             "summary_ram":  self._build_reg_block("ram"),
             "summary_shadowPrice": self._build_reg_block("shadowPrice"),
