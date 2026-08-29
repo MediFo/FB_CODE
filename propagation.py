@@ -55,6 +55,10 @@ try:
     from entsoe import EntsoePandasClient
 except (ImportError, AttributeError, Exception):
     EntsoePandasClient = None
+try:
+    from entsoe.exceptions import NoMatchingDataError
+except (ImportError, AttributeError, Exception):
+    NoMatchingDataError = ()  # empty tuple: `except NoMatchingDataError` matches nothing
 
 
 LogCallback = Callable[[str], None]
@@ -81,7 +85,11 @@ def cet_input_to_utc(val) -> pd.Timestamp:
     ts = pd.Timestamp(val)
     if ts.tzinfo is not None:
         return ts.tz_convert("UTC")
-    return ts.tz_localize(CET_ZONE, ambiguous="infer",
+    # ambiguous=True: on the one hour/year clocks fall back (CEST->CET), treat
+    # it as still-summer-time rather than raising — this is a rare edge case
+    # for outage timestamps and failing the whole load over it would be worse
+    # than the ~1h mislabelling risk it carries.
+    return ts.tz_localize(CET_ZONE, ambiguous=True,
                            nonexistent="shift_forward").tz_convert("UTC")
 
 
@@ -128,7 +136,7 @@ def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
             df["dateTimeUtc"] = pd.to_datetime(
                 df["date"].astype(str) + " " + df["time"].astype(str),
                 errors="coerce", utc=False
-            ).dt.tz_localize("Europe/Oslo", ambiguous="infer", nonexistent="shift_forward")
+            ).dt.tz_localize("Europe/Oslo", ambiguous=True, nonexistent="shift_forward")
             df["dateTimeUtc"] = df["dateTimeUtc"].dt.tz_convert("UTC")
         else:
             raise ValueError("JAO CSV has no recognizable datetime column")
@@ -499,6 +507,9 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                     })
                 except Exception as e:
                     log_cb(f"  A78 row err: {e}")
+        except NoMatchingDataError:
+            # Normal: this border simply has nothing published for the window.
+            log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
         except Exception as e:
             err_str = str(e)
             if "400" in err_str or "No matching data found" in err_str:
@@ -789,13 +800,18 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
             log_cb(f"✓ RAM formula verified: {pct_ok*100:.1f}% of rows balance within 1 MW")
         # Save as a checkable artifact (via DataFrame.attrs, written to disk by
         # run_pipeline) rather than only a transient log line — see audit L2-3.
-        jao.attrs["ram_formula_check"] = {
+        # NOTE: .attrs does not reliably survive .join()/.drop() below (verified:
+        # it doesn't, on this pandas version) — so it's captured in a plain local
+        # and re-applied to the actual object being returned, not set here.
+        _ram_check_diag = {
             "formula": "RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA",
             "n_rows": int(len(jao)),
             "pct_within_1mw": float(pct_ok),
             "max_abs_diff_mw": float(diff.max()),
             "mean_abs_diff_mw": float(diff.mean()),
         }
+    else:
+        _ram_check_diag = None
 
     # ── DEPENDENT VARIABLE CONSTRUCTION ─────────────────────────────────────
     # H1: use 'fall' (F_allReference) — the actual Fref in the RAM formula.
@@ -845,7 +861,10 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
                    "binding CNECs only (selection bias for population inference). "
                    "Re-fetch without the filter for unbiased estimates.")
 
-    return jao.reset_index(drop=True)
+    result = jao.reset_index(drop=True)
+    if _ram_check_diag is not None:
+        result.attrs["ram_formula_check"] = _ram_check_diag
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -269,20 +269,28 @@ class TestRegressions:
             assert col in cf.columns
 
     def test_hvdc_f0_signal_detected(self, no3_cov):
-        """H1: HVDC outage should produce significant F0 shift on synthetic data."""
+        """H1: HVDC outage should produce a significant F0 shift on synthetic
+        data — via whichever of the binary dummy / MW-dose variable survived
+        collinearity pruning (see _prune_collinear_dose_pairs; with few
+        independent HVDC episodes the two are near-perfectly collinear, and
+        the dose variable is kept over the binary duplicate on purpose)."""
         r = run_panel_regression(no3_cov, "f0")
         cf = r["coefs"].set_index("param")
-        assert "fi_hvdc_outage_active" in cf.index, \
-            "fi_hvdc_outage_active was absorbed — not enough variation"
-        p = cf.loc["fi_hvdc_outage_active", "p"]
+        candidates = [c for c in ("fi_hvdc_outage_active", "fi_hvdc_outage_mw_lost")
+                      if c in cf.index]
+        assert candidates, "neither fi_hvdc_outage_active nor its dose variable survived"
+        p = min(cf.loc[c, "p"] for c in candidates)
         assert p < 0.05, f"HVDC F0 effect not significant (p={p:.3f})"
 
     def test_ac_line_ptdf_signal_detected(self, no3_cov):
-        """H2: AC line outage should shift PTDF_FI."""
+        """H2: AC line outage should shift PTDF_FI — same collinearity-pruning
+        caveat as test_hvdc_f0_signal_detected above."""
         r = run_panel_regression(no3_cov, "ptdf_FI")
         cf = r["coefs"].set_index("param")
-        assert "fi_ac_line_outage_active" in cf.index
-        p = cf.loc["fi_ac_line_outage_active", "p"]
+        candidates = [c for c in ("fi_ac_line_outage_active", "fi_ac_outage_mw_lost")
+                      if c in cf.index]
+        assert candidates, "neither fi_ac_line_outage_active nor its dose variable survived"
+        p = min(cf.loc[c, "p"] for c in candidates)
         assert p < 0.05, f"AC line PTDF_FI effect not significant (p={p:.3f})"
 
     def test_frm_placebo_consistent(self, no3_cov):
