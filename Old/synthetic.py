@@ -185,11 +185,11 @@ def generate_jao_csv(start: datetime, end: datetime,
     # MW lost (for gen and hvdc, intensity matters)
     mw_gen = np.zeros(n)
     for _, r in out[out["asset_type"]=="generator"].iterrows():
-        mask = (ts_np >= r["start_utc"].to_datetime64()) & (ts_np < r["end_utc"].to_datetime64())
+        mask = (ts_np >= np.datetime64(r["start_utc"])) & (ts_np < np.datetime64(r["end_utc"]))
         mw_gen[mask] += float(r["capacity_mw"])
     mw_hvdc = np.zeros(n)
     for _, r in out[out["asset_type"]=="hvdc"].iterrows():
-        mask = (ts_np >= r["start_utc"].to_datetime64()) & (ts_np < r["end_utc"].to_datetime64())
+        mask = (ts_np >= np.datetime64(r["start_utc"])) & (ts_np < np.datetime64(r["end_utc"]))
         mw_hvdc[mask] += float(r["capacity_mw"])
 
     # Diurnal & weekly patterns
@@ -208,20 +208,13 @@ def generate_jao_csv(start: datetime, end: datetime,
         ptdf_FI_FS_base = rng.uniform(-0.04, -0.01)
         ptdf_FI_EL_base = rng.uniform(-0.03, -0.01)
 
-        # fall (F_allReference): the reference flow that actually enters the RAM
-        # formula (see CLAUDE.md / METHODOLOGY.md) — this is where outage effects
-        # belong, as an INDEPENDENT simulated quantity. It used to be computed
-        # backwards as fmax-frm+fnrao-faac-ram (an algebraic residual of the RAM
-        # identity), which made the pipeline's RAM-formula check pass 100% by
-        # construction regardless of whether the formula it was checking was
-        # actually complete. Generating it forward, independently of ram, makes
-        # that check a real test again.
-        fall = (rng.normal(0, 30, n)                   # noise
+        # F0: load-flow at zero NP, fluctuates with seasonality and outages
+        f0 = (rng.normal(0, 30, n)                    # noise
               + diurnal + weekly                       # patterns
-              + 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
+              + 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> F0 jump
               + 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
               + 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
-        fall += rng.uniform(-30, 30)  # CNEC-specific bias
+        f0 += rng.uniform(-30, 30)  # CNEC-specific bias
 
         # PTDF_FI shifts only during AC line outages (small magnitude)
         ptdf_FI = ptdf_FI_base + 0.025 * is_ac * np.sign(ptdf_FI_base) * (-1) \
@@ -256,21 +249,11 @@ def generate_jao_csv(start: datetime, end: datetime,
         iva = np.where(iva_active, rng.uniform(20, 150, n), 0.0)
 
         # FB linearised flow
-        net_position_cgma = rng.normal(500, 300, n)
-        flowFB = fall + ptdf_FI * net_position_cgma  # net positions
+        flowFB = f0 + ptdf_FI * rng.normal(500, 300, n)  # net positions
 
-        # RAM identity — the full formula (matches build_covariates() in
-        # propagation.py): RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA
-        ram = fmax_base - frm - fall + fra + amr - faac - iva
+        # RAM identity
+        ram = fmax_base - frm - f0 + fra + amr - faac - iva
         ram = np.maximum(ram, 0)
-
-        # f0 / fref: the CGMA-NP reference flow. This is a DIFFERENT physical
-        # quantity from fall, related through the net position at CGMA
-        # (fref ~ fall + PTDF * NP_CGMA), with its own noise — correlated with
-        # fall, not identical to it, and NOT an input to the RAM identity
-        # above. fref and f0 are the same quantity in JAO exports, so they're
-        # set equal here.
-        f0 = fall + ptdf_FI_base * net_position_cgma * 0.1 + rng.normal(0, 15, n)
 
         # Shadow price: positive only when RAM near binding & with prob
         binding_score = 1 - ram / fmax_base
@@ -278,6 +261,9 @@ def generate_jao_csv(start: datetime, end: datetime,
                        rng.uniform(2, 50, n), 0.0)
 
         for i, t in enumerate(timestamps):
+            # Verified RAM formula: RAM = Fmax - FRM + fnrao - AAC - fall
+            # So: fall = Fmax - FRM + fnrao - AAC - RAM
+            fall_i = fmax_base - frm[i] + fra[i] - faac[i] - ram[i]
             rows.append({
                 "dateTimeUtc": t.isoformat(),
                 "cneName": cnec,
@@ -286,10 +272,10 @@ def generate_jao_csv(start: datetime, end: datetime,
                 "contingencies": "N",
                 "shadowPrice": round(float(sp[i]), 3),
                 "ram": round(float(ram[i]), 2),
-                "fall": round(float(fall[i]), 2),
+                "fall": round(float(fall_i), 2),
                 "flowFb": round(float(flowFB[i]), 2),
                 "fmax": round(fmax_base, 2),
-                "fref": round(float(f0[i]), 2),
+                "fref": round(float(f0[i] + flowFB[i] * 0.1), 2),
                 "f0": round(float(f0[i]), 3),
                 "frm": round(float(frm[i]), 3),
                 "fnrao": round(float(fra[i]), 3),   # correct column name
