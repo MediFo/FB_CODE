@@ -1,3 +1,4 @@
+import bisect
 import csv
 import json
 import os
@@ -86,7 +87,23 @@ CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#0891b2', '#be18
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
 # ----------------------------------------------------------------------
-_CET = ZoneInfo("Europe/Oslo")
+# The zone name is sourced from propagation.CET_ZONE when that module is
+# importable, so there is one canonical definition of "which IANA zone is
+# 'CET' in this codebase" rather than two independently hardcoded string
+# literals that could silently drift apart. This file intentionally does
+# NOT import propagation.py's pandas-based conversion functions themselves
+# (propagation.cet_input_to_utc / utc_to_cet_str) — that would pull pandas
+# into what is otherwise a pandas-free GUI (tkinter + matplotlib + requests
+# only) — but both implementations must agree on the zone and on how the
+# one ambiguous autumn DST-fold hour is resolved (see _utc_to_cet below,
+# and the tz_localize(..., ambiguous=True) call further down this file —
+# keep that policy in sync with propagation.cet_input_to_utc if either
+# changes).
+try:
+    from propagation import CET_ZONE as _CET_ZONE_NAME
+except Exception:
+    _CET_ZONE_NAME = "Europe/Oslo"  # keep in sync with propagation.CET_ZONE
+_CET = ZoneInfo(_CET_ZONE_NAME)
 
 
 _OFFSET_RE = re.compile(r'(Z|[+-]\d{2}:?\d{2})$')
@@ -112,6 +129,47 @@ def _utc_to_cet(ts: str) -> datetime:
 def _cet_key(dt: datetime) -> str:
     """Return the 'YYYYMMDD_HH:MM' key used throughout for CET-aligned look-ups."""
     return f"{dt.strftime('%Y%m%d')}_{dt.strftime('%H:%M')}"
+
+
+def _asof_value(series: dict, sorted_keys: list, key: str,
+                max_gap_minutes: int = 90):
+    """Look up `key` (a _cet_key() string) in `series`; if missing, fall back
+    to the most recent EARLIER key present (forward-fill), bounded by
+    max_gap_minutes. Returns (value, exact_match: bool) or (None, False) if
+    nothing usable is within range.
+
+    Nord Pool auction products (price, net position) have historically
+    settled hourly while JAO CNEC data publishes at 15-minute MTU resolution
+    — and the two have been converging through the Nordic market's move to
+    15-minute settlement on a schedule that doesn't necessarily match every
+    zone/vintage in a mixed dataset. A plain `dict.get(key, 0)` silently
+    substitutes a literal zero for any granularity or format mismatch
+    between the two timestamp sources, which is indistinguishable on a
+    chart from a genuine zero price/net-position. Forward-filling from the
+    nearest earlier value is the economically correct treatment: the price
+    or net position from the enclosing settlement period is still the true
+    value at that MTU, not zero.
+
+    `sorted_keys` must be `sorted(series.keys())`, which is chronologically
+    valid because _cet_key()'s "YYYYMMDD_HH:MM" format is zero-padded.
+    """
+    if key in series:
+        return series[key], True
+    if not sorted_keys:
+        return None, False
+    idx = bisect.bisect_right(sorted_keys, key) - 1
+    if idx < 0:
+        return None, False
+    prev_key = sorted_keys[idx]
+    try:
+        d1 = datetime.strptime(prev_key, "%Y%m%d_%H:%M")
+        d2 = datetime.strptime(key, "%Y%m%d_%H:%M")
+    except ValueError:
+        return None, False
+    gap_min = (d2 - d1).total_seconds() / 60
+    if 0 <= gap_min <= max_gap_minutes:
+        return series[prev_key], False
+    return None, False
 
 
 def get_np_access_token():
@@ -1164,8 +1222,36 @@ class App:
         x_idx = range(len(xs))
         y_ram = [self._safe_float(d, 'ram')         for d in jao]
         y_sp  = [self._safe_float(d, 'shadowPrice') for d in jao]
-        y_np  = [net_pos.get(f"{d['date']}_{d['time'][:5]}", 0)   for d in jao]
-        y_prc = [price_map.get(f"{d['date']}_{d['time'][:5]}", 0) for d in jao]
+
+        # Look up Nord Pool net position / price for each 15-min JAO row with
+        # an as-of (forward-filled) match rather than an exact-key dict.get
+        # defaulting to 0 — see _asof_value's docstring for why an exact-key
+        # miss must not be silently plotted as a real zero.
+        np_keys_sorted  = sorted(net_pos.keys())
+        price_keys_sorted = sorted(price_map.keys())
+        y_np, y_prc = [], []
+        n_np_ff = n_prc_ff = n_np_miss = n_prc_miss = 0
+        for d in jao:
+            k = f"{d['date']}_{d['time'][:5]}"
+            v, exact = _asof_value(net_pos, np_keys_sorted, k)
+            if v is None:
+                v = 0; n_np_miss += 1
+            elif not exact:
+                n_np_ff += 1
+            y_np.append(v)
+            v, exact = _asof_value(price_map, price_keys_sorted, k)
+            if v is None:
+                v = 0; n_prc_miss += 1
+            elif not exact:
+                n_prc_ff += 1
+            y_prc.append(v)
+        if n_np_ff or n_prc_ff or n_np_miss or n_prc_miss:
+            note = (f"Note: net position forward-filled for {n_np_ff} row(s), price for "
+                   f"{n_prc_ff} row(s) (Nord Pool settlement period coarser than JAO's "
+                   f"15-min grid). {n_np_miss} net-position and {n_prc_miss} price row(s) "
+                   f"had no match within 90 min and show as 0.")
+            cur = self._t7_status.cget("text")
+            self._t7_status.config(text=(f"{cur}  {note}" if cur else note), foreground=C_AMBER)
 
         self.fig7.clear()
         self.fig7.suptitle(f"Net Position  ({zone})  —  CNEC: {cnec}",
