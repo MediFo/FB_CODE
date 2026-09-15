@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -45,6 +46,11 @@ try:
 except (ImportError, AttributeError, Exception):
     # AttributeError covers statsmodels<0.14 using removed np.MachAr on NumPy 2.x
     sm = None
+
+try:
+    from scipy.stats import chi2 as _chi2_dist
+except ImportError:
+    _chi2_dist = None
 
 try:
     from linearmodels.panel import PanelOLS
@@ -103,6 +109,48 @@ def utc_to_cet_str(ts_utc, fmt: str = "%Y-%m-%d %H:%M") -> str:
     except (ValueError, TypeError):
         return "n/a"
 
+
+_JAO_TZ_SUFFIX_RE = re.compile(r'(Z|[+-]\d{2}:?\d{2})$')
+
+
+def jao_datetime_to_utc(raw: pd.Series, source_tz: str = "UTC") -> pd.Series:
+    """Convert a JAO 'dateTimeUtc'-style column to true UTC.
+
+    source_tz="UTC" (default, unchanged from this pipeline's original
+    behaviour): trust the field at face value via pd.to_datetime(raw,
+    utc=True). Correct if the JAO export genuinely publishes true UTC.
+
+    source_tz="CET": the JAO Nordic Publication Handbook (v1.7, pages 21-22,
+    fetched directly from publicationtool.jao.eu) documents that despite the
+    field's name, its published values are actually CET/CEST wall-clock, not
+    true UTC — verbatim: "'dateTimeUtc': CET time stamp (yes… CET?!)". This
+    has NOT been confirmed against a live fetch from this codebase (see
+    CLAUDE.md) — it is a documented possibility from JAO's own Handbook, not
+    a proven defect in every JAO export, which is why this is an explicit
+    opt-in rather than the new default. Symptom to watch for if you leave
+    this at the default "UTC" and are working from real (non-synthetic) JAO
+    data: outage/event alignment that looks systematically off by a whole
+    1h (winter/CET) or 2h (summer/CEST) — e.g. a known outage's effect
+    consistently shows up "early" or "late" by exactly that amount across
+    many events, rather than at approximately time zero. That pattern is
+    what this setting exists to fix; ordinary noise or a single mistimed
+    event is not.
+
+    When source_tz="CET": any trailing Z/offset on the raw value is first
+    stripped (left in place, it would be trusted as a genuine UTC marker and
+    mask the real CET reading underneath), the remaining wall-clock digits
+    are localized as CET/CEST, and the result is converted to true UTC —
+    the same DST policy cet_input_to_utc() uses for human-typed input,
+    applied here to a machine-published field carrying the same quirk.
+    """
+    if source_tz.upper() == "CET":
+        naive_str = raw.astype(str).str.replace(_JAO_TZ_SUFFIX_RE, "", regex=True)
+        naive = pd.to_datetime(naive_str, errors="coerce")
+        return naive.dt.tz_localize(
+            CET_ZONE, ambiguous=True, nonexistent="shift_forward"
+        ).dt.tz_convert("UTC")
+    return pd.to_datetime(raw, utc=True, errors="coerce")
+
 # ---------------------------------------------------------------------------
 # 1. JAO CSV loader
 # ---------------------------------------------------------------------------
@@ -112,11 +160,21 @@ EXPECTED_NUMERIC = [
 ]
 EXPECTED_PTDF_PREFIXES = ("ptdf_",)
 
-def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
+def load_jao_csv(path: str, log_cb: LogCallback = _noop,
+                 jao_timestamp_zone: str = "UTC") -> pd.DataFrame:
     """Load a JAO CSV exported from the user's existing tool.
-    Robust to missing columns - they are filled with NaN."""
+    Robust to missing columns - they are filled with NaN.
+
+    jao_timestamp_zone: "UTC" (default) or "CET" — see jao_datetime_to_utc()
+    for why this is optional and what symptom should make you try "CET"."""
     df = pd.read_csv(path, low_memory=False)
     df.columns = [c.strip() for c in df.columns]
+
+    if jao_timestamp_zone.upper() == "CET":
+        log_cb("  JAO timestamp zone override: treating dateTimeUtc-style "
+               "column values as CET/CEST wall-clock (not true UTC) per "
+               "jao_timestamp_zone='CET' — see CLAUDE.md for why this "
+               "option exists before relying on it.")
 
     # Find datetime column under any common name
     dt_col = None
@@ -140,7 +198,7 @@ def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
         else:
             raise ValueError("JAO CSV has no recognizable datetime column")
     else:
-        df["dateTimeUtc"] = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
+        df["dateTimeUtc"] = jao_datetime_to_utc(df[dt_col], source_tz=jao_timestamp_zone)
 
     df = df.dropna(subset=["dateTimeUtc"]).copy()
 
@@ -421,15 +479,65 @@ def _indep_for_hypothesis(hid: str, src: str = "fi") -> list:
 
 
 def filter_no3(df: pd.DataFrame, patterns: Sequence[str] = DEFAULT_NO3_PATTERNS,
-               zone_label: str = "NO3") -> pd.DataFrame:
+               zone_label: str = "NO3", log_cb: LogCallback = _noop) -> pd.DataFrame:
+    """Select rows for `zone_label`, preferring the published biddingZoneFrom/
+    To tag and falling back to a hardcoded CNEC-name regex when that tag is
+    missing. The regex list is a snapshot of known corridor names for one
+    grid configuration and WILL go stale silently on any CNEC renaming or
+    Statnett grid-model change (routine in this market) — this function logs
+    how much of the match actually came from the fallback so that drift is
+    at least visible, even though it can't be prevented here."""
     pat = re.compile("|".join(patterns), flags=re.IGNORECASE) if patterns else None
+    has_zone_cols = "biddingZoneFrom" in df.columns or "biddingZoneTo" in df.columns
     is_zone = pd.Series(False, index=df.index)
     if "biddingZoneFrom" in df.columns:
         is_zone |= (df["biddingZoneFrom"] == zone_label)
     if "biddingZoneTo" in df.columns:
         is_zone |= (df["biddingZoneTo"] == zone_label)
     has_substr = df["cneName"].astype(str).str.contains(pat, na=False) if pat else pd.Series(False, index=df.index)
-    return df.loc[is_zone | has_substr].copy()
+    matched = is_zone | has_substr
+
+    # Rows found ONLY via the name-pattern fallback (not the zone tag) are
+    # exactly the ones a CNEC rename would silently stop matching, or a
+    # false positive if the pattern is broader than intended (e.g. a
+    # boundary CNEC where the name fragment belongs to a neighbouring zone).
+    substr_only = has_substr & ~is_zone
+    n_substr_only = int(substr_only.sum())
+    if n_substr_only:
+        example_names = df.loc[substr_only, "cneName"].astype(str).unique()[:5].tolist()
+        if has_zone_cols:
+            log_cb(f"  ⚠ {zone_label} filter: {n_substr_only} row(s) matched only via "
+                   f"the hardcoded name pattern, not the biddingZoneFrom/To tag — "
+                   f"e.g. {example_names}. This is expected for genuinely untagged "
+                   f"rows, but is also exactly how a CNEC rename or grid-model change "
+                   f"would go undetected; verify these names still belong to "
+                   f"{zone_label} if the JAO schema/grid model has changed recently.")
+        else:
+            log_cb(f"  {zone_label} filter: no biddingZoneFrom/To columns in this "
+                   f"data — all {n_substr_only} matched row(s) rely entirely on the "
+                   f"hardcoded name pattern (cannot cross-check against a zone tag).")
+    if int(matched.sum()) == 0:
+        log_cb(f"  ⚠ {zone_label} filter matched zero rows — neither the zone tag "
+               f"nor the name pattern found anything for '{zone_label}'.")
+
+    # Boundary CNECs (biddingZoneFrom XOR biddingZoneTo == zone_label) sit
+    # between two zones rather than purely inside one — a "propagates to
+    # {zone_label}" claim on one of these needs to say which side of the
+    # boundary is moving, since the constraint can be driven by conditions
+    # on the OTHER side. Surface the split so that distinction isn't silently
+    # lost in the pooled regression sample.
+    if has_zone_cols:
+        from_is_zone = (df["biddingZoneFrom"] == zone_label) if "biddingZoneFrom" in df.columns else pd.Series(False, index=df.index)
+        to_is_zone   = (df["biddingZoneTo"]   == zone_label) if "biddingZoneTo"   in df.columns else pd.Series(False, index=df.index)
+        boundary = matched & (from_is_zone ^ to_is_zone)
+        n_boundary = int(boundary.sum())
+        if n_boundary:
+            log_cb(f"  {zone_label} filter: {n_boundary} of {int(matched.sum())} matched "
+                   f"row(s) are BOUNDARY CNECs (only one side tagged {zone_label}) — "
+                   f"their PTDF/RAM/shadow-price behaviour can be driven by the "
+                   f"neighbouring zone as much as by {zone_label} itself.")
+
+    return df.loc[matched].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -470,14 +578,40 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
             return ts.tz_localize("UTC")   # naive → assume UTC (ENTSO-E API default)
         return ts.tz_convert("UTC")
 
+    def _duration_h(row) -> float | None:
+        try:
+            return (pd.Timestamp(row["end"]) - pd.Timestamp(row["start"])).total_seconds() / 3600
+        except Exception:
+            return None
+
+    def _with_retry(fn, label: str, retries: int = 2, delay_s: float = 2.0):
+        """Retry a transient ENTSO-E query failure (timeout, connection
+        reset, 5xx) instead of dropping that query's events for the whole
+        run after a single blip. A 4xx/"no data" response is not transient
+        (retrying it wastes time and gets the same answer), so the caller
+        is expected to have already excluded those before calling this."""
+        last_exc = None
+        for attempt in range(1, retries + 1):
+            try:
+                return fn(), None
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    log_cb(f"  {label}: attempt {attempt} failed ({e}); retrying...")
+                    time.sleep(delay_s)
+        return None, last_exc
+
     events = []
 
     # ----- A77: production unavailability -----
-    try:
+    df, a77_err = _with_retry(
+        lambda: client.query_unavailability_of_production_units(
+            country_code=country_code, start=start, end=end, docstatus=None),
+        label=f"ENTSO-E A77 ({country_code})")
+    if a77_err is not None:
+        log_cb(f"ENTSO-E A77 failed after retries: {a77_err}")
+    else:
         log_cb(f"ENTSO-E: query_unavailability_of_production_units ({country_code})")
-        df = client.query_unavailability_of_production_units(
-            country_code=country_code, start=start, end=end, docstatus=None,
-        )
         for i, row in df.reset_index().iterrows():
             try:
                 nominal = float(row.get("nominal_power", 0) or 0)
@@ -487,15 +621,18 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 btype = str(row.get("businesstype", "")).strip()
                 p_or_f = "forced" if btype == "A54" else "planned"
                 # Skip implausibly long records (>30 days = status updates)
-                try:
-                    dur_h = (pd.Timestamp(row["end"]) - pd.Timestamp(row["start"])
-                             ).total_seconds() / 3600
-                    if dur_h > 30 * 24:
-                        log_cb(f"  A77 skipped: {row.get('production_resource_name','')} "
-                               f"duration {dur_h/24:.0f} d (likely status update)")
-                        continue
-                except Exception:
-                    pass
+                dur_h = _duration_h(row)
+                if dur_h is not None and dur_h > 30 * 24:
+                    log_cb(f"  A77 skipped: {row.get('production_resource_name','')} "
+                           f"duration {dur_h/24:.0f} d (likely status update)")
+                    continue
+                if dur_h is not None and dur_h < 0:
+                    log_cb(f"  ⚠ A77 record has end before start "
+                           f"({row.get('production_resource_name','')}, "
+                           f"start={row.get('start')}, end={row.get('end')}) — "
+                           f"skipped as a malformed record, not kept as a "
+                           f"zero-duration or inverted-interval event.")
+                    continue
                 events.append({
                     "outage_id": f"entsoe_a77:{row.get('mrid', i)}:{row.get('start')}",
                     "start_utc": _ts_utc(row["start"]).isoformat(),
@@ -513,17 +650,34 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 })
             except Exception as e:
                 log_cb(f"  A77 row error: {e}")
-    except Exception as e:
-        log_cb(f"ENTSO-E A77 failed: {e}")
 
     # ----- A78: transmission unavailability -----
     borders = _country_borders(country_code)
+    failed_borders = []
     for fr, to in borders:
-        try:
-            log_cb(f"ENTSO-E: A78 {fr} -> {to}")
-            df = client.query_unavailability_transmission(
+        log_cb(f"ENTSO-E: A78 {fr} -> {to}")
+
+        def _query_this_border(fr=fr, to=to):
+            return client.query_unavailability_transmission(
                 country_code_from=fr, country_code_to=to,
                 start=start, end=end, docstatus=None)
+
+        try:
+            df = _query_this_border()
+        except Exception as e:
+            err_str = str(e)
+            if "400" in err_str or "No matching data found" in err_str:
+                # 400 = border not published in ENTSO-E TP (normal for many
+                # FI borders) -- not transient, retrying gets the same answer.
+                log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
+                continue
+            df, retry_err = _with_retry(_query_this_border, label=f"ENTSO-E A78 {fr}->{to}",
+                                        retries=2)
+            if retry_err is not None:
+                log_cb(f"ENTSO-E A78 {fr}->{to} failed after retries: {retry_err}")
+                failed_borders.append(f"{fr}->{to}")
+                continue
+        try:
             if df is None or len(df) == 0:
                 continue
             for i, row in df.reset_index().iterrows():
@@ -532,15 +686,16 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                     is_hvdc = frozenset({fr, to}) in _HVDC_PAIRS
                     # Skip implausibly long records (>30 days = ENTSO-E status
                     # updates stored as new events, not real outages)
-                    try:
-                        dur_h = (pd.Timestamp(row["end"]) - pd.Timestamp(row["start"])
-                                 ).total_seconds() / 3600
-                        if dur_h > 30 * 24:
-                            log_cb(f"  A78 skipped: {fr}->{to} duration "
-                                   f"{dur_h/24:.0f} d (likely status update)")
-                            continue
-                    except Exception:
-                        pass
+                    dur_h = _duration_h(row)
+                    if dur_h is not None and dur_h > 30 * 24:
+                        log_cb(f"  A78 skipped: {fr}->{to} duration "
+                               f"{dur_h/24:.0f} d (likely status update)")
+                        continue
+                    if dur_h is not None and dur_h < 0:
+                        log_cb(f"  ⚠ A78 {fr}->{to} record has end before start "
+                               f"(start={row.get('start')}, end={row.get('end')}) — "
+                               f"skipped as a malformed record.")
+                        continue
                     events.append({
                         "outage_id": f"entsoe_a78:{fr}-{to}:{row.get('mrid', i)}:{row.get('start')}",
                         "start_utc": _ts_utc(row["start"]).isoformat(),
@@ -559,12 +714,19 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 except Exception as e:
                     log_cb(f"  A78 row err: {e}")
         except Exception as e:
-            err_str = str(e)
-            if "400" in err_str or "No matching data found" in err_str:
-                # 400 = border not published in ENTSO-E TP (normal for many FI borders)
-                log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
-            else:
-                log_cb(f"ENTSO-E A78 {fr}->{to} failed: {e}")
+            # The query itself already succeeded above (or we'd have hit the
+            # earlier except/continue) -- an error here is in row processing,
+            # not an API failure, so it isn't retried, just logged.
+            log_cb(f"  A78 {fr}->{to} row processing failed: {e}")
+
+    if failed_borders:
+        # One line, hard to miss, in addition to the per-border log lines
+        # above -- a border that failed after retries silently degrades
+        # covariate coverage for that route if it's easy to lose among many
+        # other log lines.
+        log_cb(f"⚠ ENTSO-E A78: {len(failed_borders)} border(s) failed after "
+               f"retries and were skipped: {', '.join(failed_borders)} — "
+               f"outages on these routes are NOT included below.")
 
     log_cb(f"ENTSO-E events recorded: {len(events)}")
     return pd.DataFrame(events)
@@ -604,22 +766,90 @@ def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     # value is treated as CET/CEST and converted to true UTC right here, once,
     # so every downstream consumer gets a correct, unambiguous UTC string
     # without needing to guess.
+    #
+    # One malformed date must not abort every OTHER row in the file — this is
+    # a hand-edited CSV, and a single typo is exactly the kind of mistake a
+    # person makes here. Convert per-row, collecting failures instead of
+    # letting the first one raise out of .apply() and lose the whole file.
+    bad_rows: list[tuple[int, str, object, str]] = []
+
+    def _convert(v, row_idx: int, col: str):
+        if pd.isna(v):
+            return v
+        try:
+            return cet_input_to_utc(v).isoformat()
+        except Exception as e:
+            bad_rows.append((row_idx, col, v, str(e)))
+            return pd.NA
+
     for col in ("start_utc", "end_utc"):
         if col in df.columns:
-            df[col] = df[col].apply(
-                lambda v: cet_input_to_utc(v).isoformat() if pd.notna(v) else v)
+            df[col] = [_convert(v, i, col) for i, v in df[col].items()]
+
+    if bad_rows:
+        for row_idx, col, v, err in bad_rows:
+            log_cb(f"  ⚠ manual_outages.csv row {row_idx} ({col}={v!r}) could not be "
+                   f"parsed as a date and was dropped: {err}")
+        bad_idx = {row_idx for row_idx, _, _, _ in bad_rows}
+        df = df.drop(index=sorted(bad_idx)).reset_index(drop=True)
+        log_cb(f"  Dropped {len(bad_idx)} row(s) with unparseable dates; "
+               f"{len(df)} row(s) remain")
 
     log_cb(f"Manual outage rows loaded: {len(df)}")
     return df
 
 
-def deduplicate_outages(df: pd.DataFrame) -> pd.DataFrame:
+def _dedup_pass(df: pd.DataFrame, key_col: str, keep: np.ndarray,
+                log_cb: LogCallback, log_label: str) -> None:
+    """Suppress lower-priority rows that overlap a higher-priority row within
+    each `key_col` group, mutating `keep` in place. Shared by both the
+    exact-identity pass and the broader cross-source route pass below."""
+    for group_key, grp in df.groupby(key_col, sort=False):
+        idxs = grp.index.tolist()
+        if len(idxs) == 1:
+            continue
+        for i in range(len(idxs)):
+            if not keep[idxs[i]]:
+                continue
+            si, ei = df.loc[idxs[i], "start_utc"], df.loc[idxs[i], "end_utc"]
+            for j in range(i + 1, len(idxs)):
+                if not keep[idxs[j]]:
+                    continue
+                sj, ej = df.loc[idxs[j], "start_utc"], df.loc[idxs[j], "end_utc"]
+                # Two intervals overlap iff neither ends before the other starts
+                if si < ej and sj < ei:
+                    if keep[idxs[j]]:
+                        log_cb(f"  dedup ({log_label}): dropping {df.loc[idxs[j],'source']} "
+                               f"'{df.loc[idxs[j],'asset_name']}' "
+                               f"({df.loc[idxs[j],'start_utc']} .. {df.loc[idxs[j],'end_utc']}) "
+                               f"— overlaps higher-priority {df.loc[idxs[i],'source']} "
+                               f"'{df.loc[idxs[i],'asset_name']}' in group '{group_key}'")
+                    keep[idxs[j]] = False  # j has lower or equal priority → drop
+
+
+def deduplicate_outages(df: pd.DataFrame, log_cb: LogCallback = _noop) -> pd.DataFrame:
     """Merge events from different sources by (asset, time-window) similarity.
     Priority: entsoe_a78 > entsoe_a77 > entsoe_a80 > fingrid > manual.
 
     Only removes a lower-priority event when it overlaps in time with a
     higher-priority event for the same asset. Non-overlapping outage periods
     for the same asset (e.g., two Fenno-Skan outages months apart) are kept.
+
+    Two passes:
+      1. Exact identity (asset_id|asset_name|asset_type) — catches same-
+         source duplicates and any cross-source record that happens to share
+         an exact name.
+      2. Route-level, transmission-only (asset_type|bidding_zone), for hvdc/
+         ac_line rows only — ENTSO-E A78 names a transmission event
+         mechanically (e.g. "FI->SE_3"), while a manual CSV row describes the
+         same physical route in prose (e.g. "Fenno-Skan PTC"); those never
+         share an exact-identity key, so pass 1 alone lets the same real
+         outage survive from both sources and double-count in
+         build_covariates' MW-lost dose variables. Pass 2 is restricted to
+         transmission asset types (where this naming mismatch is the known
+         failure mode) and still requires an actual time overlap before
+         suppressing anything, so two genuinely distinct, non-overlapping
+         outages on the same country's HVDC/AC assets are never merged.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -635,30 +865,25 @@ def deduplicate_outages(df: pd.DataFrame) -> pd.DataFrame:
         df["asset_name"].fillna("").astype(str).str.lower().str.strip() + "|" +
         df["asset_type"].fillna("").astype(str)
     )
+    df["_route_key"] = (
+        df["asset_type"].fillna("").astype(str) + "|" +
+        df["bidding_zone"].fillna("").astype(str).str.upper().str.strip()
+    )
     # Sort: same-asset rows together, highest priority first
     df = df.sort_values(["_asset_key", "_pri", "start_utc"],
                         ascending=[True, False, True]).reset_index(drop=True)
 
     keep = np.ones(len(df), dtype=bool)
-    for _, grp in df.groupby("_asset_key", sort=False):
-        idxs = grp.index.tolist()
-        if len(idxs) == 1:
-            continue
-        # Within this asset group, suppress lower-priority rows that overlap
-        # with any already-kept higher-priority row.
-        for i in range(len(idxs)):
-            if not keep[idxs[i]]:
-                continue
-            si, ei = df.loc[idxs[i], "start_utc"], df.loc[idxs[i], "end_utc"]
-            for j in range(i + 1, len(idxs)):
-                if not keep[idxs[j]]:
-                    continue
-                sj, ej = df.loc[idxs[j], "start_utc"], df.loc[idxs[j], "end_utc"]
-                # Two intervals overlap iff neither ends before the other starts
-                if si < ej and sj < ei:
-                    keep[idxs[j]] = False  # j has lower or equal priority → drop
+    _dedup_pass(df, "_asset_key", keep, log_cb, "exact identity")
 
-    return df.loc[keep].drop(columns=["_asset_key", "_pri"]).reset_index(drop=True)
+    is_transmission = df["asset_type"].isin(["hvdc", "ac_line"])
+    if is_transmission.any():
+        trans = df.loc[is_transmission].sort_values(
+            ["_route_key", "_pri", "start_utc"], ascending=[True, False, True])
+        _dedup_pass(trans, "_route_key", keep, log_cb, "cross-source route")
+
+    return (df.loc[keep].drop(columns=["_asset_key", "_pri", "_route_key"])
+            .reset_index(drop=True))
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1283,61 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
 DEFAULT_INDEP = _default_indep("fi")
 
 
+def _prune_collinear_dose_pairs(
+    X: pd.DataFrame, indep: list[str], log_cb: LogCallback = _noop,
+) -> tuple[pd.DataFrame, list[str], list[tuple[str, str, str, float]]]:
+    """Detect and drop near-perfectly collinear covariate pairs before a fit.
+
+    A binary outage-active dummy and its paired MW-lost dose variable can be
+    near-perfectly collinear when outages of that type never vary in size
+    within the sample (constant capacity_mw x binary is proportional to the
+    binary itself). _indep_for_hypothesis() already avoids pairing these for
+    the built-in H1-H6 specs, but any caller supplying a custom `indep` list
+    has no such protection, and PanelOLS(check_rank=False) would otherwise
+    split the coefficient between the two collinear variables arbitrarily.
+
+    Checks every pair of the given covariates for |corr| > 0.995 and drops
+    one, preferring to keep a continuous "dose" variable over a binary
+    {0,1} "active" indicator (falling back to a deterministic later-column
+    drop when neither or both are binary).
+
+    Returns (X with dropped columns removed, indep with dropped names
+    removed, list of (col1, col2, dropped, corr) for whatever was pruned).
+    """
+    pruned: list[tuple[str, str, str, float]] = []
+    covariate_cols = [c for c in indep if c in X.columns]
+    to_drop: set[str] = set()
+    for i, c1 in enumerate(covariate_cols):
+        if c1 in to_drop:
+            continue
+        for c2 in covariate_cols[i + 1:]:
+            if c2 in to_drop:
+                continue
+            v1, v2 = X[c1], X[c2]
+            if v1.std() < 1e-12 or v2.std() < 1e-12:
+                continue
+            corr = v1.corr(v2)
+            if pd.isna(corr) or abs(corr) <= 0.995:
+                continue
+            bin1 = set(v1.unique()) <= {0.0, 1.0}
+            bin2 = set(v2.unique()) <= {0.0, 1.0}
+            if bin1 and not bin2:
+                drop_col = c1
+            elif bin2 and not bin1:
+                drop_col = c2
+            else:
+                drop_col = c2  # both/neither binary: deterministic, drop the later one
+            to_drop.add(drop_col)
+            pruned.append((c1, c2, drop_col, float(corr)))
+    if to_drop:
+        for c1, c2, dropped, corr in pruned:
+            log_cb(f"  ⚠ collinearity pruning: {c1} and {c2} are near-perfectly "
+                   f"correlated (r={corr:.4f}) — dropping {dropped}, keeping the other")
+        X = X.drop(columns=list(to_drop))
+        indep = [c for c in indep if c not in to_drop]
+    return X, indep, pruned
+
+
 def run_panel_regression(df: pd.DataFrame, dep_var: str,
                          indep: Sequence[str] | None = None,
                          add_time_fe: bool = True,
@@ -1116,6 +1396,12 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     # Drop rows where any conversion produced NaN; align y
     valid = X.notna().all(axis=1) & y.notna()
     X = X.loc[valid]; y = y.loc[valid]
+
+    # Collinear dose-pair pruning (see _prune_collinear_dose_pairs below):
+    # applies to the REQUESTED covariates, not the hour/dow/month FE dummies
+    # added further down.
+    X, indep, _pruned = _prune_collinear_dose_pairs(X, indep, log_cb)
+
     # Drop columns with zero variance (constant dummies that didn't activate)
     nz = X.std(axis=0, skipna=True) > 1e-12
     X = X.loc[:, nz]
@@ -1147,9 +1433,25 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     cluster_series_entity = cluster_series_entity.loc[y.index]
     cluster_series_time   = cluster_series_time.loc[y.index]
 
-    cluster_codes_twoway = np.column_stack([cluster_series_entity.values,
-                                             cluster_series_time.values])
-    cluster_codes_time   = cluster_series_time.values.reshape(-1, 1)
+    # IMPORTANT: pass the (entity, time)-indexed pandas objects themselves,
+    # NOT their bare .values — linearmodels' PanelOLS.fit(cov_type=
+    # "clustered", clusters=...) re-wraps whatever it receives in its own
+    # internal PanelData and validates that PanelData's inferred entity/time
+    # shape against the model's. A raw NumPy array (what .values.reshape(-1,
+    # 1)/np.column_stack(...) previously produced here) carries no index for
+    # PanelData to recover that shape from, so this ALWAYS raised "clusters
+    # must have the same number of entities and time periods as the model
+    # data" -- meaning time-clustered and two-way-clustered SEs could never
+    # actually succeed, and every fit silently fell through to the
+    # entity-clustered fallback further down this function's attempt chain,
+    # with no trace of that having happened before cov_type_used/
+    # se_fallback_occurred were added below. Verified against linearmodels
+    # directly: the identical cluster codes succeed immediately once passed
+    # as a properly-indexed Series/DataFrame instead of a stripped array.
+    cluster_codes_twoway = pd.concat(
+        [cluster_series_entity.rename("entity"), cluster_series_time.rename("time")],
+        axis=1)
+    cluster_codes_time   = cluster_series_time
 
     _time_kwargs   = {"cov_type": "clustered", "clusters": cluster_codes_time,
                       "group_debias": True}
@@ -1179,17 +1481,22 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     attempts = [primary] + [f for f in fallbacks if f[0] != primary[0]]
 
     res = None
+    cov_type_used = None
     for attempt_label, kwargs in attempts:
         try:
             mod = PanelOLS(y, X, entity_effects=True, drop_absorbed=True,
                            check_rank=False)
             res = mod.fit(**kwargs)
+            cov_type_used = attempt_label
             break
         except Exception as e:
             log_cb(f"  {attempt_label} failed: {e}")
 
     if res is None:
         return {}
+    if cov_type_used != primary[0]:
+        log_cb(f"  ⚠ requested '{primary[0]}' standard errors were not usable; "
+               f"fell back to '{cov_type_used}' — see cov_type_used in the result")
 
     # Diagnostics
     try:
@@ -1247,6 +1554,10 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
         "rank": design_rank,
         "n_params": int(X.shape[1]),
         "ill_conditioned": ill_conditioned,
+        "cov_type_used": cov_type_used,
+        "cov_type_requested": primary[0],
+        "se_fallback_occurred": cov_type_used != primary[0],
+        "collinearity_pruned": [(c1, c2, dropped, corr) for c1, c2, dropped, corr in _pruned],
     }
 
 
@@ -1422,6 +1733,39 @@ def _build_hypotheses(src: str = "fi", tgt: str = "NO3") -> list:
 HYPOTHESES = _build_hypotheses("fi", "NO3")
 
 
+# ── Economic-significance gate ───────────────────────────────────────────────
+# p<0.05 alone does not mean a result is economically meaningful: on a large
+# 15-min-MTU panel spanning months, even a tiny, physically-expected shift
+# (FI and NO3 are not adjacent zones — flow between them routes through
+# SE1/SE2/SE3, so a small PTDF_FI on a NO3 CNEC is the expected case, not an
+# anomaly) can clear conventional statistical significance. These are
+# conservative, documented floors below which a coefficient is reported as
+# statistically significant but NOT economically material — not a precise
+# calibration against live market data, which this codebase does not have
+# access to; adjust them if better-grounded thresholds become available.
+ECONOMIC_SIGNIFICANCE_THRESHOLDS = {
+    "fall_signed": 10.0,   # MW — floor for a reference-flow shift to matter
+    "ram":         10.0,   # MW — floor for a RAM shift to matter
+    "shadowPrice": 0.5,    # EUR/MW — floor for a shadow-price shift to matter
+    # ptdf_*_abs handled by prefix match below (PTDF columns are per-src)
+}
+_PTDF_ECON_THRESHOLD = 0.01  # dimensionless PTDF-magnitude floor
+
+
+def _economic_threshold(dep_var: str) -> float | None:
+    if dep_var in ECONOMIC_SIGNIFICANCE_THRESHOLDS:
+        return ECONOMIC_SIGNIFICANCE_THRESHOLDS[dep_var]
+    if dep_var.startswith("ptdf_") and dep_var.endswith("_abs"):
+        return _PTDF_ECON_THRESHOLD
+    return None
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal CDF via math.erf — avoids adding a scipy.stats
+    dependency just for a single two-sided z-test p-value."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
 def _holm_bonferroni(p_values: list[float | None], alpha: float = 0.05) -> list[bool]:
     """Holm-Bonferroni step-down procedure for multiple testing correction.
     Returns a list of booleans: True = reject H0 at family-wise alpha.
@@ -1492,9 +1836,25 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                                    "p-value undefined (not a null result; re-check "
                                    "sample size or collinearity)")
                     else:
+                        # Test the DIFFERENCE (forced - planned) directly rather
+                        # than eyeballing two independently estimated
+                        # coefficients: comparing point estimates and gating on
+                        # only one coefficient's own p-value can call a result
+                        # "supported" even when the difference itself isn't
+                        # statistically distinguishable from zero.
+                        diff = float(bf["coef"] - bp["coef"])
+                        se_f = float(bf["std_err"]); se_p = float(bp["std_err"])
+                        combined_se = math.sqrt(se_f**2 + se_p**2)
+                        if combined_se > 0 and not math.isnan(combined_se):
+                            z = diff / combined_se
+                            p_diff = 2.0 * (1.0 - _norm_cdf(abs(z)))
+                        else:
+                            p_diff = float("nan")
+                        supported = (not math.isnan(p_diff)) and diff > 0 and p_diff < 0.05
                         verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
                                    f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
-                                   f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
+                                   f"Δ(forced−planned)={diff:.3g}, p_diff={p_diff:.3g} → "
+                                   f"{'SUPPORTED' if supported else 'NOT supported'}")
                 except KeyError:
                     verdict = "vars absent in logit (likely no IVA-active rows)"
             else:
@@ -1505,7 +1865,8 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                 cf = r["coefs"].set_index("param")
                 if h["var"] in cf.index:
                     beta = cf.loc[h["var"], "coef"]; pval = cf.loc[h["var"], "p"]
-                    verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                    se_label = f", se={r.get('cov_type_used','?')}"
+                    verdict = (f"β={beta:.3g}, p={pval:.3g}, n={r.get('n_obs','?'):,}{se_label} → "
                                f"{'CONSISTENT (no MTU effect)' if pval>=0.05 else 'inconsistent (MTU effect detected)'}")
                 else:
                     verdict = f"{h['var']} absorbed by FE; placebo inconclusive"
@@ -1524,27 +1885,44 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                         ill_label = (f"  ⚠ design matrix ill-conditioned "
                                      f"(cond={r.get('condition_number'):.2e}) — "
                                      f"coefficient not reliably identified" if ill else "")
+                        se_fallback_label = (
+                            f"  ⚠ requested SE unavailable — fell back to "
+                            f"'{r.get('cov_type_used')}'" if r.get("se_fallback_occurred") else "")
+                        n_se_label = f", n={r.get('n_obs','?'):,}, se={r.get('cov_type_used','?')}"
+
+                        econ_threshold = _economic_threshold(h["dep"])
+                        econ_ok = (econ_threshold is None) or (abs(beta) >= econ_threshold)
+                        econ_label = ("" if econ_ok or econ_threshold is None else
+                                      f"  [below economic-significance floor of "
+                                      f"{econ_threshold:g}; statistically significant "
+                                      f"only]")
 
                         if h["expected_sign"] is None:
                             # Direction is physically ambiguous — any significant
                             # result is a finding; neither direction is "wrong"
-                            if pval < 0.05:
+                            if pval < 0.05 and econ_ok:
                                 direction = "positive" if beta > 0 else "negative"
-                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
-                                           f"SIGNIFICANT ({direction} direction){used_label}{ill_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"SIGNIFICANT ({direction} direction){used_label}{ill_label}{se_fallback_label}")
+                            elif pval < 0.05:
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"statistically significant{econ_label}{used_label}{ill_label}{se_fallback_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}{se_fallback_label}")
                         else:
                             sign_ok = (np.sign(beta) == np.sign(h["expected_sign"]))
-                            if sign_ok and pval < 0.05:
-                                verdict = f"β={beta:.3g}, p={pval:.3g} → SUPPORTED{used_label}{ill_label}"
+                            if sign_ok and pval < 0.05 and econ_ok:
+                                verdict = f"β={beta:.3g}, p={pval:.3g}{n_se_label} → SUPPORTED{used_label}{ill_label}{se_fallback_label}"
+                            elif sign_ok and pval < 0.05:
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"statistically SUPPORTED{econ_label}{used_label}{ill_label}{se_fallback_label}")
                             elif pval < 0.05:
-                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
-                                           f"SIGNIFICANT but opposite direction{used_label}{ill_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"SIGNIFICANT but opposite direction{used_label}{ill_label}{se_fallback_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g}{n_se_label} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}{se_fallback_label}")
                         break
                     tried.append(var)
                 else:
@@ -1705,6 +2083,29 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
 # ---------------------------------------------------------------------------
 # 10. End-to-end orchestrator (simple, called by dashboard)
 # ---------------------------------------------------------------------------
+def main_cli() -> None:
+    """pip console-script entry point for fi-no3-analyse.
+    Locates run_analysis.py relative to this file and delegates to its main()."""
+    import importlib.util
+    import sys as _sys
+    _here = Path(__file__).resolve().parent
+    _candidates = [
+        _here.parent.parent / "scripts" / "run_analysis.py",  # src/fi_no3/ layout
+        _here.parent / "scripts" / "run_analysis.py",
+        _here / "run_analysis.py",
+        _here.parent / "run_analysis.py",
+    ]
+    for _script in _candidates:
+        if _script.exists():
+            spec = importlib.util.spec_from_file_location("run_analysis", _script)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+            return
+    print("ERROR: run_analysis.py not found relative to propagation.py.", file=_sys.stderr)
+    _sys.exit(1)
+
+
 @dataclass
 class PipelineConfig:
     jao_csv:        str   = ""
@@ -1718,6 +2119,7 @@ class PipelineConfig:
     source_country: str   = "FI"    # ENTSO-E country code for the outage source
     target_zone:    str   = "NO3"   # Bidding zone to analyse (CNEC filter)
     no3_patterns:   tuple = DEFAULT_NO3_PATTERNS  # auto-updated in __post_init__
+    jao_timestamp_zone: str = "UTC"  # "UTC" (default) or "CET" — see jao_datetime_to_utc()
 
     def __post_init__(self):
         # If no3_patterns is the default, auto-populate from target_zone
@@ -1735,11 +2137,12 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # 1. JAO
     if jao_df is None:
         log_cb(f"Loading JAO CSV: {cfg.jao_csv}")
-        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb)
+        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb,
+                           jao_timestamp_zone=cfg.jao_timestamp_zone)
     else:
         jao = jao_df.copy()
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")
-    no3 = filter_no3(jao, cfg.no3_patterns, zone_label=cfg.target_zone)
+    no3 = filter_no3(jao, cfg.no3_patterns, zone_label=cfg.target_zone, log_cb=log_cb)
     log_cb(f"  {cfg.target_zone} rows: {len(no3)}, {cfg.target_zone} CNECs: {no3['cneName'].nunique()}")
 
     if no3.empty:
@@ -1778,10 +2181,10 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
                 upsert_events(con, df_m.to_dict("records"))
                 all_events.append(df_m)
         outages = load_cached_outages(con)
-        outages = deduplicate_outages(outages)
+        outages = deduplicate_outages(outages, log_cb=log_cb)
         con.close()
     else:
-        outages = deduplicate_outages(outages_df)
+        outages = deduplicate_outages(outages_df, log_cb=log_cb)
     log_cb(f"  Unified outage events (deduped): {len(outages)}")
 
     # --- Overlap check: warn if no outages fall inside the JAO window ---
@@ -2018,20 +2421,31 @@ def build_event_time_dummies(df: pd.DataFrame, outages: pd.DataFrame,
     # evaluate True at every k, so event_k collapsed to a single constant —
     # k=lags, the last value written in the loop — for the ENTIRE dataframe,
     # regardless of actual proximity to any outage). Rounding that offset to
-    # the nearest integer step directly gives "the target hour nearest to
-    # this row" in one shot, with no inner per-k loop and no overwrite-order
-    # ambiguity for a single outage.
+    # the nearest integer step gives "the target hour nearest to this row"
+    # for THIS outage.
+    #
+    # When more than one outage is in range for the same row, the tie-break
+    # across outages must use the row's TRUE elapsed time to each outage's
+    # start (true_dist_s below) — not the sub-hour rounding residual of the
+    # offset (|offset_steps - k_nearest|). The residual measures how close a
+    # row sits to an hour boundary relative to one particular outage, which
+    # is unrelated to which outage is actually temporally closest: a row
+    # exactly 6.0 hours after outage A (residual 0) would previously beat a
+    # row 0.99 hours after outage C (residual ~0.006h) even though C is the
+    # genuinely nearest event, purely because A's start happened to fall on
+    # an hour boundary relative to this row. True elapsed time does not have
+    # that failure mode.
     event_k = np.full(len(df), np.nan)
     best_dist_s = np.full(len(df), np.inf)
     for _, row in out.iterrows():
         s = row["start_utc"]
         offset_steps = ((ts - s) / step).to_numpy()
         k_nearest = np.rint(offset_steps)
-        dist_s = np.abs(offset_steps - k_nearest) * step.total_seconds()
+        true_dist_s = np.abs(offset_steps) * step.total_seconds()
         in_range = (k_nearest >= -leads) & (k_nearest <= lags)
-        closer = in_range & (dist_s < best_dist_s)
+        closer = in_range & (true_dist_s < best_dist_s)
         event_k[closer] = k_nearest[closer]
-        best_dist_s[closer] = dist_s[closer]
+        best_dist_s[closer] = true_dist_s[closer]
 
     df["event_k"] = event_k
 
@@ -2121,15 +2535,40 @@ def run_event_study(df: pd.DataFrame, dep_var: str,
 
     coef_df = pd.DataFrame(rows).sort_values("k").reset_index(drop=True)
 
-    # Pre-trend test: are betas for k < 0 jointly zero?
+    # Pre-trend test: are betas for k < 0 JOINTLY zero? A per-coefficient
+    # check (each individually p>=0.05) is NOT the same claim — it is an
+    # uncorrected multiple-comparisons check that understates the true
+    # joint false-positive rate as more leads are added. Run a genuine Wald
+    # chi-square test on the pre-period coefficient subvector using the
+    # model's own coefficient covariance matrix: W = b' * Cov^-1 * b ~
+    # chi2(df = number of pre-period coefficients).
     pre = coef_df[coef_df["k"] < 0]
-    pre_trend_ok = (pre["p"] >= 0.05).all() if len(pre) else True
+    pre_cols = [col for k, col in dummy_cols if k < 0 and col in res.params.index]
+    wald_stat, wald_p = float("nan"), float("nan")
+    if pre_cols and _chi2_dist is not None:
+        try:
+            beta_sub = res.params.loc[pre_cols].to_numpy()
+            cov_sub = res.cov.loc[pre_cols, pre_cols].to_numpy()
+            wald_stat = float(beta_sub @ np.linalg.solve(cov_sub, beta_sub))
+            wald_p = float(_chi2_dist.sf(wald_stat, df=len(pre_cols)))
+            pre_trend_ok = wald_p >= 0.05
+        except (np.linalg.LinAlgError, ValueError) as e:
+            # Singular pre-period covariance (e.g. too few pre-period rows) —
+            # fall back to the conservative per-coefficient check rather than
+            # fail the whole event study over an un-invertible submatrix.
+            log_cb(f"  pre-trend joint Wald test failed ({e}); "
+                   f"falling back to per-coefficient check")
+            pre_trend_ok = (pre["p"] >= 0.05).all() if len(pre) else True
+    else:
+        pre_trend_ok = (pre["p"] >= 0.05).all() if len(pre) else True
 
     return {
         "dep": dep_var,
         "coefs": coef_df,
         "n_obs": int(res.nobs),
         "pre_trend_ok": bool(pre_trend_ok),
+        "pre_trend_wald_stat": wald_stat,
+        "pre_trend_wald_p": wald_p,
         "pre_trend_detail": pre[["k", "beta", "p"]].to_dict("records"),
         "rsquared_within": float(getattr(res, "rsquared_within", np.nan)),
     }
@@ -2659,6 +3098,14 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         ts = pd.Timestamp(val)
         return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
+    # Log/error messages below are human-facing, so dates are shown in CET —
+    # matching the documented convention (see CLAUDE.md) that logs and
+    # summaries are CET, not the raw UTC calendar date. Europe/Oslo is always
+    # ahead of UTC, so an event a user enters as starting just after CET
+    # midnight would otherwise display under the PREVIOUS UTC calendar day.
+    def _d(ts) -> str:
+        return utc_to_cet_str(ts, "%Y-%m-%d")
+
     s = _to_utc(outage_row["start_utc"])
     e = _to_utc(outage_row["end_utc"])
 
@@ -2670,8 +3117,8 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     jao_max = no3_df["dateTimeUtc"].max()
     if s > jao_max or e < jao_min:
         raise ValueError(
-            f"Event window {s.date()} → {e.date()} is entirely outside the "
-            f"JAO data range {jao_min.date()} → {jao_max.date()}.\n"
+            f"Event window {_d(s)} → {_d(e)} is entirely outside the "
+            f"JAO data range {_d(jao_min)} → {_d(jao_max)}.\n"
             f"Load a JAO CSV that covers the event date, or pick a different event."
         )
     # Warn if event duration looks implausible (> 30 days = likely bad ENTSO-E record)
@@ -2684,11 +3131,11 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             f"leaving no pre/post baseline. Select a real short-duration event instead."
         )
     if pre_start < jao_min:
-        log_cb(f"  ⚠ Pre-period clipped: JAO data starts {jao_min.date()} "
-               f"(need {pre_start.date()}). Baseline may be short.")
+        log_cb(f"  ⚠ Pre-period clipped: JAO data starts {_d(jao_min)} "
+               f"(need {_d(pre_start)}). Baseline may be short.")
     if post_end > jao_max:
-        log_cb(f"  ⚠ Post-period clipped: JAO data ends {jao_max.date()} "
-               f"(need {post_end.date()}). Recovery window may be short.")
+        log_cb(f"  ⚠ Post-period clipped: JAO data ends {_d(jao_max)} "
+               f"(need {_d(post_end)}). Recovery window may be short.")
     # ───────────────────────────────────────────────────────────────────────
 
     pre     = no3_df[(no3_df.dateTimeUtc >= pre_start) & (no3_df.dateTimeUtc < s)]
@@ -2699,21 +3146,21 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     n_cnecs = int(no3_df.cneName.nunique())
     log_cb(f"  Periods (×{n_cnecs} CNECs):  "
            f"pre={len(pre):,} rows "
-           f"({pre_start.date()} → {s.date()})  |  "
+           f"({_d(pre_start)} → {_d(s)})  |  "
            f"during={len(during):,} rows "
-           f"({s.date()} → {e.date()})  |  "
+           f"({_d(s)} → {_d(e)})  |  "
            f"post={len(post):,} rows")
     if len(during) == 0:
         log_cb(f"  ⚠ During-period empty — event may be entirely outside JAO window, "
-               f"or JAO data has a gap at {s.date()} → {e.date()}.")
+               f"or JAO data has a gap at {_d(s)} → {_d(e)}.")
     if len(pre) == 0:
         log_cb(f"  ⚠ Pre-period empty — event starts before JAO data "
-               f"({jao_min.date()}). Δ cannot be computed.")
+               f"({_d(jao_min)}). Δ cannot be computed.")
 
     # Final guard: if pre AND post are both empty there is no baseline at all
     if pre.empty and post.empty:
         raise ValueError(
-            f"Event {s.date()} → {e.date()} ({duration_h:.0f} h) covers the entire "
+            f"Event {_d(s)} → {_d(e)} ({duration_h:.0f} h) covers the entire "
             f"JAO window — no pre/post baseline rows exist. "
             f"Load a longer JAO CSV or select a shorter event."
         )

@@ -73,10 +73,18 @@ from matplotlib.backends.backend_tkagg import (
     FigureCanvasTkAgg, NavigationToolbar2Tk,
 )
 
-# All files live in the same folder as this script.
+# All files live in the same folder as this script. This directory also has
+# an __init__.py (it's the fi_no3 package) -- when this module is imported in
+# dotted form (e.g. "fi_no3.dashboard", as the fi-no3-dash console script
+# does), Python's own import machinery can have already put this directory's
+# PARENT ahead of it on sys.path, which would make "not in sys.path" true for
+# a merely-elsewhere-present _HERE and skip re-inserting it at the front --
+# letting a same-named propagation.py/synthetic.py in the parent directory
+# shadow this package's own copies. Always force _HERE to the front.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+if _HERE in sys.path:
+    sys.path.remove(_HERE)
+sys.path.insert(0, _HERE)
 
 import propagation as pipe
 import synthetic as syn
@@ -188,6 +196,20 @@ class App:
                   style="Hint.TLabel", wraplength=900).grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
+        ttk.Label(self.real_frame, text="dateTimeUtc column is actually in:").grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
+        self.jao_timestamp_zone = tk.StringVar(value="UTC")
+        ttk.Combobox(self.real_frame, textvariable=self.jao_timestamp_zone,
+                    values=["UTC", "CET"], state="readonly", width=6).grid(
+            row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(self.real_frame,
+                  text=("Leave at UTC unless outage/event timing looks consistently "
+                        "off by exactly 1h (winter) or 2h (summer) — JAO's own "
+                        "Publication Handbook notes this field can actually be CET. "
+                        "Only affects this Real JAO CSV path, not Synthetic data."),
+                  style="Hint.TLabel", wraplength=760).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(6, 0))
+
         # --- Synthetic block ---
         self.syn_frame = ttk.LabelFrame(f, text="Synthetic data", padding=10)
         self.syn_frame.grid(row=3, column=0, columnspan=3, sticky="ew",
@@ -252,12 +274,93 @@ class App:
         # --- Status panel ---
         sp = ttk.LabelFrame(f, text="Loaded data status", padding=10)
         sp.grid(row=6, column=0, columnspan=3, sticky="ew", padx=12, pady=8)
+        sp.columnconfigure(1, weight=1)
         self.status_jao = tk.StringVar(value="No JAO data loaded")
         self.status_out = tk.StringVar(value="No outage data")
-        ttk.Label(sp, textvariable=self.status_jao).pack(anchor="w")
-        ttk.Label(sp, textvariable=self.status_out).pack(anchor="w")
+        ttk.Label(sp, textvariable=self.status_jao).grid(row=0, column=0, sticky="w", columnspan=2)
+        ttk.Label(sp, textvariable=self.status_out).grid(row=1, column=0, sticky="w", columnspan=2)
+
+        # --- Reset button ---
+        reset_frame = ttk.LabelFrame(f, text="Start new analysis", padding=10)
+        reset_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 12))
+        ttk.Button(reset_frame, text="⟳  Reset all data",
+                   style="Big.TButton",
+                   command=self._reset_all).pack(side="left", padx=(0, 20))
+        ttk.Label(reset_frame,
+                  text=("Clears all loaded JAO data, outage events, and analysis results. "
+                        "Use this before starting a new analysis with different data, "
+                        "zone, or source country."),
+                  style="Hint.TLabel", wraplength=800).pack(side="left")
 
         self._on_mode_change()
+
+    def _reset_all(self):
+        """Clear all loaded data and results; reset the dashboard to initial state."""
+        if not messagebox.askyesno(
+                "Reset all data",
+                "This will clear all loaded JAO data, outage events, and analysis results.\n\n"
+                "Continue?"):
+            return
+
+        # Clear data state
+        self.jao_df        = None
+        self.outages_df    = None
+        self.results       = None
+        self.last_jao_path = ""
+
+        # Reset status labels
+        self.status_jao.set("No JAO data loaded")
+        self.status_out.set("No outage data")
+        self.jao_path_var.set("")
+
+        # Clear outage treeview
+        if hasattr(self, "outage_tree"):
+            for it in self.outage_tree.get_children():
+                self.outage_tree.delete(it)
+
+        # Clear run log
+        if hasattr(self, "log_box"):
+            self.log_box.delete("1.0", "end")
+        self.run_status.set("Idle") if hasattr(self, "run_status") else None
+
+        # Clear results tab
+        if hasattr(self, "hyp_tree"):
+            for it in self.hyp_tree.get_children():
+                self.hyp_tree.delete(it)
+        if hasattr(self, "reg_text"):
+            self.reg_text.delete("1.0", "end")
+
+        # Clear plots tab figures
+        for fig_attr in ("fig", "_ev_its_fig", "_ev_decomp_fig"):
+            if hasattr(self, fig_attr):
+                getattr(self, fig_attr).clear()
+        for canvas_attr in ("canvas", "_ev_its_canvas", "_ev_decomp_canvas"):
+            if hasattr(self, canvas_attr):
+                try:
+                    getattr(self, canvas_attr).draw()
+                except Exception:
+                    pass
+
+        # Clear single event tab
+        if hasattr(self, "_ev_summary_txt"):
+            self._ev_summary_txt.delete("1.0", "end")
+        if hasattr(self, "_ev_did_txt"):
+            self._ev_did_txt.delete("1.0", "end")
+        if hasattr(self, "_ev_cnec_tree"):
+            for it in self._ev_cnec_tree.get_children():
+                self._ev_cnec_tree.delete(it)
+
+        # Reset event selector dropdowns
+        for cb_attr in ("event_sel_cb", "event_sel_var", "event_cb", "plot_event"):
+            if hasattr(self, cb_attr):
+                try:
+                    getattr(self, cb_attr).set("")
+                except Exception:
+                    pass
+
+        # Switch back to Setup tab
+        self.nb.select(self.tab_setup)
+        self._log("All data cleared. Ready for new analysis.")
 
     def _on_mode_change(self):
         mode = self.data_mode.get()
@@ -283,7 +386,8 @@ class App:
             messagebox.showinfo("Pick a file", "Select a JAO CSV first.")
             return
         try:
-            df = pipe.load_jao_csv(path, log_cb=self._log)
+            df = pipe.load_jao_csv(path, log_cb=self._log,
+                                   jao_timestamp_zone=self.jao_timestamp_zone.get())
         except Exception as e:
             messagebox.showerror("Load failed", f"{e}")
             return
@@ -518,6 +622,16 @@ class App:
         self._log(f"Loaded manual outage CSV: {path}")
 
     def _fetch_outages(self):
+        # Guard against a second click starting an overlapping fetch while
+        # one is already running -- two workers writing self.outages_df
+        # concurrently would otherwise let whichever finishes last silently
+        # clobber or interleave with the other's result.
+        if getattr(self, "_outage_fetch_running", False):
+            messagebox.showinfo("Already fetching",
+                                "An outage fetch is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
+        self._outage_fetch_running = True
         # Run in a thread so the UI stays responsive
         threading.Thread(target=self._fetch_outages_worker, daemon=True).start()
 
@@ -545,13 +659,19 @@ class App:
             else:
                 self.outages_df = pipe.deduplicate_outages(pd.concat(collected, ignore_index=True))
 
-            self.status_out.set(f"Outages: {len(self.outages_df)} (deduped)")
+            # StringVar.set() drives the Tcl interpreter, which is not
+            # thread-safe -- every other update in this worker is correctly
+            # marshaled via root.after(); this one wasn't, unlike the rest.
+            n_outages = len(self.outages_df)
+            self.root.after(0, lambda: self.status_out.set(f"Outages: {n_outages} (deduped)"))
             self.root.after(0, self._refresh_outage_view)
             self.root.after(0, self._populate_event_selector)
-            log(f"Outage fetch complete: {len(self.outages_df)} events")
+            log(f"Outage fetch complete: {n_outages} events")
         except Exception as e:
             log("ERROR: " + str(e))
             log(traceback.format_exc())
+        finally:
+            self._outage_fetch_running = False
 
     # -----------------------------------------------------------------
     # Run tab
@@ -565,8 +685,8 @@ class App:
         ttk.Button(ctrl, text="RUN ANALYSIS", style="Big.TButton",
                    command=self._run_pipeline).pack(side="left")
         ttk.Label(ctrl,
-                  text=("This loads NO3 CNECs from the JAO data, joins outage covariates,"
-                        " runs PanelOLS regressions on F0, PTDF_FI, RAM, shadowPrice, FRM,"
+                  text=("Loads target-zone CNECs from the JAO data, joins outage covariates,"
+                        " runs PanelOLS regressions on fall_signed, |PTDF|, RAM, shadowPrice, FRM,"
                         " and a logit on IVA active. Output: hypothesis verdicts + summaries."),
                   style="Hint.TLabel", wraplength=900).pack(side="left", padx=14)
 
@@ -583,6 +703,22 @@ class App:
                                                   background="#fbfbf8")
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0,12))
 
+    # convenience: always return the current source/target from results or UI controls
+    @property
+    def _src(self) -> str:
+        return (self.results or {}).get("source_country",
+                self.source_country.get().strip().upper() or "FI")
+
+    @property
+    def _tgt(self) -> str:
+        return (self.results or {}).get("target_zone",
+                self.target_zone.get().strip().upper() or "NO3")
+
+    @property
+    def _ptdf_col(self) -> str:
+        """Canonical PTDF column for the current source country."""
+        return f"ptdf_{self._src}"
+
     def _log(self, msg: str):
         line = f"[{pipe.utc_to_cet_str(datetime.now(timezone.utc), '%H:%M:%S')} CET] {msg}\n"
         # threadsafe
@@ -594,6 +730,16 @@ class App:
         self.log_box.see("end")
 
     def _run_pipeline(self):
+        # Guard against a double-click (or a click while a previous run is
+        # still going) starting a second overlapping worker thread: both
+        # would write the same output CSV paths and both assign
+        # self.results, so whichever finishes last silently wins with a
+        # report that may mix state from two different runs.
+        if getattr(self, "_pipeline_running", False):
+            messagebox.showinfo("Already running",
+                                "An analysis run is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
         if self.jao_df is None:
             messagebox.showinfo("No JAO data",
                                 "Load a JAO CSV (or generate synthetic) on the Setup tab first.")
@@ -605,6 +751,7 @@ class App:
                     "(Regressions will produce no useful results.)"):
                 return
 
+        self._pipeline_running = True
         self.run_status.set("Running...")
         self.progress.start(10)
         threading.Thread(target=self._run_pipeline_worker, daemon=True).start()
@@ -621,6 +768,7 @@ class App:
                 use_manual=self.use_manual.get(),
                 source_country=self.source_country.get().strip().upper() or "FI",
                 target_zone=self.target_zone.get().strip().upper() or "NO3",
+                jao_timestamp_zone=self.jao_timestamp_zone.get(),
             )
             self._log(f"Analysis scope: source={cfg.source_country}  target={cfg.target_zone}")
             res = pipe.run_pipeline(cfg, jao_df=self.jao_df,
@@ -634,6 +782,7 @@ class App:
             self._log("ERROR: " + str(e))
             self._log(traceback.format_exc())
         finally:
+            self._pipeline_running = False
             self.root.after(0, self.progress.stop)
             self.root.after(0, lambda: self.run_status.set("Done"))
 
@@ -658,15 +807,23 @@ class App:
         sub = ttk.Notebook(f)
         sub.grid(row=2, column=0, sticky="nsew", padx=12, pady=10)
         self.res_text = {}
-        for name, label in [("f0","F0"), ("ptdf_FI","PTDF_FI"),
-                             ("ram","RAM"), ("shadowPrice","Shadow price"),
-                             ("frm","FRM (placebo H6)"), ("logit","IVA logit (H5)")]:
+        # Tab labels are fixed at build time; the data they show is always
+        # resolved via the live _src property at display time.
+        for name, label in [("fall_signed","fall / F_allRef (H1)"),
+                             ("ptdf_FI_abs","|PTDF_src| (H2)"),
+                             ("ram","RAM (H3)"),
+                             ("shadowPrice","Shadow price (H4)"),
+                             ("frm","FRM placebo (H6)"),
+                             ("logit","IVA logit (H5)")]:
             tab = ttk.Frame(sub); sub.add(tab, text=label)
             tab.columnconfigure(0, weight=1); tab.rowconfigure(0, weight=1)
             txt = scrolledtext.ScrolledText(tab, font=("Consolas", 9),
                                              background="#fafafa")
             txt.grid(row=0, column=0, sticky="nsew")
             self.res_text[name] = txt
+            # keep backward-compat aliases so both old and new keys work
+        self.res_text["f0"]      = self.res_text["fall_signed"]
+        self.res_text["ptdf_FI"] = self.res_text["ptdf_FI_abs"]
 
     def _update_results_view(self):
         if not self.results: return
@@ -680,18 +837,34 @@ class App:
             self.hyp_tree.insert("", "end",
                                   values=(h["id"], h["text"], h["verdict"]))
 
-        # Regression summaries
-        for name in ("f0","ptdf_FI","ram","shadowPrice","frm"):
-            box = self.res_text[name]
-            box.delete("1.0", "end")
-            r = self.results["regressions"].get(name)
-            if not r:
-                box.insert("end", f"No result for {name}.\n")
+        # Regression summaries — use source-country-aware keys
+        # The results dict stores both canonical keys and backward-compat aliases
+        _reg_display = [
+            ("fall_signed",  f"fall_signed (F_allRef, src={self._src})"),
+            ("ptdf_FI_abs",  f"|PTDF_{self._src}| (H2)"),
+            ("ram",          "RAM (H3)"),
+            ("shadowPrice",  "Shadow price — binding MTUs only (H4)"),
+            ("frm",          "FRM placebo (H6)"),
+        ]
+        regs = self.results.get("regressions", {})
+        for name, display_label in _reg_display:
+            box = self.res_text.get(name) or self.res_text.get("f0")
+            if box is None:
                 continue
-            box.insert("end", f"Dependent: {r['dep']}\n")
+            box.delete("1.0", "end")
+            # Try multiple key variants (canonical + compat aliases)
+            r = (regs.get(name)
+                 or regs.get(f"ptdf_{self._src}_abs" if "ptdf" in name else name)
+                 or regs.get(name.replace("fall_signed","f0"))
+                 or None)
+            if not r:
+                box.insert("end", f"No result for {display_label}.\n")
+                continue
+            box.insert("end", f"Dependent: {r.get('dep', name)}\n")
             box.insert("end", f"Observations: {r['n_obs']:,} | "
-                              f"Entities: {r['n_entities']} | "
-                              f"R^2: {r['rsquared']:.4f} (within: {r.get('rsquared_within','n/a')})\n")
+                              f"Entities: {r.get('n_entities','?')} | "
+                              f"R²: {r.get('rsquared','?'):.4f} "
+                              f"(within: {r.get('rsquared_within','n/a')})\n")
             if r.get("bp_p") is not None:
                 box.insert("end",
                            f"Breusch-Pagan p={r['bp_p']:.4f} | "
@@ -871,9 +1044,14 @@ class App:
                               ha="center", va="top", fontsize=8, color="#a01a1a",
                               transform=self.fig.transFigure)
 
-        panels = [("f0", "F0 / fref (MW)"), ("ptdf_FI", "PTDF_FI"),
-                  ("ram", "RAM (MW)"), ("shadowPrice", "Shadow price (€/MWh)"),
-                  ("iva", "IVA (MW)")]
+        _ptdf_col = self._ptdf_col  # e.g. "ptdf_FI", "ptdf_NO"
+        _fall_col = "fall_signed" if "fall_signed" in plot_sub.columns else "fall"
+        _sp_col   = "shadowPrice_clean" if "shadowPrice_clean" in plot_sub.columns else "shadowPrice"
+        panels = [(_fall_col, f"fall_signed ({self._src} ref flow, MW)"),
+                  (_ptdf_col, f"PTDF_{self._src}"),
+                  ("ram",     "RAM (MW)"),
+                  (_sp_col,   "Shadow price (€/MWh)"),
+                  ("iva",     "IVA (MW)")]
         n = len(panels)
         for i, (col, label) in enumerate(panels):
             ax = self.fig.add_subplot(n, 1, i + 1)
@@ -899,7 +1077,7 @@ class App:
     def _plot_violin(self):
         no3 = self.results["no3"]
         # Use dynamic source prefix from results
-        _src_v = self.results.get("source_country", self.source_country.get() or "FI").lower()
+        _src_v = self._src.lower()
         forced_col = f"{_src_v}_forced_outage_active"
         if forced_col not in no3.columns:
             # fallback
@@ -907,7 +1085,11 @@ class App:
         if forced_col is None:
             self.fig.text(0.5, 0.5, "Run analysis first", ha="center")
             return
-        ax_specs = [("f0","F0 (MW)"), ("ptdf_FI","PTDF_FI"), ("ram","RAM (MW)")]
+        _fall_col = "fall_signed" if "fall_signed" in no3.columns else "fall"
+        _ptdf_col = self._ptdf_col
+        ax_specs = [(_fall_col, f"fall ({self._src} ref, MW)"),
+                    (_ptdf_col, f"PTDF_{self._src}"),
+                    ("ram",     "RAM (MW)")]
         for i, (col, label) in enumerate(ax_specs):
             ax = self.fig.add_subplot(1, 3, i+1)
             data_no = no3.loc[no3[forced_col]==0, col].dropna().values
@@ -931,7 +1113,8 @@ class App:
     def _plot_scatter(self):
         no3 = self.results["no3"]
         ax = self.fig.add_subplot(111)
-        _src_s = self.results.get("source_country", self.source_country.get() or "FI").lower()
+        _src_s = self._src.lower()
+        _tgt_s = self._tgt
         gen_col  = f"{_src_s}_gen_outage_mw_lost"
         hvdc_col = f"{_src_s}_hvdc_outage_mw_lost"
         ac_col   = f"{_src_s}_ac_outage_mw_lost"
@@ -953,7 +1136,6 @@ class App:
             s = sub[sub["cneName"] == c]
             ax.scatter(s["total_mw"], s["dF0"], s=12, alpha=0.5,
                        color=cmap(i % 10), label=c[:40])
-        _tgt_s = self.results.get("target_zone", self.target_zone.get() or "NO3")
         ax.set_xlabel(f"Total MW lost ({_src_s.upper()} outages)")
         ax.set_ylabel("ΔF0 vs CNEC median (MW)")
         ax.set_title(f"ΔF0 on {_tgt_s} CNECs vs {_src_s.upper()} outage MW lost")
@@ -990,10 +1172,15 @@ class App:
             buf = pd.Timedelta(hours=72)
             sub = sub[(sub["dateTimeUtc"] >= s - buf) & (sub["dateTimeUtc"] <= e + buf)]
 
+        _src = self._src.upper()
         ax = self.fig.add_subplot(111)
-        for col, c, label in [("ptdf_FI", "#2c3e50", "PTDF_FI"),
-                               ("ptdf_FI_FS", "#e67e22", "PTDF_FI_FS"),
-                               ("ptdf_FI_EL", "#16a085", "PTDF_FI_EL")]:
+        # Show primary PTDF + any HVDC-specific subcolumns for this source
+        _ptdf_cols = [(f"ptdf_{_src}", "#2c3e50", f"PTDF_{_src}")]
+        for suffix, color, lbl in [("_FS", "#e67e22", f"PTDF_{_src}_FS (Fenno-Skan)"),
+                                    ("_EL", "#16a085", f"PTDF_{_src}_EL (Estlink)")]:
+            col = f"ptdf_{_src}{suffix}"
+            _ptdf_cols.append((col, color, lbl))
+        for col, c, label in _ptdf_cols:
             if col in sub.columns and sub[col].notna().any():
                 ax.plot(sub["dateTimeUtc"], sub[col], lw=1.0, color=c, label=label)
         if s is not None:
@@ -1042,14 +1229,75 @@ class App:
 
         ttk.Label(ctrl, text="Baseline (days before):").grid(row=1, column=0, sticky="w")
         self.baseline_days = tk.IntVar(value=7)
-        ttk.Spinbox(ctrl, from_=2, to=30, textvariable=self.baseline_days,
-                    width=6).grid(row=1, column=1, sticky="w", padx=6)
+        self._baseline_sb = ttk.Spinbox(
+            ctrl, from_=2, to=365, textvariable=self.baseline_days, width=6)
+        self._baseline_sb.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(ctrl, text="(2–365)", style="Hint.TLabel").grid(
+            row=1, column=1, sticky="e", padx=(0, 4))
 
-        ttk.Label(ctrl, text="Post-event (days after):").grid(row=1, column=2,
-                                                               sticky="w", padx=(20,0))
+        ttk.Label(ctrl, text="Post-event (days after):").grid(
+            row=1, column=2, sticky="w", padx=(20, 0))
         self.post_days = tk.IntVar(value=3)
-        ttk.Spinbox(ctrl, from_=1, to=14, textvariable=self.post_days,
+        ttk.Spinbox(ctrl, from_=1, to=90, textvariable=self.post_days,
                     width=6).grid(row=1, column=3, sticky="w", padx=6)
+        ttk.Label(ctrl, text="(1–90)", style="Hint.TLabel").grid(
+            row=1, column=3, sticky="e", padx=(0, 4))
+
+        # ITS model selector
+        ttk.Label(ctrl, text="Counterfactual model:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        self.its_method = tk.StringVar(value="seasonal_naive")
+        _method_opts = list(pipe.ITS_METHOD_NAMES) + ["all"]
+        _method_labels = {
+            "seasonal_naive": "Seasonal Naive           [min 2 days]",
+            "fourier_trend":  "Fourier + Linear Trend   [min 7 days]",
+            "stl":            "STL Decomposition        [min 7 days]",
+            "arima":          "ARIMA on residuals       [min 14 days, rec. 30]",
+            "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
+            "all":            "All five  [run & compare side-by-side]",
+        }
+        _method_cb = ttk.Combobox(
+            ctrl,
+            textvariable=self.its_method,
+            values=[_method_labels.get(m, m) for m in _method_opts],
+            state="readonly",
+            width=55,
+        )
+        _method_cb.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=(8,0))
+        self._its_method_map = {_method_labels.get(m, m): m for m in _method_opts}
+        self.its_method.set(_method_labels["seasonal_naive"])
+
+        # Dynamic hint: description + minimum baseline warning
+        self._its_hint_var = tk.StringVar()
+        ttk.Label(ctrl, textvariable=self._its_hint_var,
+                  style="Hint.TLabel", wraplength=720).grid(
+            row=3, column=0, columnspan=5, sticky="w", padx=4, pady=(3, 0))
+
+        def _update_hint(*_):
+            label  = self.its_method.get()
+            key    = self._its_method_map.get(label, "seasonal_naive")
+            cur_bl = int(self.baseline_days.get())
+            if key == "all":
+                hint = (
+                    "Runs all five models and overlays their projected counterfactuals "
+                    "on the ITS plot so you can compare them directly. "
+                    "Summary metrics use Seasonal Naive as primary. "
+                    "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
+            else:
+                meta     = pipe._ITS_METHODS.get(key, {})
+                desc     = meta.get("description", "")
+                min_days = int(meta.get("min_days", 2))
+                warning  = ""
+                if cur_bl < min_days:
+                    warning = (
+                        f"  ⚠  Current baseline ({cur_bl} days) is below the minimum "
+                        f"for this method ({min_days} days). "
+                        f"Increase the baseline or results may degrade.")
+                hint = desc + warning
+            self._its_hint_var.set(hint)
+
+        self.its_method.trace_add("write", _update_hint)
+        self.baseline_days.trace_add("write", _update_hint)
+        _update_hint()
 
         ttk.Button(ctrl, text="Run single-event analysis",
                    style="Big.TButton",
@@ -1169,6 +1417,11 @@ class App:
         return None
 
     def _run_single_event(self):
+        if getattr(self, "_single_event_running", False):
+            messagebox.showinfo("Already running",
+                                "A single-event analysis is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
         if not self.results:
             messagebox.showinfo("Run analysis first",
                                 "Complete the population analysis on Tab 3 first.")
@@ -1177,12 +1430,18 @@ class App:
         if row is None:
             messagebox.showinfo("No event selected", "Pick an outage from the dropdown.")
             return
+        # Resolve display label → method key
+        its_label  = self.its_method.get()
+        method_key = getattr(self, "_its_method_map", {}).get(its_label, its_label)
+        if method_key not in pipe.ITS_METHOD_NAMES and method_key != "all":
+            method_key = pipe.ITS_DEFAULT_METHOD
+        self._single_event_running = True
         threading.Thread(target=self._single_event_worker,
-                         args=(row,), daemon=True).start()
+                         args=(row, method_key), daemon=True).start()
 
-    def _single_event_worker(self, outage_row):
+    def _single_event_worker(self, outage_row, its_method: str = "seasonal_naive"):
         no3 = self.results["no3"]
-        _src = (self.results.get("source_country") or self.source_country.get() or "FI").lower()
+        _src = self._src.lower()
         try:
             res = pipe.single_event_analysis(
                 no3, outage_row,
@@ -1190,11 +1449,14 @@ class App:
                 post_days=int(self.post_days.get()),
                 log_cb=self._log,
                 src=_src,
+                its_method=its_method,
             )
             self.root.after(0, self._display_single_event, res, outage_row)
         except Exception as e:
             self._log(f"Single event error: {e}")
             import traceback; self._log(traceback.format_exc())
+        finally:
+            self._single_event_running = False
 
     def _display_single_event(self, res: dict, outage_row):
         try:
@@ -1230,7 +1492,7 @@ class App:
 
         # ── Summary text ──────────────────────────────────────────────────
         self._ev_summary_txt.delete("1.0", "end")
-        tgt = (self.results.get("target_zone") if self.results else None) or "NO3"
+        tgt = self._tgt
         lines = [
             f"Event:    {s['asset_name']} ({s['asset_type']}, {s['planned_or_forced']})",
             f"Window:   {pipe.utc_to_cet_str(s['start_utc'])} → "
@@ -1268,55 +1530,97 @@ class App:
                     lines.append(
                         f"  {col:15s}: pre={pre_s}  during={dur_s}"
                         f"  Δ=      n/a {reason}")
+
+        # Counterfactual-corrected impact and recovery from ITS
+        its_sum = s.get("its_summary", {})
+        if its_sum:
+            method_used = next(iter(its_sum.values()), {}).get("method_label", "seasonal_naive")
+            lines += [
+                "",
+                f"── Counterfactual-corrected estimates  [{method_used}] ────────────",
+                "   impact = actual_during − Y(0)_during  (treatment effect)",
+                "   recovery = actual_post − Y(0)_post   (0 MW = full recovery)",
+                "   recovery_frac: 1.0 = fully recovered  0.0 = no recovery",
+                "",
+            ]
+            for col, cs in its_sum.items():
+                imp = cs.get("impact", float("nan"))
+                rec = cs.get("recovery_residual", float("nan"))
+                rfrac = cs.get("recovery_frac", float("nan"))
+                proj_d = cs.get("projected_during", float("nan"))
+                proj_p = cs.get("projected_post",   float("nan"))
+                imp_s   = f"{imp:>+9.2f}" if not math.isnan(imp) else "     n/a"
+                rec_s   = f"{rec:>+9.2f}" if not math.isnan(rec) else "     n/a"
+                rfrac_s = f"{rfrac:.2f}"   if not math.isnan(rfrac) else " n/a"
+                lines.append(
+                    f"  {col:20s}: impact={imp_s} MW  |  "
+                    f"recovery residual={rec_s} MW  |  frac={rfrac_s}")
+
         if s.get("did_estimates"):
-            lines += ["", "── DiD estimates (high − low PTDF_FI effect) ────────────────"]
+            lines += ["", "── DiD estimates (PRE ∪ POST sample; DURING excluded) ──────────"]
             for col, val in s["did_estimates"].items():
                 if isinstance(val, dict):
-                    beta = val.get("beta", float("nan"))
-                    p    = val.get("p",    float("nan"))
                     interp = val.get("interpretation", "")
-                    lines.append(
-                        f"  {col:15s}: β={beta:>+9.4f}  p={p:.3f}  {interp}")
+                    sample = val.get("sample", "")
+                    lines.append(f"  {col:20s}: {interp}")
+                    if sample:
+                        lines.append(f"  {'':20s}  [{sample}]")
                 else:
-                    lines.append(f"  {col:15s}: ATT = {float(val):>+9.2f} MW")
-
-        event_study = res.get("event_study") or {}
-        if event_study:
-            lines += ["", "── Event study (β_k, hourly, -24h..+48h) ─────────────────────"]
-            for col, es in event_study.items():
-                coef_df = es.get("coefs")
-                if coef_df is None or coef_df.empty:
-                    continue
-                pre_ok = "ok" if es.get("pre_trend_ok") else "FAILED (pre-trend not flat)"
-                lines.append(f"  {col}  (n_obs={es.get('n_obs','n/a')}, pre-trend {pre_ok})")
-                post = coef_df[coef_df["k"] >= 0].head(6)
-                for _, row in post.iterrows():
-                    sig = "*" if row["p"] < 0.05 else " "
-                    lines.append(f"    k=+{int(row['k']):<3d}h  "
-                                 f"β={row['beta']:>+9.2f}  p={row['p']:.3f} {sig}")
+                    lines.append(f"  {col:20s}: ATT = {float(val):>+9.2f} MW")
         self._ev_summary_txt.insert("end", "\n".join(lines))
 
         # ── ITS plot ──────────────────────────────────────────────────────
         self._ev_its_fig.clear()
-        its = res.get("its", pd.DataFrame())
+        its     = res.get("its", pd.DataFrame())
+        its_all = res.get("its_all", {})
+        s_ts    = pd.Timestamp(s["start_utc"])
+        e_ts    = pd.Timestamp(s["end_utc"])
+
+        _method_colors = {
+            "seasonal_naive": ("#e74c3c", "--"),
+            "fourier_trend":  ("#2980b9", "-."),
+            "stl":            ("#27ae60", ":"),
+        }
+
         if not its.empty:
-            params_in_its = its["param"].unique()
-            n = len(params_in_its)
-            s_ts = pd.Timestamp(s["start_utc"])
-            e_ts = pd.Timestamp(s["end_utc"])
+            params_in_its = [p for p in its["param"].unique() if p in its.columns]
+            if not params_in_its:
+                # param column used as actual column name when only one col present
+                params_in_its = its["param"].unique().tolist()
+            n = max(len(params_in_its), 1)
             for i, param in enumerate(params_in_its):
-                sub = its[its.param == param].sort_values("dateTimeUtc")
-                ax  = self._ev_its_fig.add_subplot(n, 1, i + 1)
-                ax.plot(sub.dateTimeUtc, sub[param], lw=1.0,
-                        color="#2c3e50", label="actual")
-                ax.plot(sub.dateTimeUtc, sub["projected"], lw=1.0,
-                        ls="--", color="#e74c3c", label="projected trend")
-                ax.axvspan(s_ts, e_ts, alpha=0.15, color="#e67e22", label="outage")
+                ax = self._ev_its_fig.add_subplot(n, 1, i + 1)
+
+                # Actual values (same regardless of model)
+                sub_any = (list(its_all.values())[0] if its_all else its)
+                sub_actual = sub_any[sub_any.param == param].sort_values("dateTimeUtc")
+                if param in sub_actual.columns:
+                    ax.plot(sub_actual.dateTimeUtc, sub_actual[param],
+                            lw=1.2, color="#2c3e50", label="actual", zorder=5)
+
+                # Projected counterfactual(s)
+                if its_all and len(its_all) > 1:
+                    # "all" mode: overlay all three
+                    for mkey, mdf in its_all.items():
+                        if mdf.empty: continue
+                        msub = mdf[mdf.param == param].sort_values("dateTimeUtc")
+                        col_h, ls = _method_colors.get(mkey, ("#888","--"))
+                        mlabel = pipe._ITS_METHODS.get(mkey, {}).get("label", mkey)
+                        ax.plot(msub.dateTimeUtc, msub["projected"],
+                                lw=1.0, ls=ls, color=col_h, label=f"Y(0) {mlabel}", alpha=0.85)
+                else:
+                    # Single model
+                    sub = its[its.param == param].sort_values("dateTimeUtc")
+                    ax.plot(sub.dateTimeUtc, sub["projected"],
+                            lw=1.0, ls="--", color="#e74c3c", label="Y(0) counterfactual")
+
+                ax.axvspan(s_ts, e_ts, alpha=0.12, color="#e67e22", label="outage")
                 ax.set_ylabel(param, fontsize=8)
-                ax.legend(fontsize=7, loc="upper right")
+                ax.legend(fontsize=7, loc="upper right", ncol=2)
                 ax.grid(True, ls=":", alpha=0.4)
                 if i == 0:
-                    ax.set_title(f"Interrupted time series — {s['asset_name'][:50]}",
+                    title_suffix = f" — all {len(its_all)} models" if len(its_all) > 1 else ""
+                    ax.set_title(f"ITS counterfactual{title_suffix}: {s['asset_name'][:45]}",
                                  fontsize=9)
                 ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H"))
                 for lbl in ax.get_xticklabels():
@@ -1335,7 +1639,7 @@ class App:
             colors = ["#27ae60" if v >= 0 else "#e74c3c" for v in agg.MW]
             ax.barh(agg.component, agg.MW, color=colors)
             ax.axvline(0, color="black", lw=0.8)
-            ax.set_xlabel("Average MW contribution to ΔRAM across NO3 CNECs")
+            ax.set_xlabel(f"Average MW contribution to ΔRAM across {self._tgt} CNECs")
             ax.set_title(f"ΔRAM decomposition — {s['asset_name'][:50]}", fontsize=9)
             ax.grid(True, axis="x", ls=":", alpha=0.4)
         self._ev_decomp_fig.tight_layout()
@@ -1724,7 +2028,7 @@ class App:
         w(f"  Only binding MTUs (shadow price > 0, {sp_pct:.1f}% of dataset) are\n"
           f"  included in this regression. Shadow price measures how much the\n"
           f"  market-clearing price would fall if the CNEC limit were relaxed by 1 MW.\n"
-          f"  A positive β means FI outages worsen existing congestion.\n"
+          f"  A positive β means {_SRC} outages worsen existing congestion.\n"
           f"  A negative β means they relieve it (or push the CNEC toward non-binding).\n\n",
           "body")
         w("  What the numbers say\n", "label")
@@ -1745,7 +2049,7 @@ class App:
             w("  Verdict: — No data\n", "nodata"); nl()
             w("  IVA (Individual Validation Adjustment) is applied by TSOs when\n"
               "  the CGMA model does not reflect a topology change. It requires\n"
-              "  IVA-active rows in the NO3 dataset — there were none in this window.\n"
+              f"  IVA-active rows in the {_tgt} dataset — there were none in this window.\n"
               "  Use a longer JAO CSV or include a window with a known forced outage.\n\n",
               "body")
         else:
@@ -1768,14 +2072,14 @@ class App:
         elif p_frm_hvdc >= 0.10:
             w(f"  Verdict: ✅ Placebo clean  —  β={b_frm_hvdc:+.3f} MW, p={p_frm_hvdc:.3f}\n",
               "confirmed"); nl()
-            w("  FRM did not move with FI outage covariates. This is the expected\n"
+            w(f"  FRM did not move with {_SRC} outage covariates. This is the expected\n"
               "  result and confirms the model is well-specified. FRM is a structural\n"
               "  margin set once per year — it should not respond to individual events.\n\n",
               "body")
         else:
             w(f"  Verdict: ⚠ WARNING — FRM IS MOVING  β={b_frm_hvdc:+.3f} MW, "
               f"p={p_frm_hvdc:.3f}\n", "warn"); nl()
-            w("  FRM is correlated with FI outage covariates. This is a model\n"
+            w(f"  FRM is correlated with {_SRC} outage covariates. This is a model\n"
               "  misspecification flag — FRM should be structural. Possible causes:\n"
               "  • The JAO window spans a December FRM recalibration (regime break)\n"
               "  • Seasonal patterns in FRM are aliased with outage seasonality\n"
@@ -1796,8 +2100,8 @@ class App:
           "  results marked 'Confirmed' have survived family-wise error rate control.\n\n",
           "body")
         w("  Time clustering:  ", "label")
-        w("Standard errors are clustered by calendar date to account for the\n"
-          "  fact that a single FI outage hits all NO3 CNECs simultaneously.\n\n",
+        w(f"Standard errors are clustered by calendar date to account for the\n"
+          f"  fact that a single {_SRC} outage hits all {_tgt} CNECs simultaneously.\n\n",
           "body")
         w("  Sign normalisation (H1):  ", "label")
         w("fall_signed = σᵢ × fall, where σᵢ = sign(median fall in pre-period).\n"
@@ -1817,7 +2121,7 @@ class App:
         ttk.Label(f, text="Export results", style="Header.TLabel").grid(
             row=0, column=0, sticky="w", padx=12, pady=(12, 4))
 
-        b1 = ttk.Button(f, text="Export NO3 + covariates CSV",
+        b1 = ttk.Button(f, text="Export target-zone + covariates CSV",
                         command=self._export_no3_csv)
         b1.grid(row=1, column=0, sticky="ew", padx=12, pady=4)
 
@@ -1961,25 +2265,30 @@ class App:
         ctx = {
             "ts": pipe.utc_to_cet_str(datetime.now(timezone.utc), "%Y-%m-%d %H:%M:%S") + " CET",
             "n_jao": len(self.jao_df) if self.jao_df is not None else 0,
+            "source_country": self._src,
+            "target_zone":    self._tgt,
             "n_no3": len(no3),
             "n_outages": len(outages) if outages is not None else 0,
             "hypotheses": self.results["hypotheses"],
-            "summary_f0":   self._build_reg_block("fall_signed"),
-            "summary_ptdf_FI": self._build_reg_block("ptdf_FI"),
+            "summary_f0":   self._build_reg_block("fall_signed") or self._build_reg_block("f0"),
+            "summary_ptdf_FI": (self._build_reg_block(f"ptdf_{self._src}_abs")
+                                or self._build_reg_block("ptdf_FI_abs")
+                                or self._build_reg_block("ptdf_FI")),
             "summary_ram":  self._build_reg_block("ram"),
             "summary_shadowPrice": self._build_reg_block("shadowPrice"),
             "summary_frm":  self._build_reg_block("frm"),
             "summary_logit": self._build_logit_block(),
             "figures": figures,
             "caveats": (
-                "Statistical power is heterogeneous across hypotheses: H1/H3 "
-                "have many treatment hours; H5 only a handful. Confounders "
-                "include Statnett's December 2024 FRM revision, the NO3-NO5 "
-                "Aurland reinforcement (early 2026), and seasonal Fmax derating "
-                "on Fenno-Skan. ENTSO-E A78 returns mostly forced events; "
-                "planned FI line outages are best curated manually. "
-                "Use the placebo on FRM (H6) as a sanity check; if FRM moves "
-                "with outage covariates, your model is mis-specified."
+                f"Statistical power is heterogeneous across hypotheses: H1/H3 "
+                f"have many treatment hours; H5 only a handful. "
+                f"Outage source: {self._src}. Target zone: {self._tgt}. "
+                f"ENTSO-E A78 returns mostly forced events; "
+                f"planned {self._src} line outages are best curated manually via the manual CSV. "
+                f"Use the placebo on FRM (H6) as a sanity check; if FRM moves "
+                f"with outage covariates, your model is mis-specified. "
+                f"If the JAO CSV was fetched with shadowPrice>0 filter, H4 reflects "
+                f"effects conditional on binding CNECs only."
             ),
         }
         path = pipe.render_html_report(self.out_dir_var.get(), ctx)
