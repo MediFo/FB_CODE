@@ -10,10 +10,19 @@ import os
 import warnings
 warnings.filterwarnings("ignore")
 
-# All files are in the same folder as this script
+# All files are in the same folder as this script. This directory also has
+# an __init__.py (it's the fi_no3 package), which makes pytest's own import
+# machinery insert this directory's PARENT ahead of it on sys.path (to import
+# this module as "file.test_pipeline") -- if _HERE were merely appended
+# elsewhere on sys.path by that process, "not in sys.path" would be true and
+# skip re-inserting it at the front, so a same-named propagation.py/
+# synthetic.py sitting in the parent directory would shadow this package's
+# own copies. Always force _HERE to the front regardless of whether it's
+# already present elsewhere on sys.path.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+if _HERE in sys.path:
+    sys.path.remove(_HERE)
+sys.path.insert(0, _HERE)
 
 import pytest
 import pandas as pd
@@ -26,8 +35,11 @@ from propagation import (
     load_jao_csv, filter_no3, build_covariates, deduplicate_outages,
     run_panel_regression, run_logit_iva, decompose_delta_ram,
     summarize_hypotheses, PipelineConfig, run_pipeline,
-    DEFAULT_NO3_PATTERNS,
+    DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str,
+    build_event_time_dummies, run_event_study,
+    single_event_analysis, pre_period_abs_ptdf,
 )
+import propagation as _pipe
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -269,20 +281,28 @@ class TestRegressions:
             assert col in cf.columns
 
     def test_hvdc_f0_signal_detected(self, no3_cov):
-        """H1: HVDC outage should produce significant F0 shift on synthetic data."""
+        """H1: HVDC outage should produce a significant F0 shift on synthetic
+        data — via whichever of the binary dummy / MW-dose variable survived
+        collinearity pruning (see _prune_collinear_dose_pairs; with few
+        independent HVDC episodes the two are near-perfectly collinear, and
+        the dose variable is kept over the binary duplicate on purpose)."""
         r = run_panel_regression(no3_cov, "f0")
         cf = r["coefs"].set_index("param")
-        assert "fi_hvdc_outage_active" in cf.index, \
-            "fi_hvdc_outage_active was absorbed — not enough variation"
-        p = cf.loc["fi_hvdc_outage_active", "p"]
+        candidates = [c for c in ("fi_hvdc_outage_active", "fi_hvdc_outage_mw_lost")
+                      if c in cf.index]
+        assert candidates, "neither fi_hvdc_outage_active nor its dose variable survived"
+        p = min(cf.loc[c, "p"] for c in candidates)
         assert p < 0.05, f"HVDC F0 effect not significant (p={p:.3f})"
 
     def test_ac_line_ptdf_signal_detected(self, no3_cov):
-        """H2: AC line outage should shift PTDF_FI."""
+        """H2: AC line outage should shift PTDF_FI — same collinearity-pruning
+        caveat as test_hvdc_f0_signal_detected above."""
         r = run_panel_regression(no3_cov, "ptdf_FI")
         cf = r["coefs"].set_index("param")
-        assert "fi_ac_line_outage_active" in cf.index
-        p = cf.loc["fi_ac_line_outage_active", "p"]
+        candidates = [c for c in ("fi_ac_line_outage_active", "fi_ac_outage_mw_lost")
+                      if c in cf.index]
+        assert candidates, "neither fi_ac_line_outage_active nor its dose variable survived"
+        p = min(cf.loc[c, "p"] for c in candidates)
         assert p < 0.05, f"AC line PTDF_FI effect not significant (p={p:.3f})"
 
     def test_frm_placebo_consistent(self, no3_cov):
@@ -466,3 +486,396 @@ class TestFullPipeline:
                              use_entsoe=False, use_manual=False)
         res = run_pipeline(cfg, jao_df=jao, outages_df=single)
         assert "hypotheses" in res
+
+
+# ── 10. Regressions for previously-fixed bugs (audit) ─────────────────────────
+
+class TestAuditFixes:
+    """Each test here reproduces a specific bug found in the strict audit and
+    would fail again if that bug were reintroduced."""
+
+    def test_h5_verdict_not_shadowed_by_pvalue(self):
+        """A loop-local p-value used to overwrite the `p` (source-prefix)
+        variable inside summarize_hypotheses, so H5's column lookup
+        ('{p}_planned_outage_active') always KeyError'd once H1-H4 had run —
+        producing 'vars absent in logit' even when the logit succeeded."""
+        logit_coefs = pd.DataFrame({
+            "param": ["const", "fi_planned_outage_active", "fi_forced_outage_active"],
+            "coef":  [-4.87, -1.77, 2.56],
+            "std_err": [0.27, 0.49, 0.18],
+            "z": [-18.4, -3.6, 14.2],
+            "p": [3.3e-75, 3.0e-4, 4.5e-46],
+        })
+        logit_result = {"coefs": logit_coefs, "n_obs": 43200, "n_positive": 513,
+                        "pseudo_r2": 0.11}
+        ram_coefs = pd.DataFrame({
+            "param": ["const", "fi_hvdc_outage_active"],
+            "coef":  [1100.0, 50.0],
+            "std_err": [1.0, 3.0],
+            "t": [1000.0, 16.0],
+            "p": [0.0, 0.0],
+        })
+        reg_results = {"ram": {"dep": "ram", "n_obs": 43200, "n_entities": 5,
+                               "rsquared": 0.5, "rsquared_within": 0.5,
+                               "summary_text": "", "coefs": ram_coefs}}
+        verdicts = summarize_hypotheses(reg_results, logit_result)
+        h5 = next(h for h in verdicts if h["id"] == "H5")
+        assert "vars absent" not in h5["verdict"], (
+            f"H5 verdict regressed to the shadowing bug: {h5['verdict']!r}")
+        assert "SUPPORTED" in h5["verdict"]
+        assert "forced" in h5["verdict"] and "planned" in h5["verdict"]
+
+    def test_ram_formula_check_is_not_circular(self):
+        """The RAM-formula balance check must actually be able to fail when
+        the formula is wrong — not just balance 100% by construction because
+        'fall' was defined as an algebraic residual of the same formula."""
+        n = 200
+        rng = np.random.default_rng(0)
+        dt = pd.date_range("2025-01-01", periods=n, freq="15min", tz="UTC")
+        base = pd.DataFrame({
+            "dateTimeUtc": dt, "cneName": "TEST_CNEC",
+            "fmax": 1000.0, "frm": 100.0, "fnrao": 5.0,
+            "amr": rng.uniform(0, 50, n),      # independent, sometimes nonzero
+            "faac": 2.0,
+            "fall": rng.normal(50, 10, n),     # independent of amr/iva/ram
+            "iva": rng.uniform(0, 30, n),      # independent, sometimes nonzero
+        })
+        # Correct full formula: RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA
+        correct = base.copy()
+        correct["ram"] = (correct.fmax - correct.frm - correct.fall
+                          + correct.fnrao + correct.amr - correct.faac - correct.iva)
+        cov = build_covariates(correct, pd.DataFrame())
+        check = cov.attrs.get("ram_formula_check")
+        assert check is not None
+        assert check["pct_within_1mw"] > 0.99, (
+            "Correct formula should balance against build_covariates' own check")
+
+        # Now build RAM from the INCOMPLETE (amr/iva-omitting) formula on the
+        # same independently-varying amr/iva — the check must catch this.
+        wrong = base.copy()
+        wrong["ram"] = wrong.fmax - wrong.frm - wrong.fall + wrong.fnrao - wrong.faac
+        cov_wrong = build_covariates(wrong, pd.DataFrame())
+        check_wrong = cov_wrong.attrs.get("ram_formula_check")
+        assert check_wrong["pct_within_1mw"] < 0.5, (
+            "Check should FAIL to balance when amr/iva are dropped from a RAM "
+            "series that was built with them — otherwise the check is circular "
+            "and can never catch this class of bug again")
+
+    def test_regression_reports_condition_number(self, no3_cov):
+        """Identification diagnostics must reflect the actual fitted design,
+        not just the 7 raw covariates, so ill-conditioning is visible."""
+        r = run_panel_regression(no3_cov, "ram")
+        for key in ("condition_number", "rank", "n_params", "ill_conditioned"):
+            assert key in r, f"Missing diagnostic key: {key}"
+        assert r["condition_number"] > 0
+        assert r["rank"] <= r["n_params"]
+
+    def test_collinear_dose_pair_pruned(self, no3_cov):
+        """A binary outage-active dummy and its paired MW-lost dose variable,
+        when near-perfectly collinear, must not both survive into the fitted
+        coefficients — otherwise the split between them (and the sign of the
+        surviving one) is solver-dependent, not physical."""
+        r = run_panel_regression(no3_cov, "ram")
+        cf = r["coefs"]["param"].tolist()
+        for binary_col, mw_col in [("fi_hvdc_outage_active", "fi_hvdc_outage_mw_lost"),
+                                   ("fi_ac_line_outage_active", "fi_ac_outage_mw_lost")]:
+            assert not (binary_col in cf and mw_col in cf), (
+                f"{binary_col} and {mw_col} both survived — if they are "
+                f"collinear in this data, one must be pruned before fitting")
+
+    def test_cet_utc_roundtrip(self):
+        """A CET-entered time converts to the expected UTC instant and back."""
+        # 2025-06-15 12:00 CEST (UTC+2 in summer) == 2025-06-15 10:00 UTC
+        utc_ts = cet_input_to_utc("2025-06-15T12:00:00")
+        assert utc_ts.tz_convert("UTC").strftime("%H:%M") == "10:00"
+        assert utc_to_cet_str(utc_ts, "%H:%M") == "12:00"
+        # An explicit-offset input is respected, not reinterpreted as CET
+        explicit = cet_input_to_utc("2025-06-15T10:00:00Z")
+        assert explicit == utc_ts
+
+
+# ── 11. Event study ───────────────────────────────────────────────────────────
+# build_event_time_dummies/run_event_study previously had two independent,
+# unconditional bugs: a hardcoded-nanosecond distance threshold that silently
+# broke on pandas versions where .values returns non-nanosecond datetime64
+# (collapsing event_k to a single constant for the whole panel), and a
+# `keep`/`dropna` mismatch in run_event_study that raised KeyError on any
+# well-formed input. Neither was reachable by any prior test, which is
+# exactly why they shipped undetected — see the audit report for the
+# reproduction. These tests exercise both functions end-to-end.
+
+class TestEventStudy:
+    @pytest.fixture(autouse=True)
+    def skip_without_linearmodels(self):
+        try:
+            from linearmodels.panel import PanelOLS
+        except ImportError:
+            pytest.skip("linearmodels not installed")
+
+    def test_event_k_not_collapsed_to_constant(self, no3_cov, outages_df):
+        df_ek = build_event_time_dummies(no3_cov, outages_df, leads=12, lags=48)
+        assert df_ek["event_k"].notna().any(), "event_k is all-NaN"
+        assert df_ek["event_k"].nunique() > 5, (
+            "event_k has suspiciously few distinct values — looks collapsed "
+            "toward a single constant rather than reflecting real distance "
+            "from each outage")
+
+    def test_event_k_matches_hand_computed_offset(self, no3_df):
+        """A row exactly N hours after a (the only) outage's start must get
+        event_k == N, not some unrelated constant."""
+        base = no3_df["dateTimeUtc"].min() + pd.Timedelta(days=3)
+        outage = pd.DataFrame([{
+            "outage_id": "solo", "start_utc": base.isoformat(),
+            "end_utc": (base + pd.Timedelta(hours=2)).isoformat(),
+        }])
+        df_ek = build_event_time_dummies(no3_df, outage, leads=12, lags=48)
+        one_cnec = df_ek[df_ek["cneName"] == df_ek["cneName"].iloc[0]]
+        row = one_cnec[one_cnec["dateTimeUtc"] == base + pd.Timedelta(hours=5)]
+        if len(row):
+            assert row["event_k"].iloc[0] == 5.0
+
+    def test_event_k_independent_of_outage_input_order(self, no3_df):
+        """Nearest-event assignment must not depend on the arbitrary order
+        outages happen to appear in the input DataFrame (deduplicate_outages
+        does not guarantee chronological output order)."""
+        base = no3_df["dateTimeUtc"].min() + pd.Timedelta(days=5)
+        outages = pd.DataFrame([
+            {"outage_id": "A", "start_utc": base.isoformat(),
+             "end_utc": (base + pd.Timedelta(hours=2)).isoformat()},
+            {"outage_id": "B", "start_utc": (base + pd.Timedelta(hours=30)).isoformat(),
+             "end_utc": (base + pd.Timedelta(hours=32)).isoformat()},
+        ])
+        ek_ab = build_event_time_dummies(no3_df, outages, leads=12, lags=48)["event_k"]
+        ek_ba = build_event_time_dummies(no3_df, outages.iloc[[1, 0]], leads=12, lags=48)["event_k"]
+        pd.testing.assert_series_equal(ek_ab.fillna(-999).reset_index(drop=True),
+                                       ek_ba.fillna(-999).reset_index(drop=True),
+                                       check_names=False)
+
+    def test_run_event_study_executes_without_keyerror(self, no3_cov, outages_df):
+        df_ek = build_event_time_dummies(no3_cov, outages_df, leads=4, lags=8)
+        result = run_event_study(df_ek, "f0", leads=4, lags=8)
+        assert result, "run_event_study returned an empty result on well-formed input"
+        assert "coefs" in result and len(result["coefs"]) > 0
+        assert "pre_trend_ok" in result
+
+
+# ── 12. Cluster-mode selection ────────────────────────────────────────────────
+# run_panel_regression's cluster="two_way"/"entity" branches previously
+# selected the WRONG cluster-code array relative to the function's own
+# docstring: "two_way" silently ran plain time-only clustering, and "entity"
+# silently attempted two-way clustering first (logged under the misleading
+# "time-clustered" label). These tests spy on the actual kwargs passed to
+# PanelOLS.fit() to verify the fix at the mechanism level, not just "it
+# runs" — an incorrect-but-non-crashing cluster choice would pass a
+# does-it-run check.
+
+class TestClusterModeSelection:
+    @pytest.fixture(autouse=True)
+    def skip_without_linearmodels(self):
+        try:
+            from linearmodels.panel import PanelOLS
+        except ImportError:
+            pytest.skip("linearmodels not installed")
+
+    def test_two_way_passes_two_column_cluster_array(self, no3_cov, monkeypatch):
+        from linearmodels.panel import PanelOLS
+        captured = {}
+        orig_fit = PanelOLS.fit
+        def spy_fit(self, *a, **kw):
+            if "n_cols" not in captured and "clusters" in kw:
+                captured["n_cols"] = np.asarray(kw["clusters"]).shape[1]
+            return orig_fit(self, *a, **kw)
+        monkeypatch.setattr(PanelOLS, "fit", spy_fit)
+        run_panel_regression(no3_cov, "ram", cluster="two_way")
+        assert captured.get("n_cols") == 2, (
+            f"cluster='two_way' should pass a 2-column (entity,time) cluster "
+            f"array to the FIRST fit attempt; got {captured.get('n_cols')} "
+            f"column(s) — looks like it silently fell back to one-way "
+            f"time clustering")
+
+    def test_entity_does_not_attempt_two_way_first(self, no3_cov, monkeypatch):
+        from linearmodels.panel import PanelOLS
+        captured = {}
+        orig_fit = PanelOLS.fit
+        def spy_fit(self, *a, **kw):
+            if "first_kwargs" not in captured:
+                captured["first_kwargs"] = dict(kw)
+            return orig_fit(self, *a, **kw)
+        monkeypatch.setattr(PanelOLS, "fit", spy_fit)
+        run_panel_regression(no3_cov, "ram", cluster="entity")
+        first = captured.get("first_kwargs", {})
+        assert first.get("cluster_entity") is True, (
+            f"cluster='entity' should request cluster_entity=True on the "
+            f"FIRST fit attempt; got {first} — looks like it tried two-way "
+            f"clustering before falling back to real entity-only clustering")
+
+    def test_time_cluster_still_the_default(self, no3_cov):
+        """Default behaviour (the only mode any current caller actually
+        uses) must be unaffected by the fix."""
+        r = run_panel_regression(no3_cov, "ram")
+        assert r
+
+
+# ── 13. Event-aware clustering key ────────────────────────────────────────────
+
+class TestClusterDateEpisodes:
+    def test_multiday_outage_shares_one_cluster_key(self, no3_df):
+        """A single continuous multi-day outage should collapse to ONE
+        cluster_date value for its whole span, not one per UTC calendar day
+        — otherwise SE clustering under-corrects for the within-event
+        cross-CNEC correlation the outage induces (it doesn't reset at
+        midnight)."""
+        start = no3_df["dateTimeUtc"].min() + pd.Timedelta(days=2)
+        outage = pd.DataFrame([{
+            "outage_id": "multi", "start_utc": start.isoformat(),
+            "end_utc": (start + pd.Timedelta(days=3)).isoformat(),
+            "asset_type": "hvdc", "planned_or_forced": "forced",
+            "capacity_mw": 500.0, "bidding_zone": "FI", "asset_id": None,
+            "asset_name": "x", "voltage_kv": None, "control_area": "FI",
+            "source": "manual", "raw_payload": "{}",
+        }])
+        cov = build_covariates(no3_df, outage)
+        assert "cluster_date" in cov.columns
+        during = cov[(cov["dateTimeUtc"] >= start) &
+                     (cov["dateTimeUtc"] < start + pd.Timedelta(days=3))]
+        assert during["cluster_date"].nunique() == 1, (
+            f"a single continuous 3-day outage should map to one cluster_date, "
+            f"got {during['cluster_date'].nunique()}: "
+            f"{during['cluster_date'].unique()}")
+        assert during["date"].nunique() > 1, (
+            "sanity check: the plain calendar date SHOULD vary across 3 days")
+
+    def test_no_outages_falls_back_to_plain_date(self, no3_df):
+        cov = build_covariates(no3_df, pd.DataFrame())
+        assert (cov["cluster_date"] == cov["date"]).all()
+
+
+# ── 14. Lag covariates: time-indexed, not positional ──────────────────────────
+
+class TestLagCovariates:
+    def test_lag_respects_time_gaps(self):
+        """A positional .shift() silently mislabels the lag whenever the
+        per-CNEC series has a missing MTU: 'N rows back' stops meaning 'N
+        steps back in time' the moment a row is missing. Build a series with
+        a deliberate gap and confirm the lag is resolved by wall-clock
+        offset, not row position."""
+        dt = pd.date_range("2025-01-01", periods=10, freq="15min", tz="UTC")
+        dt_gap = dt.delete(3)  # drop the row at t+45min
+        df = pd.DataFrame({
+            "dateTimeUtc": dt_gap, "cneName": "TEST",
+            "fmax": 1000.0, "frm": 100.0, "fnrao": 0.0, "amr": 0.0,
+            "faac": 0.0, "fall": 0.0, "iva": 0.0, "ram": 900.0,
+        })
+        outage = pd.DataFrame([{
+            "outage_id": "x", "start_utc": dt[0].isoformat(),
+            "end_utc": (dt[0] + pd.Timedelta(minutes=15)).isoformat(),
+            "asset_type": "hvdc", "planned_or_forced": "forced",
+            "capacity_mw": 100.0, "bidding_zone": "FI", "asset_id": None,
+            "asset_name": "x", "voltage_kv": None, "control_area": "FI",
+            "source": "manual", "raw_payload": "{}",
+        }])
+        cov = build_covariates(df, outage)
+
+        row_1h = cov[cov["dateTimeUtc"] == dt[0] + pd.Timedelta(hours=1)]
+        assert len(row_1h) == 1
+        assert row_1h["fi_forced_outage_active_lag1h"].iloc[0] == 1.0, (
+            "lag1h should find the active row exactly 1h earlier by wall "
+            "clock regardless of the gap; a positional shift(4) would "
+            "instead land 4 ROWS back in a 9-row gapped series and miss it")
+
+        row_30m = cov[cov["dateTimeUtc"] == dt[0] + pd.Timedelta(minutes=30)]
+        assert row_30m["fi_forced_outage_active_lag1h"].iloc[0] == 0.0, (
+            "no data 1h back yet this early in the window — must fall back "
+            "to 0.0, not borrow a positionally-nearby value across the gap")
+
+
+# ── 15. f0 partial backfill from fref ─────────────────────────────────────────
+
+class TestF0Backfill:
+    def test_partial_f0_gaps_are_backfilled_from_fref(self, tmp_path):
+        """f0 backfill used to trigger only when f0 was ENTIRELY empty — a
+        partially-populated f0 column kept its own gaps unfilled."""
+        df = pd.DataFrame({
+            "dateTimeUtc": ["2026-01-01T00:00:00Z", "2026-01-01T00:15:00Z"],
+            "cneName": ["TEST", "TEST"],
+            "biddingZoneFrom": ["NO3", "NO3"], "biddingZoneTo": ["NO4", "NO4"],
+            "f0": [123.0, None],       # first row populated, second missing
+            "fref": [999.0, 456.0],    # backfill source
+            "fmax": [500.0, 500.0], "frm": [50.0, 50.0],
+            "ram": [300.0, 300.0], "shadowPrice": [0.0, 0.0],
+            "iva": [0.0, 0.0], "amr": [0.0, 0.0],
+        })
+        p = str(tmp_path / "partial_f0.csv")
+        df.to_csv(p, index=False)
+        loaded = load_jao_csv(p)
+        assert loaded["f0"].iloc[0] == 123.0, "existing f0 value must not be overwritten"
+        assert loaded["f0"].iloc[1] == 456.0, "missing f0 must be backfilled from fref"
+
+
+# ── 16. DiD PTDF classification: mean(abs) not abs(mean) ──────────────────────
+
+class TestPrePeriodAbsPtdf:
+    def test_abs_applied_before_averaging(self):
+        """abs(mean(x)) only equals mean(abs(x)) when every value in the
+        window shares one sign. Build a CNEC whose PTDF flips sign within
+        the pre-period and confirm the per-row-abs average is used, not the
+        (potentially near-zero, sign-cancelled) abs-of-mean."""
+        df = pd.DataFrame({
+            "cneName": ["A", "A", "A", "A", "B", "B"],
+            "ptdf_FI": [0.10, -0.10, 0.10, -0.10, 0.05, 0.07],
+        })
+        result = pre_period_abs_ptdf(df, "ptdf_FI")
+        # mean(abs(A)) = 0.10; abs(mean(A)) = abs(0.0) = 0.0 -- these must differ
+        assert result.loc["A"] == pytest.approx(0.10)
+        assert result.loc["B"] == pytest.approx(0.06)
+
+    def test_missing_column_returns_empty(self):
+        df = pd.DataFrame({"cneName": ["A"], "other_col": [1.0]})
+        assert pre_period_abs_ptdf(df, "ptdf_FI").empty
+
+
+# ── 17. Recovery direction (magnitude-blind metric fix) ───────────────────────
+
+class TestRecoveryDirection:
+    def test_direction_distinguishes_persist_from_reverse(self):
+        persists = _pipe._recovery_direction(impact=50.0, recovery_residual=48.0)
+        reverses = _pipe._recovery_direction(impact=50.0, recovery_residual=-48.0)
+        recovered = _pipe._recovery_direction(impact=50.0, recovery_residual=2.0)
+        assert persists == "persists"
+        assert reverses == "reversed"
+        assert recovered == "recovered"
+        # The magnitude-only metric genuinely cannot distinguish the first two:
+        assert _pipe._clamp_recovery_frac(50.0, 48.0) == _pipe._clamp_recovery_frac(50.0, -48.0)
+
+    def test_zero_impact_is_not_applicable(self):
+        assert _pipe._recovery_direction(impact=0.0, recovery_residual=5.0) == "n/a"
+
+
+# ── 18. Single-event analysis (previously untested end-to-end) ───────────────
+
+class TestSingleEventAnalysis:
+    @pytest.fixture(autouse=True)
+    def skip_without_statsmodels(self):
+        if _pipe.sm is None:
+            pytest.skip("statsmodels not installed")
+
+    def test_runs_end_to_end_and_reports_recovery_direction(self, no3_cov, outages_df):
+        row = outages_df.iloc[0]
+        res = single_event_analysis(no3_cov, row, baseline_days=7, post_days=3)
+        assert set(res.keys()) >= {"summary", "its", "its_all", "decomp", "did", "cnec_table"}
+        assert res["summary"]["n_cnecs"] > 0
+        direction_keys = [k for k in res["summary"] if k.startswith("recovery_direction_")]
+        assert direction_keys, "recovery_direction_* fields missing from summary"
+        for k in direction_keys:
+            assert res["summary"][k] in ("recovered", "persists", "reversed", "n/a")
+
+    def test_forced_only_stratified_columns_present(self, no3_cov):
+        for col in ("fi_hvdc_outage_active_forced", "fi_hvdc_outage_active_planned",
+                    "fi_ac_line_outage_active_forced", "fi_ac_line_outage_active_planned"):
+            assert col in no3_cov.columns
+            assert set(no3_cov[col].dropna().unique()) <= {0, 1, 0.0, 1.0}
+
+    def test_planned_forced_confound_diagnostic_present(self, no3_cov):
+        diag = no3_cov.attrs.get("planned_forced_confound")
+        assert diag is not None
+        assert "all_planned_transmission_is_manual" in diag

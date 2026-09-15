@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fi-no3-propagation"
@@ -24,9 +24,24 @@ dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-p
 fi-no3-analyse = "fi_no3.propagation:main_cli"
 fi-no3-dash    = "fi_no3.dashboard:launch"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+# This directory (the one pyproject.toml lives in) IS the package: it's a
+# flat script layout (see CLAUDE.md), not a src/ layout -- there never was a
+# src/fi_no3/ directory, so `where = ["src"]` found nothing to package and
+# `pip install .` would produce an empty wheel. Mapping "." to the fi_no3
+# package name lets `__init__.py`'s existing relative imports (`from
+# .propagation import ...`) and the fi-no3-analyse/fi-no3-dash console
+# scripts below resolve correctly without duplicating any of the flat
+# module files into a separate src/ copy.
+package-dir = {"fi_no3" = "."}
+packages = ["fi_no3"]
+
+[tool.setuptools.package-data]
+fi_no3 = ["*.png", "*.csv"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# test_pipeline.py is flat in this directory too -- there is no tests/
+# subfolder, so the previous "tests" testpaths silently discovered zero
+# tests when pytest was run with this config.
+testpaths = ["."]
 filterwarnings = ["ignore::UserWarning", "ignore::RuntimeWarning"]

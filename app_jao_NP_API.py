@@ -281,6 +281,13 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
                 writer.writeheader()
                 writer.writerows(all_data)
 
+    # Was missing entirely: every caller does `self.raw_filtered_data =
+    # run_data_fetching_and_processing(...)`, so without this the fetched
+    # data -- however much of it there was -- was silently discarded and
+    # self.raw_filtered_data was always set to None, breaking the very next
+    # thing that touches it (e.g. _update_data_badge's len(self.raw_filtered_data)).
+    return all_data
+
     return all_data
 
 

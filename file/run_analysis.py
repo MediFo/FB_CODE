@@ -16,17 +16,26 @@ import os
 import sys
 from pathlib import Path
 
-# Allow running from project root or scripts/ directory
-_HERE   = Path(__file__).resolve().parent
-_ROOT   = _HERE.parent
-for p in [str(_ROOT / "src"), str(_ROOT)]:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+# propagation.py is a flat module next to this script (see CLAUDE.md's
+# documented "flat — all in project root" layout) -- there is no installed
+# `fi_no3` package to import from unless this project has been `pip install
+# -e`'d (see pyproject.toml's package-dir mapping). Support both: prefer an
+# installed `fi_no3` package if present, otherwise fall back to importing
+# the flat module directly.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-from fi_no3.propagation import (
-    PipelineConfig, run_pipeline, load_jao_csv,
-    load_manual_outages, render_html_report, summarize_hypotheses,
-)
+try:
+    from fi_no3.propagation import (
+        PipelineConfig, run_pipeline, load_jao_csv,
+        load_manual_outages, render_html_report, summarize_hypotheses,
+    )
+except ImportError:
+    from propagation import (
+        PipelineConfig, run_pipeline, load_jao_csv,
+        load_manual_outages, render_html_report, summarize_hypotheses,
+    )
 import pandas as pd
 
 
@@ -60,7 +69,10 @@ def main():
 
     # ── Data source ────────────────────────────────────────────────────────
     if args.synthetic:
-        from fi_no3.synthetic import generate_demo_dataset
+        try:
+            from fi_no3.synthetic import generate_demo_dataset
+        except ImportError:
+            from synthetic import generate_demo_dataset
         out_dir = args.out
         log(f"Generating {args.days} days of synthetic data...")
         info = generate_demo_dataset(out_dir + "/synthetic", days=args.days)
@@ -89,15 +101,26 @@ def main():
     if not args.end and jao_df is not None:
         args.end   = jao_df["dateTimeUtc"].max().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # NOTE: PipelineConfig has no fingrid_api_key/entsoe_api_key/use_fingrid
+    # fields -- there is no Fingrid integration anywhere in this codebase
+    # (propagation.py only fetches ENTSO-E outages, via the hardcoded
+    # ENTSOE_TOKEN module constant, not a per-run key), so passing those
+    # kwargs used to crash this script immediately with a TypeError. Warn
+    # once if the user supplied flags that don't correspond to real
+    # functionality, rather than silently dropping them or crashing.
+    if args.fingrid_key or args.no_fingrid:
+        log("NOTE: --fingrid-key/--no-fingrid have no effect -- this "
+            "codebase has no Fingrid data source.")
+    if args.entsoe_key:
+        log("NOTE: --entsoe-key has no effect -- propagation.py uses a "
+            "fixed ENTSOE_TOKEN constant, not a per-run key.")
+
     cfg = PipelineConfig(
         jao_csv        = args.jao or "",
         out_dir        = args.out,
         manual_csv     = args.outages,
         start_utc      = args.start,
         end_utc        = args.end,
-        fingrid_api_key= "" if args.no_fingrid else args.fingrid_key,
-        entsoe_api_key = "" if args.no_entsoe  else args.entsoe_key,
-        use_fingrid    = not args.no_fingrid,
         use_entsoe     = not args.no_entsoe,
         use_manual     = True,
     )

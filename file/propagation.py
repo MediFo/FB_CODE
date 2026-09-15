@@ -61,6 +61,49 @@ LogCallback = Callable[[str], None]
 def _noop(msg: str) -> None: ...
 
 # ---------------------------------------------------------------------------
+# CET boundary helpers
+# ---------------------------------------------------------------------------
+# All internal storage and computation (JAO/ENTSO-E alignment, regressions,
+# CSV columns) stays in UTC — that's the only sane common clock for data from
+# multiple sources. CET is the convention at the human boundary only: what a
+# person types into a dashboard, and what they read back in logs, summaries
+# and reports. "CET" here means the Europe/Oslo zone, which correctly follows
+# CET in winter and CEST in summer (DST-aware), matching the Nordic
+# flow-based domain's own regional time convention.
+CET_ZONE = "Europe/Oslo"
+
+
+def cet_input_to_utc(val) -> pd.Timestamp:
+    """Parse a human-entered timestamp. An explicit offset/Z is always
+    respected and converted to UTC. A bare, offset-less value is interpreted
+    as CET/CEST local time (the convention for anything a person types),
+    then converted to UTC for internal use."""
+    ts = pd.Timestamp(val)
+    if ts.tzinfo is not None:
+        return ts.tz_convert("UTC")
+    # ambiguous=True: on the one hour/year clocks fall back (CEST->CET), treat
+    # it as still-summer-time rather than raising — a rare edge case for
+    # outage timestamps, and failing the whole load over it would be worse
+    # than the ~1h mislabelling risk it carries.
+    return ts.tz_localize(CET_ZONE, ambiguous=True,
+                           nonexistent="shift_forward").tz_convert("UTC")
+
+
+def utc_to_cet_str(ts_utc, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a UTC-aware (or naive-assumed-UTC) timestamp as a CET/CEST
+    wall-clock string for display to a person. Missing/unparseable input
+    returns 'n/a' rather than raising, since this is called from display code
+    that shouldn't crash a GUI over one malformed row."""
+    try:
+        ts = pd.Timestamp(ts_utc)
+        if pd.isna(ts):
+            return "n/a"
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        return ts.tz_convert(CET_ZONE).strftime(fmt)
+    except (ValueError, TypeError):
+        return "n/a"
+
+# ---------------------------------------------------------------------------
 # 1. JAO CSV loader
 # ---------------------------------------------------------------------------
 EXPECTED_NUMERIC = [
@@ -69,7 +112,7 @@ EXPECTED_NUMERIC = [
 ]
 EXPECTED_PTDF_PREFIXES = ("ptdf_",)
 
-def load_jao_csv(path: str) -> pd.DataFrame:
+def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     """Load a JAO CSV exported from the user's existing tool.
     Robust to missing columns - they are filled with NaN."""
     df = pd.read_csv(path, low_memory=False)
@@ -84,10 +127,15 @@ def load_jao_csv(path: str) -> pd.DataFrame:
     if dt_col is None:
         # try to construct from date + time
         if "date" in df.columns and "time" in df.columns:
+            log_cb("  JAO CSV has no explicit UTC datetime column — building it "
+                   "from date+time columns (CET/CEST local time).")
             df["dateTimeUtc"] = pd.to_datetime(
                 df["date"].astype(str) + " " + df["time"].astype(str),
                 errors="coerce", utc=False
-            ).dt.tz_localize("Europe/Oslo", ambiguous="infer", nonexistent="shift_forward")
+            # ambiguous='infer' is not a valid tz_localize value on pandas 3.0+
+            # (raises ValueError); ambiguous=True treats the one DST-fold
+            # hour/year as still-summer-time rather than crashing the whole load.
+            ).dt.tz_localize("Europe/Oslo", ambiguous=True, nonexistent="shift_forward")
             df["dateTimeUtc"] = df["dateTimeUtc"].dt.tz_convert("UTC")
         else:
             raise ValueError("JAO CSV has no recognizable datetime column")
@@ -147,10 +195,14 @@ def load_jao_csv(path: str) -> pd.DataFrame:
         )
 
     # Correct Nordic RAM formula (JAO Nordic Publication Handbook v1.5):
-    # RAM = Fmax - FRM - Fref + fnrao + AMR - AAC - IVA
-    # Note: fref = f0 in JAO export (both represent reference flow at CGMA NP)
-    if df["f0"].isna().all() and df["fref"].notna().any():
-        df["f0"] = df["fref"]
+    # RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA  (see build_covariates()
+    # for the actual check; 'fall' is F_allReference, NOT fref/f0 below).
+    # Note: fref = f0 in JAO export (both represent reference flow at CGMA NP,
+    # a different quantity from 'fall' and not an input to the RAM formula).
+    # Backfill f0 from fref row-by-row (not only when f0 is entirely empty) so
+    # a partially-populated f0 column still gets its own gaps filled.
+    if df["fref"].notna().any():
+        df["f0"] = df["f0"].fillna(df["fref"])
 
     return df.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
 
@@ -544,6 +596,19 @@ def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     df = pd.read_csv(p)
     if "raw_payload" not in df.columns:
         df["raw_payload"] = "{}"
+
+    # This file is hand-edited (see CLAUDE.md). A person typing or pasting a
+    # time here is thinking in CET/CEST, not UTC — and spreadsheet editors
+    # commonly strip the "Z"/offset suffix off ISO-8601 strings on save. So:
+    # a value with an explicit offset is respected as given; an offset-less
+    # value is treated as CET/CEST and converted to true UTC right here, once,
+    # so every downstream consumer gets a correct, unambiguous UTC string
+    # without needing to guess.
+    for col in ("start_utc", "end_utc"):
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda v: cet_input_to_utc(v).isoformat() if pd.notna(v) else v)
+
     log_cb(f"Manual outage rows loaded: {len(df)}")
     return df
 
@@ -653,29 +718,49 @@ OUTAGE_BIN_COLS, OUTAGE_MW_COLS = _outage_cols("fi")  # default; overridden per-
 
 def _interval_active(times: np.ndarray, starts: np.ndarray,
                      ends: np.ndarray) -> np.ndarray:
-    """Vectorised: for each time t, return 1 if any (start <= t < end)."""
+    """Fully vectorised: for each time t, return 1 if any (start <= t < end).
+
+    Sort intervals by start, take a running max of end over that order, then
+    a single searchsorted per query time tells us how many intervals have
+    already started; the running max up to that point tells us whether any
+    of them are still open. No per-row Python loop — this used to iterate
+    `times` one at a time (O(rows) Python-level iterations, each doing its
+    own boolean scan), which does not scale to a full JAO panel (a CNEC x
+    15-min-MTU year easily reaches ~10^6 rows).
+    """
     if len(starts) == 0:
         return np.zeros(len(times), dtype=int)
-    out = np.zeros(len(times), dtype=int)
-    # Sort intervals by start
     order = np.argsort(starts)
     s = starts[order]; e = ends[order]
-    for i, t in enumerate(times):
-        idx = np.searchsorted(s, t, side="right")
-        # Any interval with s<=t and e>t in s[:idx]
-        if idx > 0 and np.any(e[:idx] > t):
-            out[i] = 1
+    cummax_e = np.maximum.accumulate(e)
+    idx = np.searchsorted(s, times, side="right")
+    out = np.zeros(len(times), dtype=int)
+    has_started = idx > 0
+    out[has_started] = (cummax_e[idx[has_started] - 1] > times[has_started]).astype(int)
     return out
 
 
 def _interval_mw(times: np.ndarray, starts: np.ndarray, ends: np.ndarray,
                  caps: np.ndarray) -> np.ndarray:
+    """Fully vectorised sum of caps over intervals active at each time t.
+
+    Classic sweep-line: +cap at each start, -cap at each end, sorted and
+    cumulatively summed once; a searchsorted per query time then reads off
+    the running total. Order among same-timestamp +/- events does not affect
+    the result at any query point, since a query only ever reads the
+    cumulative sum after ALL events at-or-before it have been applied.
+    """
     if len(starts) == 0:
         return np.zeros(len(times), dtype=float)
+    event_t = np.concatenate([starts, ends])
+    event_v = np.concatenate([caps, -caps])
+    order = np.argsort(event_t, kind="stable")
+    event_t = event_t[order]; event_v = event_v[order]
+    cum = np.cumsum(event_v)
+    idx = np.searchsorted(event_t, times, side="right")
     out = np.zeros(len(times), dtype=float)
-    for i, t in enumerate(times):
-        mask = (starts <= t) & (ends > t)
-        out[i] = float(caps[mask].sum())
+    has_any = idx > 0
+    out[has_any] = cum[idx[has_any] - 1]
     return out
 
 
@@ -691,10 +776,14 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     """
     p = src.lower()
     bin_cols, mw_cols = _outage_cols(p)
+    _stratified_cols = (f"{p}_hvdc_outage_active_forced", f"{p}_hvdc_outage_active_planned",
+                        f"{p}_ac_line_outage_active_forced", f"{p}_ac_line_outage_active_planned")
     jao = jao.copy()
+    _outg_for_cluster = None   # set below when outages are present; used for cluster_date
+    _confound_diag = None
     if outages is None or outages.empty:
         log_cb("No outages provided; covariates set to zero")
-        for c in bin_cols + mw_cols:
+        for c in bin_cols + mw_cols + _stratified_cols:
             jao[c] = 0.0
     else:
         # ensure datetime
@@ -750,11 +839,81 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
         s,e,c = subset_ndarrays(outg[outg["asset_type"]=="generator"])
         jao[f"{p}_gen_outage_mw_lost"] = _interval_mw(ts, s, e, c)
 
-    # Lagged versions
-    jao = jao.sort_values(["cneName", "dateTimeUtc"])
+        # ── Forced/planned-stratified HVDC & AC-line dummies ─────────────────
+        # fi_hvdc_outage_active / fi_ac_line_outage_active above pool planned
+        # AND forced events into one dummy. TSOs schedule planned maintenance
+        # deliberately during low-demand/low-flow periods — an endogenous
+        # timing choice correlated with the very dependent variables this
+        # pipeline regresses on — while forced outages are a much cleaner
+        # quasi-experiment. These four columns let H1/H2 be re-estimated on
+        # the forced-only subsample (see run_pipeline) so a pooled result can
+        # be checked against its cleaner-identified counterpart rather than
+        # trusted unconditionally.
+        for _atype, _label in (("hvdc", "hvdc"), ("ac_line", "ac_line")):
+            s,e,c = subset_ndarrays(outg[(outg["asset_type"] == _atype) &
+                                         (outg["planned_or_forced"] == "forced")])
+            jao[f"{p}_{_label}_outage_active_forced"] = _interval_active(ts, s, e)
+            s,e,c = subset_ndarrays(outg[(outg["asset_type"] == _atype) &
+                                         (outg["planned_or_forced"] == "planned")])
+            jao[f"{p}_{_label}_outage_active_planned"] = _interval_active(ts, s, e)
+
+        # ── Planned/forced provenance caveat (HVDC & AC-line only) ───────────
+        # ENTSO-E A78 (transmission unavailability) hardcodes planned_or_forced
+        # = "forced" for every record it returns (see fetch_entsoe_outages —
+        # a real entsoe-py #137 limitation, not a modelling choice made here).
+        # So a genuinely "planned" HVDC/AC-line event can only ever originate
+        # from a manually-curated CSV row. Record how much of the planned
+        # side, for these two asset types, actually rests on manual data, so
+        # callers (H5/H6 verdict text; the HTML report) can attach an accurate
+        # caveat instead of treating the label as a reliable physical
+        # classification for transmission assets.
+        _transmission = outg[outg["asset_type"].isin(["hvdc", "ac_line"])]
+        _planned_transmission = _transmission[_transmission["planned_or_forced"] == "planned"]
+        _src_col = (_planned_transmission["source"] if "source" in _planned_transmission.columns
+                    else pd.Series("", index=_planned_transmission.index, dtype=str))
+        n_planned_transmission = len(_planned_transmission)
+        n_planned_transmission_manual = int((_src_col == "manual").sum())
+        _confound_diag = {
+            "n_planned_transmission_events": n_planned_transmission,
+            "n_planned_transmission_manual": n_planned_transmission_manual,
+            "all_planned_transmission_is_manual": (
+                n_planned_transmission > 0
+                and n_planned_transmission_manual == n_planned_transmission),
+        }
+        if n_planned_transmission == 0:
+            log_cb(f"  ⚠ PLANNED/FORCED CAVEAT: zero 'planned' {src_prefix} HVDC/AC-line "
+                   f"events in this window. ENTSO-E A78 always reports 'forced' "
+                   f"(entsoe-py #137), so the only source of a genuine 'planned' "
+                   f"transmission event is a manual CSV row — with none present, H1/H2 "
+                   f"cannot be split into a meaningful planned-vs-forced comparison for "
+                   f"these asset types; see the forced-only H1/H2 regressions instead.")
+        elif _confound_diag["all_planned_transmission_is_manual"]:
+            log_cb(f"  ⚠ PLANNED/FORCED CAVEAT: all {n_planned_transmission} 'planned' "
+                   f"{src_prefix} HVDC/AC-line event(s) in this window come from the "
+                   f"manual CSV, not ENTSO-E (A78 always reports 'forced' — entsoe-py "
+                   f"#137). The planned-vs-forced split for these asset types is only "
+                   f"as reliable as the manually-curated rows.")
+
+        _outg_for_cluster = outg
+
+    # Lagged versions — time-indexed (reindex on cneName + exact offset
+    # timestamp), NOT a positional .shift(). A positional shift silently
+    # mislabels the lag whenever the per-CNEC series has any gap (a missing
+    # published MTU): "4 rows back" stops meaning "1 hour back" the moment a
+    # row is missing, with no error and no flag. Reindexing on the actual
+    # target timestamp is immune to this by construction — a gap correctly
+    # produces "no lagged value available" (falls back to 0.0, same as
+    # before) rather than silently pulling in the wrong point in time.
+    jao = jao.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
     for col in bin_cols + (f"{p}_gen_outage_mw_lost",):
-        jao[f"{col}_lag1h"]  = jao.groupby("cneName")[col].shift(4).fillna(0.0)
-        jao[f"{col}_lag24h"] = jao.groupby("cneName")[col].shift(96).fillna(0.0)
+        _series = pd.Series(jao[col].to_numpy(),
+                            index=pd.MultiIndex.from_arrays(
+                                [jao["cneName"].to_numpy(), jao["dateTimeUtc"].to_numpy()]))
+        for _label, _delta in (("lag1h", pd.Timedelta(hours=1)),
+                               ("lag24h", pd.Timedelta(hours=24))):
+            _target_idx = pd.MultiIndex.from_arrays(
+                [jao["cneName"].to_numpy(), (jao["dateTimeUtc"] - _delta).to_numpy()])
+            jao[f"{col}_{_label}"] = _series.reindex(_target_idx).fillna(0.0).to_numpy()
 
     # Time fixed-effect columns
     jao["hour"]  = jao["dateTimeUtc"].dt.hour
@@ -762,13 +921,41 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     jao["month"] = jao["dateTimeUtc"].dt.month
     jao["date"]  = jao["dateTimeUtc"].dt.date.astype(str)
 
-    # ── CORRECT RAM FORMULA VERIFICATION ────────────────────────────────────
-    # Verified on real JAO data: RAM = Fmax - FRM + fnrao - AAC - fall  (R²=1.000)
-    # 'fall' (F_allReference) is the reference flow entering the formula.
-    # 'fref'/'f0' in JAO = flow at CGMA NP ≈ fall + PTDF*NP_CGMA; NOT in RAM formula.
+    # ── Event-aware clustering key (for time-clustered standard errors) ─────
+    # A plain calendar-date key under-corrects standard errors for outages
+    # spanning more than one day: the within-event cross-CNEC correlation an
+    # outage induces does not reset at UTC midnight, so a 3-day outage should
+    # be ONE cluster, not three. Rows inside an outage's [start,end) window
+    # take the outage's own start-date as their cluster key (the whole
+    # episode shares one cluster); rows outside any outage window fall back
+    # to the plain calendar date. run_panel_regression() prefers this column
+    # over 'date' for time-clustering when it is present.
+    jao["cluster_date"] = jao["date"]
+    if _outg_for_cluster is not None and not _outg_for_cluster.empty:
+        _cluster_key = jao["cluster_date"].to_numpy(dtype=object).copy()
+        _ts_ns = jao["dateTimeUtc"].values.astype("datetime64[ns]")
+        for _, _orow in _outg_for_cluster.sort_values("start_utc").iterrows():
+            _in_window = ((_ts_ns >= _orow["start_utc"].to_datetime64()) &
+                         (_ts_ns < _orow["end_utc"].to_datetime64()))
+            if _in_window.any():
+                _cluster_key[_in_window] = f"ep:{_orow['start_utc'].strftime('%Y-%m-%d')}"
+        jao["cluster_date"] = _cluster_key
+
+    # ── RAM FORMULA VERIFICATION ─────────────────────────────────────────────
+    # Full Nordic CCM identity (matches CLAUDE.md's own documented derivation):
+    # RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA, using 'fall'
+    # (F_allReference) — NOT fref/f0, a different quantity (see load_jao_csv).
+    # AMR and IVA are INCLUDED here — a previous version of this formula omitted
+    # them, and the only check of that omission was circular on synthetic data
+    # (synthetic 'fall' used to be defined as an algebraic residual of the
+    # incomplete formula, so it could never fail). They are real, independently
+    # observed terms, and IVA in particular is expected to be nonzero exactly
+    # during forced outages (see H5) — dropping it would misstate RAM
+    # specifically on the rows this pipeline exists to study.
     ram_check = (jao["fmax"].fillna(0) - jao["frm"].fillna(0)
-                 + jao["fnrao"].fillna(0) - jao["faac"].fillna(0)
-                 - jao["fall"].fillna(0))
+                 + jao["fnrao"].fillna(0) + jao["amr"].fillna(0)
+                 - jao["faac"].fillna(0) - jao["fall"].fillna(0)
+                 - jao["iva"].fillna(0))
     if "ram" in jao.columns and jao["ram"].notna().any():
         diff = (jao["ram"] - ram_check).abs()
         pct_ok = (diff < 1.0).mean()
@@ -777,9 +964,22 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
                    f"(expected ~100%). Columns may differ from JAO Nordic v1.5 schema.")
         else:
             log_cb(f"✓ RAM formula verified: {pct_ok*100:.1f}% of rows balance within 1 MW")
+        # Captured in a plain local, not jao.attrs, here — .attrs does not
+        # reliably survive the .join()/.drop() calls further down on this
+        # pandas version. Applied to the actual returned object at the end
+        # of this function instead (see "result.attrs[...]" near the return).
+        _ram_check_diag = {
+            "formula": "RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA",
+            "n_rows": int(len(jao)),
+            "pct_within_1mw": float(pct_ok),
+            "max_abs_diff_mw": float(diff.max()),
+            "mean_abs_diff_mw": float(diff.mean()),
+        }
+    else:
+        _ram_check_diag = None
 
     # ── DEPENDENT VARIABLE CONSTRUCTION ─────────────────────────────────────
-    # H1: use 'fall' (F_allReference) — the actual Fref in the RAM formula.
+    # H1: use 'fall' (F_allReference) — the reference-flow term in the RAM formula.
     #     Sign-normalise per CNEC so positive always = "loading in congested direction".
     #     Within-CNEC entity FE handles the sign, but sign-normalisation makes the
     #     pooled coefficient interpretable and avoids cross-CNEC cancellation.
@@ -844,7 +1044,12 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
         else:
             log_cb("  ✓ FRM constant within all CNECs — H6 placebo test is valid")
 
-    return jao.reset_index(drop=True)
+    result = jao.reset_index(drop=True)
+    if _ram_check_diag is not None:
+        result.attrs["ram_formula_check"] = _ram_check_diag
+    if _confound_diag is not None:
+        result.attrs["planned_forced_confound"] = _confound_diag
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -873,8 +1078,10 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
         log_cb("linearmodels/statsmodels missing; skip")
         return {}
     indep = list(indep) if indep else _default_indep(src)
-    keep = ["dateTimeUtc","cneName",dep_var] + indep + ["hour","dow","month","date"]
-    keep = [c for c in keep if c in df.columns]
+    _time_cluster_col = "cluster_date" if "cluster_date" in df.columns else "date"
+    keep = (["dateTimeUtc","cneName",dep_var] + indep +
+           ["hour","dow","month","date", _time_cluster_col])
+    keep = list(dict.fromkeys(c for c in keep if c in df.columns))
     if dep_var not in keep:
         log_cb(f"Column {dep_var} not found in data")
         return {}
@@ -914,15 +1121,28 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     X = X.loc[:, nz]
     X = sm.add_constant(X, has_constant="add")
 
+    # ── Identification diagnostics on the ACTUAL fitted design ───────────────
+    # _indep_for_hypothesis() already picks orthogonal specs per hypothesis, so
+    # this should normally be well-conditioned — this is a safety-net check for
+    # cases outside that per-hypothesis path (e.g. custom `indep` callers).
+    cond_number = float(np.linalg.cond(X.values))
+    design_rank = int(np.linalg.matrix_rank(X.values))
+    ill_conditioned = bool(cond_number > 1e10 or design_rank < X.shape[1])
+    if ill_conditioned:
+        log_cb(f"  ⚠ design matrix ill-conditioned: condition number={cond_number:.2e}, "
+               f"rank={design_rank}/{X.shape[1]} columns — coefficients on collinear "
+               f"variables may not be uniquely identified")
+
     # Build cluster arrays aligned to the model index
-    # Time-clustering: group all CNECs on the same calendar date into one cluster.
-    # This is the correct design for outage studies where treatment is assigned
-    # at the event (time) level, not the CNEC level.
+    # Time-clustering: group all CNECs on the same calendar date (or, when
+    # cluster_date is present, the same outage episode — see build_covariates)
+    # into one cluster. This is the correct design for outage studies where
+    # treatment is assigned at the event (time) level, not the CNEC level.
     cluster_series_entity = pd.Series(
         pd.Categorical(sub.index.get_level_values(0)).codes.astype(np.int64),
         index=sub.index)
     cluster_series_time = pd.Series(
-        pd.Categorical(sub["date"]).codes.astype(np.int64),
+        pd.Categorical(sub[_time_cluster_col]).codes.astype(np.int64),
         index=sub.index)
     cluster_series_entity = cluster_series_entity.loc[y.index]
     cluster_series_time   = cluster_series_time.loc[y.index]
@@ -931,30 +1151,42 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
                                              cluster_series_time.values])
     cluster_codes_time   = cluster_series_time.values.reshape(-1, 1)
 
-    res = None
-    for attempt_label, kwargs in [
-        ("time-clustered",
-         {"cov_type": "clustered",
-          "clusters": cluster_codes_time,
-          "group_debias": True}
-         if cluster in ("time", "two_way") else
-         {"cov_type": "clustered",
-          "clusters": cluster_codes_twoway,
-          "group_debias": True}),
-        ("entity-clustered", {"cov_type": "clustered", "cluster_entity": True}),
+    _time_kwargs   = {"cov_type": "clustered", "clusters": cluster_codes_time,
+                      "group_debias": True}
+    _twoway_kwargs = {"cov_type": "clustered", "clusters": cluster_codes_twoway,
+                      "group_debias": True}
+    _entity_kwargs = {"cov_type": "clustered", "cluster_entity": True}
+
+    # The attempt actually requested by `cluster` goes first; the remaining
+    # attempts are a safety-net fallback chain, tried in order, with any
+    # attempt whose label already matches the primary one skipped so nothing
+    # is tried twice. (Previously "two_way" and "entity" were swapped here —
+    # "two_way" silently ran time-only clustering, and "entity" silently
+    # attempted two-way clustering first, under the "time-clustered" log
+    # label — contradicting this function's own docstring for both modes.)
+    if cluster == "two_way":
+        primary = ("two-way-clustered", _twoway_kwargs)
+    elif cluster == "entity":
+        primary = ("entity-clustered", _entity_kwargs)
+    else:
+        primary = ("time-clustered", _time_kwargs)
+    fallbacks = [
+        ("time-clustered",   _time_kwargs),
+        ("entity-clustered", _entity_kwargs),
         ("robust",           {"cov_type": "robust"}),
         ("unadjusted",       {"cov_type": "unadjusted"}),
-    ]:
+    ]
+    attempts = [primary] + [f for f in fallbacks if f[0] != primary[0]]
+
+    res = None
+    for attempt_label, kwargs in attempts:
         try:
             mod = PanelOLS(y, X, entity_effects=True, drop_absorbed=True,
                            check_rank=False)
             res = mod.fit(**kwargs)
             break
         except Exception as e:
-            if attempt_label == "time-clustered":
-                pass  # silent fallback
-            else:
-                log_cb(f"  {attempt_label} failed: {e}")
+            log_cb(f"  {attempt_label} failed: {e}")
 
     if res is None:
         return {}
@@ -1004,12 +1236,17 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
         "n_entities": int(sub.index.get_level_values(0).nunique()),
         "rsquared": float(res.rsquared),
         "rsquared_within": float(getattr(res, "rsquared_within", float("nan"))),
+        "rsquared_overall": float(res.rsquared),  # alias — some callers expect this name
         "summary_text": summary_text,
         "coefs": coefs,
         "bp_stat": float(bp_stat) if pd.notna(bp_stat) else None,
         "bp_p":    float(bp_p)    if pd.notna(bp_p)    else None,
         "durbin_watson": dw,
         "vif": vifs,
+        "condition_number": cond_number,
+        "rank": design_rank,
+        "n_params": int(X.shape[1]),
+        "ill_conditioned": ill_conditioned,
     }
 
 
@@ -1072,16 +1309,21 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     """For one CNEC and outage window, decompose ΔRAM into per-parameter
     contributions relative to the previous baseline_h hours.
 
-    Verified Nordic JAO RAM formula (R² = 1.000 on real data):
-        RAM = Fmax - FRM + fnrao - AAC - fall
+    Nordic JAO RAM formula (matches the check in build_covariates):
+        RAM = Fmax - FRM - fall + fnrao + AMR - AAC - IVA
 
     where:
         fall   = F_allReference (reference flow; negative = anti-congestion)
         fnrao  = Non-costly RA and other adjustments (positive = adds capacity)
-        AAC    = Already Allocated Capacity (aac column in JAO)
+        AAC    = Already Allocated Capacity (aac/faac column in JAO)
+        AMR    = Adjustment for Minimum RAM
+        IVA    = Individual Validation Adjustment (TSO discretionary)
 
     Note: fref/f0 are NOT in this formula (they represent a different quantity).
-    Note: AMR and IVA are zero for NO3 CNECs in the studied period (Apr-May 2026).
+    AMR and IVA are included unconditionally — assuming they're zero for any
+    given window is a dataset-specific observation, not a general truth, and
+    IVA specifically is expected to be nonzero exactly during forced outages
+    (see H5), i.e. on the windows this function is most often called for.
     """
     s = pd.Timestamp(outage_start, tz="UTC") if outage_start.tzinfo is None else outage_start
     e = pd.Timestamp(outage_end,   tz="UTC") if outage_end.tzinfo   is None else outage_end
@@ -1092,8 +1334,7 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     if pre.empty or during.empty:
         return pd.DataFrame()
 
-    # Verified columns
-    formula_cols = ["fmax", "frm", "fnrao", "faac", "fall", "ram"]
+    formula_cols = ["fmax", "frm", "fnrao", "amr", "faac", "fall", "iva", "ram"]
     cols = [c for c in formula_cols if c in sub.columns]
     means_pre = pre[cols].mean()
     means_dur = during[cols].mean()
@@ -1103,8 +1344,10 @@ def decompose_delta_ram(df: pd.DataFrame, cnec: str,
     if "fmax"  in delta: contrib["+ Δfmax"]  = float( delta["fmax"])
     if "frm"   in delta: contrib["- Δfrm"]   = float(-delta["frm"])
     if "fnrao" in delta: contrib["+ Δfnrao"] = float( delta["fnrao"])   # RA channel
+    if "amr"   in delta: contrib["+ Δamr"]   = float( delta["amr"])
     if "faac"  in delta: contrib["- Δaac"]   = float(-delta["faac"])
     if "fall"  in delta: contrib["- Δfall"]  = float(-delta["fall"])    # reference flow channel
+    if "iva"   in delta: contrib["- Δiva"]   = float(-delta["iva"])
 
     sigma = float(sum(contrib.values()))
     obs   = float(delta.get("ram", float("nan")))
@@ -1197,11 +1440,34 @@ def _holm_bonferroni(p_values: list[float | None], alpha: float = 0.05) -> list[
 
 
 def summarize_hypotheses(reg_results: dict, logit_result: dict,
-                          src: str = "fi", tgt: str = "NO3") -> list[dict]:
+                          src: str = "fi", tgt: str = "NO3",
+                          stratified_results: dict | None = None,
+                          confound_diag: dict | None = None) -> list[dict]:
     """Summarise verdicts for the given source country and target zone.
     When the primary test variable is absorbed by fixed effects, falls back to
-    alternative channel variables and reports why the original test wasn't possible."""
-    p = src.lower()
+    alternative channel variables and reports why the original test wasn't possible.
+
+    stratified_results: optional {"H1_forced": reg_result, "H2_forced": reg_result}
+        from re-estimating H1/H2 on forced-only outage covariates (see
+        run_pipeline). H1's pooled treatment variable (fi_hvdc_outage_active)
+        and H2's (fi_ac_line_outage_active) are active for BOTH planned and
+        forced outages — pooling an endogenously-timed source of variation
+        (planned maintenance, which TSOs deliberately schedule during
+        low-demand/low-flow periods) with a quasi-exogenous one (forced
+        outages) risks attenuating or fabricating a coefficient depending on
+        which regime dominates the sample. When present, the forced-only
+        estimate is appended to the H1/H2 verdict so a pooled result can be
+        checked against its more cleanly identified counterpart.
+    confound_diag: optional build_covariates() result.attrs["planned_forced_confound"]
+        — used to attach a caveat to H5/H6 when the "planned" side of the
+        HVDC/AC-line comparison is entirely (or partly) manual-CSV-sourced,
+        since ENTSO-E A78 hardcodes every transmission event as "forced"
+        (entsoe-py #137) and cannot supply a genuine planned/forced split for
+        those asset types.
+    """
+    p = src.lower()   # source-country column prefix — must survive the whole function;
+                      # do not reuse `p` as a loop-local for a p-value anywhere below
+                      # (that bug used to make H5 always report "vars absent").
     fallback_vars = {
         "H1": [f"{p}_hvdc_outage_active", f"{p}_forced_outage_active",
                f"{p}_hvdc_outage_mw_lost", f"{p}_planned_outage_active"],
@@ -1221,9 +1487,14 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                 try:
                     bp = cf.loc[f"{p}_planned_outage_active"]
                     bf = cf.loc[f"{p}_forced_outage_active"]
-                    verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
-                               f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
-                               f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
+                    if pd.isna(bf["p"]) or pd.isna(bp["p"]):
+                        verdict = ("estimation failed — logit Hessian singular / "
+                                   "p-value undefined (not a null result; re-check "
+                                   "sample size or collinearity)")
+                    else:
+                        verdict = (f"forced β={bf['coef']:.3g} (p={bf['p']:.3g}) | "
+                                   f"planned β={bp['coef']:.3g} (p={bp['p']:.3g}) | "
+                                   f"{'SUPPORTED' if bf['coef']>bp['coef'] and bf['p']<0.10 else 'NOT supported'}")
                 except KeyError:
                     verdict = "vars absent in logit (likely no IVA-active rows)"
             else:
@@ -1233,9 +1504,9 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
             if r and "coefs" in r:
                 cf = r["coefs"].set_index("param")
                 if h["var"] in cf.index:
-                    beta = cf.loc[h["var"], "coef"]; p = cf.loc[h["var"], "p"]
-                    verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                               f"{'CONSISTENT (no MTU effect)' if p>=0.05 else 'inconsistent (MTU effect detected)'}")
+                    beta = cf.loc[h["var"], "coef"]; pval = cf.loc[h["var"], "p"]
+                    verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                               f"{'CONSISTENT (no MTU effect)' if pval>=0.05 else 'inconsistent (MTU effect detected)'}")
                 else:
                     verdict = f"{h['var']} absorbed by FE; placebo inconclusive"
         else:
@@ -1247,34 +1518,90 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
                 tried = []
                 for var in [h["var"]] + fallback_vars.get(h["id"], []):
                     if var in cf.index:
-                        beta = cf.loc[var, "coef"]; p = cf.loc[var, "p"]
+                        beta = cf.loc[var, "coef"]; pval = cf.loc[var, "p"]
                         used_label = ("" if var == h["var"] else f" [via {var}]")
+                        ill = r.get("ill_conditioned")
+                        ill_label = (f"  ⚠ design matrix ill-conditioned "
+                                     f"(cond={r.get('condition_number'):.2e}) — "
+                                     f"coefficient not reliably identified" if ill else "")
 
                         if h["expected_sign"] is None:
                             # Direction is physically ambiguous — any significant
                             # result is a finding; neither direction is "wrong"
-                            if p < 0.05:
+                            if pval < 0.05:
                                 direction = "positive" if beta > 0 else "negative"
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"SIGNIFICANT ({direction} direction){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"SIGNIFICANT ({direction} direction){used_label}{ill_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
                         else:
                             sign_ok = (np.sign(beta) == np.sign(h["expected_sign"]))
-                            if sign_ok and p < 0.05:
-                                verdict = f"β={beta:.3g}, p={p:.3g} → SUPPORTED{used_label}"
-                            elif p < 0.05:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"SIGNIFICANT but opposite direction{used_label}")
+                            if sign_ok and pval < 0.05:
+                                verdict = f"β={beta:.3g}, p={pval:.3g} → SUPPORTED{used_label}{ill_label}"
+                            elif pval < 0.05:
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"SIGNIFICANT but opposite direction{used_label}{ill_label}")
                             else:
-                                verdict = (f"β={beta:.3g}, p={p:.3g} → "
-                                           f"inconclusive (p≥0.05){used_label}")
+                                verdict = (f"β={beta:.3g}, p={pval:.3g} → "
+                                           f"inconclusive (p≥0.05){used_label}{ill_label}")
                         break
                     tried.append(var)
                 else:
                     verdict = f"all candidate vars absorbed by FE: {tried}"
         out.append({"id": h["id"], "text": h["text"], "verdict": verdict})
+
+    # ── Forced-only stratification note (H1/H2) ───────────────────────────────
+    # H1's treatment variable (fi_hvdc_outage_active) and H2's
+    # (fi_ac_line_outage_active) are active for BOTH planned and forced
+    # outages. Planned maintenance is deliberately timed for low-demand/
+    # low-flow periods — an endogenous choice correlated with the dependent
+    # variables regressed on here — while forced outages are a much cleaner
+    # quasi-experiment. Report the forced-only re-estimate alongside the
+    # pooled one so a reader can see whether the pooled conclusion survives
+    # restriction to the cleaner-identified subsample, rather than trusting
+    # the pooled coefficient unconditionally.
+    if stratified_results:
+        _strat_var = {"H1": f"{p}_hvdc_outage_active_forced",
+                      "H2": f"{p}_ac_line_outage_active_forced"}
+        _strat_key = {"H1": "H1_forced", "H2": "H2_forced"}
+        for h in out:
+            if h["id"] not in _strat_var:
+                continue
+            r_strat = stratified_results.get(_strat_key[h["id"]])
+            if not r_strat or "coefs" not in r_strat:
+                continue
+            cf_strat = r_strat["coefs"].set_index("param")
+            var = _strat_var[h["id"]]
+            if var in cf_strat.index:
+                fb = cf_strat.loc[var, "coef"]; fp = cf_strat.loc[var, "p"]
+                h["verdict"] += (f"  | forced-only re-estimate: β={fb:.3g}, p={fp:.3g} "
+                                 f"(n={r_strat.get('n_obs', '?')})")
+            else:
+                h["verdict"] += ("  | forced-only re-estimate: variable absorbed by FE "
+                                 "or insufficient forced-only variation to identify it")
+
+    # ── Planned/forced provenance caveat (H5/H6, HVDC/AC-line assets) ────────
+    # See build_covariates()'s "PLANNED/FORCED CAVEAT" log message for the
+    # underlying cause: ENTSO-E A78 hardcodes every transmission event as
+    # "forced" (entsoe-py #137), so a genuinely planned HVDC/AC-line event
+    # can only come from the manual CSV.
+    if confound_diag:
+        _caveat = None
+        if confound_diag.get("n_planned_transmission_events", 0) == 0:
+            _caveat = ("  ⚠ zero genuinely 'planned' HVDC/AC-line events in this "
+                      "window — ENTSO-E A78 always reports 'forced' (entsoe-py "
+                      "#137), so this planned-vs-forced comparison has no "
+                      "non-manual data on the planned side for those asset types")
+        elif confound_diag.get("all_planned_transmission_is_manual"):
+            _caveat = ("  ⚠ all 'planned' HVDC/AC-line events in this window come "
+                      "from the manual CSV, not ENTSO-E (A78 always reports "
+                      "'forced' — entsoe-py #137); the planned side of this "
+                      "comparison is only as reliable as the manually-curated rows")
+        if _caveat:
+            for h in out:
+                if h["id"] in ("H5", "H6"):
+                    h["verdict"] += _caveat
 
     # ── Multiple-testing correction (H1–H4 form the testable family) ─────────
     # H5 is a logit (different distributional family); H6 is explicitly a
@@ -1287,17 +1614,30 @@ def summarize_hypotheses(reg_results: dict, logit_result: dict,
         m = re.search(r",\s*p=([0-9.eE+\-]+)", h["verdict"])
         p_vals.append(float(m.group(1)) if m else None)
 
-    if any(p is not None for p in p_vals):
+    if any(pv is not None for pv in p_vals):
         reject = _holm_bonferroni(p_vals, alpha=0.05)
-        for h, rej, p in zip(pool_out, reject, p_vals):
-            if p is None:
+        for h, rej, pv in zip(pool_out, reject, p_vals):
+            if pv is None:
                 continue
             if "SIGNIFICANT" in h["verdict"] and not rej:
-                h["verdict"] += (
-                    "  ⚠ Holm–Bonferroni: p does NOT survive FWER correction "
-                    f"(raw p={p:.3g} > corrected threshold)")
-            elif "inconclusive" not in h["verdict"] and rej and p >= 0.05:
-                pass  # would be a contradiction — ignore
+                # Lead with the corrected conclusion instead of appending a caveat
+                # after the word SIGNIFICANT, which a skim-read misses.
+                h["verdict"] = h["verdict"].replace(
+                    "SIGNIFICANT", "SIGNIFICANT-BUT-NOT-FWER-ROBUST", 1) + (
+                    f"  (raw p={pv:.3g} does not survive Holm–Bonferroni "
+                    f"family-wise correction across H1–H4)")
+
+    # ── Placebo gate: if H6 (FRM must not move) fails, the same design/window
+    # produced it as H1–H4, so their SIGNIFICANT verdicts may share the same
+    # confound. Flag rather than silently letting them stand unremarked.
+    h6 = next((h for h in out if h["id"] == "H6"), None)
+    if h6 and "inconsistent" in h6["verdict"]:
+        for h in out:
+            if h["id"] in fwer_pool and "SIGNIFICANT" in h["verdict"]:
+                h["verdict"] += ("  ⚠ H6 placebo FAILED in this run — FRM moved "
+                                  "with outage covariates, indicating an unmodeled "
+                                  "confound (e.g. a structural break) that could "
+                                  "also be driving this result; interpret with caution")
 
     return out
 
@@ -1418,7 +1758,7 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # 1. JAO
     if jao_df is None:
         log_cb(f"Loading JAO CSV: {cfg.jao_csv}")
-        jao = load_jao_csv(cfg.jao_csv)
+        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb)
     else:
         jao = jao_df.copy()
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")
@@ -1541,6 +1881,30 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     res_ptdf = run_panel_regression(
         no3_cov, h2_dep, indep=h2_spec, log_cb=log_cb, cluster="time", src=_src)
 
+    # ── H1/H2 forced-only re-estimate ────────────────────────────────────────
+    # fi_hvdc_outage_active / fi_ac_line_outage_active pool planned AND forced
+    # outages. Re-estimate on the forced-only subsample (a much cleaner
+    # quasi-experiment — see build_covariates' _{atype}_outage_active_forced
+    # columns) so the pooled H1/H2 verdicts can carry a check against their
+    # more cleanly identified counterpart rather than standing unqualified.
+    stratified_results: dict = {}
+    _h1_forced_var = f"{_src}_hvdc_outage_active_forced"
+    if _h1_forced_var in no3_cov.columns:
+        log_cb("Running fall (sign-normalised) regression [H1, forced-only]...")
+        h1_forced_spec = [_h1_forced_var] + [v for v in h1_spec
+                                              if v != f"{_src}_hvdc_outage_active"]
+        stratified_results["H1_forced"] = run_panel_regression(
+            no3_cov, h1_dep, indep=h1_forced_spec, log_cb=log_cb,
+            cluster="time", src=_src)
+    _h2_forced_var = f"{_src}_ac_line_outage_active_forced"
+    if _h2_forced_var in no3_cov.columns:
+        log_cb(f"Running |PTDF_{_src.upper()}| regression [H2, forced-only]...")
+        h2_forced_spec = [_h2_forced_var] + [v for v in h2_spec
+                                              if v != f"{_src}_ac_line_outage_active"]
+        stratified_results["H2_forced"] = run_panel_regression(
+            no3_cov, h2_dep, indep=h2_forced_spec, log_cb=log_cb,
+            cluster="time", src=_src)
+
     # ── H3: RAM ──────────────────────────────────────────────────────────────
     log_cb("Running RAM regression [H3]...")
     res_ram = run_panel_regression(
@@ -1559,10 +1923,20 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         log_cb("  Too few truly-binding MTUs; skipping shadow price regression")
         res_sp = {}
     else:
+        # H4's 3-covariate spec is already lean, but a very thin binding
+        # sample can still make hour/dow/month FE dummies outnumber the
+        # useful observations — drop them for H4 specifically when the
+        # binding sample is small (entity FE only).
+        thin_sample = sp_mask.sum() < 500
+        if thin_sample:
+            log_cb(f"  Binding sample is thin ({sp_mask.sum():,} rows) — "
+                   f"dropping hour/dow/month fixed effects for H4 to preserve "
+                   f"obs-per-parameter ratio (entity FE only).")
         res_sp = run_panel_regression(
             no3_binding, sp_col,
             indep=_indep_for_hypothesis("H4", _src),
-            log_cb=log_cb, cluster="time", src=_src)
+            log_cb=log_cb, cluster="time", src=_src,
+            add_time_fe=not thin_sample)
 
     # ── H6 placebo: FRM ──────────────────────────────────────────────────────
     log_cb("Running FRM placebo regression [H6]...")
@@ -1596,8 +1970,10 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         "frm":          res_frm,
         "fnrao":        res_fnrao,
     }
-    hypotheses = summarize_hypotheses(reg_results, res_logit,
-                                      src=_src, tgt=cfg.target_zone)
+    hypotheses = summarize_hypotheses(
+        reg_results, res_logit, src=_src, tgt=cfg.target_zone,
+        stratified_results=stratified_results,
+        confound_diag=no3_cov.attrs.get("planned_forced_confound"))
 
     # 5. Save outages
     outages.to_csv(Path(cfg.out_dir) / "outages_unified.csv", index=False)
@@ -1605,6 +1981,7 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     return {
         "no3": no3_cov, "outages": outages,
         "regressions": reg_results, "logit": res_logit,
+        "stratified_regressions": stratified_results,
         "hypotheses": hypotheses,
         "out_dir": cfg.out_dir,
         "source_country": cfg.source_country,
@@ -1634,6 +2011,11 @@ def build_event_time_dummies(df: pd.DataFrame, outages: pd.DataFrame,
     - Meaningful recovery dynamics occur over hours, not MTUs
 
     Rows not within (leads+lags+1) hours of any outage get event_k = NaN.
+    When a row falls within range of more than one outage, it is assigned to
+    whichever outage's start is temporally closest (ties broken toward the
+    earliest-starting outage) — not by outage input order, which is
+    otherwise arbitrary (deduplicate_outages does not guarantee chronological
+    output order).
     Dummy columns: D_km{leads} ... D_k{lags} (omit k=-1 as reference).
     """
     df = df.copy()
@@ -1644,21 +2026,35 @@ def build_event_time_dummies(df: pd.DataFrame, outages: pd.DataFrame,
     out = outages.copy()
     for c in ("start_utc", "end_utc"):
         out[c] = pd.to_datetime(out[c], utc=True, errors="coerce")
-    out = out.dropna(subset=["start_utc"])
+    out = out.dropna(subset=["start_utc"]).sort_values("start_utc")
 
     step = pd.Timedelta(hours=step_hours)
-    ts   = df["dateTimeUtc"].values
+    ts = pd.to_datetime(df["dateTimeUtc"], utc=True)
 
+    # For each outage, compute every row's offset from that outage's start as
+    # an exact (fractional) number of steps via Timedelta division — never a
+    # raw int64/datetime64 arithmetic assumption, which silently breaks if
+    # the platform's datetime64 resolution isn't nanoseconds (pandas 3.x can
+    # return microsecond-resolution datetime64 from .values, which used to
+    # make the old int64-nanosecond threshold here ~1000x too large: with
+    # even a single outage, that miscalibration caused every row's mask to
+    # evaluate True at every k, so event_k collapsed to a single constant —
+    # k=lags, the last value written in the loop — for the ENTIRE dataframe,
+    # regardless of actual proximity to any outage). Rounding that offset to
+    # the nearest integer step directly gives "the target hour nearest to
+    # this row" in one shot, with no inner per-k loop and no overwrite-order
+    # ambiguity for a single outage.
     event_k = np.full(len(df), np.nan)
+    best_dist_s = np.full(len(df), np.inf)
     for _, row in out.iterrows():
         s = row["start_utc"]
-        for k in range(-leads, lags + 1):
-            target = s + k * step
-            # Match any row within ±step/2 of the target hour
-            half = step.total_seconds() * 1e9 / 2
-            mask = np.abs((ts - target.to_datetime64()).astype("int64")) < half
-            # Only assign if not yet assigned or if this is closer
-            event_k[mask] = k
+        offset_steps = ((ts - s) / step).to_numpy()
+        k_nearest = np.rint(offset_steps)
+        dist_s = np.abs(offset_steps - k_nearest) * step.total_seconds()
+        in_range = (k_nearest >= -leads) & (k_nearest <= lags)
+        closer = in_range & (dist_s < best_dist_s)
+        event_k[closer] = k_nearest[closer]
+        best_dist_s[closer] = dist_s[closer]
 
     df["event_k"] = event_k
 
@@ -1695,9 +2091,9 @@ def run_event_study(df: pd.DataFrame, dep_var: str,
         log_cb("No event-time dummy columns found; run build_event_time_dummies first")
         return {}
 
-    keep = ["dateTimeUtc", "cneName", dep_var, "hour", "dow", "month"] \
+    keep = ["dateTimeUtc", "cneName", dep_var, "event_k", "hour", "dow", "month"] \
            + [c for _, c in dummy_cols]
-    keep = [c for c in keep if c in df.columns]
+    keep = list(dict.fromkeys(c for c in keep if c in df.columns))
     sub = df[keep].dropna(subset=[dep_var, "event_k"] if "event_k" in df.columns
                                   else [dep_var])
     # Keep only rows that are in event windows or in baseline
@@ -2145,6 +2541,29 @@ def _clamp_recovery_frac(impact: float, recovery_residual: float) -> float:
     return round(clamped, 3)
 
 
+def _recovery_direction(impact: float, recovery_residual: float,
+                        tol_frac: float = 0.15) -> str:
+    """Classify the post-period residual's direction relative to the
+    during-period impact — information _clamp_recovery_frac() above cannot
+    express, since it depends only on |recovery_residual| / |impact|. A
+    post-period deviation that PERSISTS unchanged (same sign and size as the
+    outage-period impact) and one that fully REVERSES (overshoots to the
+    equal-and-opposite value) both score exactly 0.0 on that magnitude-only
+    scale, even though physically they are different stories: the first says
+    the outage's effect never dissipated, the second suggests a compensating
+    response strong enough to swing past baseline. Returns one of:
+    "recovered" (residual small relative to impact), "persists" (residual
+    same sign as impact — the effect hasn't gone away), "reversed" (residual
+    opposite sign — overshoot past baseline), or "n/a".
+    """
+    if abs(impact) < 1e-9 or not np.isfinite(recovery_residual):
+        return "n/a"
+    ratio = recovery_residual / impact   # positive => same direction as impact
+    if abs(ratio) <= tol_frac:
+        return "recovered"
+    return "persists" if ratio > 0 else "reversed"
+
+
 _ITS_METHODS = {
     "seasonal_naive": {
         "label":       "Seasonal Naive",
@@ -2218,6 +2637,21 @@ def _build_its_for_col(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
     if method == "seasonal_naive":
         return fn(pre_agg, all_agg, col)
     return fn(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+
+def pre_period_abs_ptdf(pre_df: pd.DataFrame, ptdf_col: str) -> pd.Series:
+    """Per-CNEC mean |PTDF| over a pre-period, for the DiD high/low split.
+
+    abs() is applied per-row before averaging, not to the averaged value:
+    abs(mean(x)) only equals mean(abs(x)) when every value shares one sign,
+    which is the common case for a CNEC's PTDF over a short pre-period but
+    is not guaranteed (e.g. a topology change within the pre-period itself
+    could flip it) — using mean(abs(x)) doesn't rely on that assumption
+    silently. Returns an empty Series if `ptdf_col` is not in `pre_df`.
+    """
+    if ptdf_col not in pre_df.columns or pre_df.empty:
+        return pd.Series(dtype=float)
+    return pre_df[ptdf_col].abs().groupby(pre_df["cneName"]).mean()
 
 
 def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
@@ -2351,19 +2785,33 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         _cnec_seasonal[col]   = _pre_lookup.groupby(["cneName","hour","dow"])[col].mean()
 
     def _cf_mean_for(df_subset: pd.DataFrame, col: str) -> float:
-        """Y(0) expected value for df_subset using PRE-ONLY seasonal model."""
+        """Y(0) expected value for df_subset using PRE-ONLY seasonal model.
+
+        Vectorised three-level fallback (per-CNEC seasonal mean, else pooled
+        seasonal mean, else pre-period grand mean) via reindex/where rather
+        than a per-row Python .iterrows() loop — this is called once per
+        (CNEC x fb_param) from the caller below, so the old loop compounded
+        across the full cross product on every single-event analysis run.
+        """
         if df_subset.empty or col not in _pooled_seasonal:
             return np.nan
         ds = df_subset.copy()
         ds["hour"] = ds["dateTimeUtc"].dt.hour
         ds["dow"]  = ds["dateTimeUtc"].dt.dayofweek
-        vals = []
         fallback = float(_pre_lookup[col].mean()) if col in _pre_lookup.columns else np.nan
-        for _, r in ds.iterrows():
-            v = _cnec_seasonal[col].get((r["cneName"], int(r["hour"]), int(r["dow"])),
-                _pooled_seasonal[col].get((int(r["hour"]), int(r["dow"])), fallback))
-            vals.append(float(v) if pd.notna(v) else np.nan)
-        return round(float(np.nanmean(vals)), 2) if vals else np.nan
+
+        cnec_key = pd.MultiIndex.from_arrays([ds["cneName"], ds["hour"], ds["dow"]])
+        vals = _cnec_seasonal[col].reindex(cnec_key).to_numpy(dtype=float)
+
+        pooled_key = pd.MultiIndex.from_arrays([ds["hour"], ds["dow"]])
+        pooled_vals = _pooled_seasonal[col].reindex(pooled_key).to_numpy(dtype=float)
+        missing = np.isnan(vals)
+        vals = np.where(missing, pooled_vals, vals)
+
+        still_missing = np.isnan(vals)
+        vals = np.where(still_missing, fallback, vals)
+
+        return round(float(np.nanmean(vals)), 2) if len(vals) else np.nan
 
     cnec_rows = []
     for cnec in sorted(no3_df.cneName.unique()):
@@ -2473,6 +2921,10 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
                     float(dur_rows["gap"].mean()),
                     float(post_rows["gap"].mean()))
                     if (not dur_rows.empty and not post_rows.empty) else np.nan,
+                "recovery_direction": _recovery_direction(
+                    float(dur_rows["gap"].mean()),
+                    float(post_rows["gap"].mean()))
+                    if (not dur_rows.empty and not post_rows.empty) else "n/a",
                 "method":            method_key,
                 "method_label":      _ITS_METHODS[method_key]["label"],
             }
@@ -2533,13 +2985,10 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     if _ptdf_raw_col not in no3_df.columns:
         _ptdf_raw_col = "ptdf_FI"
 
-    # Use PRE-period PTDF to classify CNECs (no post-treatment contamination)
-    if _ptdf_raw_col in no3_df.columns:
-        ptdf_fi_abs = pre.groupby("cneName")[_ptdf_raw_col].mean().abs()
-        if ptdf_fi_abs.empty:
-            ptdf_fi_abs = no3_df.groupby("cneName")[_ptdf_raw_col].mean().abs()
-    else:
-        ptdf_fi_abs = pd.Series(dtype=float)
+    # Use PRE-period PTDF to classify CNECs (no post-treatment contamination).
+    ptdf_fi_abs = pre_period_abs_ptdf(pre, _ptdf_raw_col)
+    if ptdf_fi_abs.empty:
+        ptdf_fi_abs = pre_period_abs_ptdf(no3_df, _ptdf_raw_col)
 
     if _ptdf_raw_col in no3_df.columns and sm is not None and not ptdf_fi_abs.empty:
         # Build estimation sample: PRE ∪ POST, DURING excluded
@@ -2659,6 +3108,10 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         summary[f"impact_cf_{col}"]         = its_s["impact"]            # during_actual - Y(0)_during
         summary[f"recovery_resid_{col}"]     = its_s["recovery_residual"] # post_actual   - Y(0)_post
         summary[f"recovery_frac_{col}"]      = its_s["recovery_frac"]     # 1=full, 0=none
+        # recovery_frac alone can't tell "effect persists" from "effect
+        # reverses past baseline" (both score 0.0 when magnitudes match) —
+        # this direction label carries the information the magnitude drops.
+        summary[f"recovery_direction_{col}"] = its_s.get("recovery_direction", "n/a")
         summary[f"projected_during_{col}"]   = its_s["projected_during"]  # Y(0)_during
         summary[f"projected_post_{col}"]     = its_s["projected_post"]    # Y(0)_post
 
