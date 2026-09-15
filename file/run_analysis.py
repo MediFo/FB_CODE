@@ -63,6 +63,11 @@ def main():
                         help="Use synthetic data (no JAO CSV needed)")
     parser.add_argument("--days",    type=int, default=90,
                         help="Days of synthetic data (with --synthetic)")
+    parser.add_argument("--effect-scale", type=float, default=1.0,
+                        help="Scale outage-induced effects in synthetic data "
+                             "(with --synthetic); 1.0 = large/easy-to-detect "
+                             "default, e.g. 0.1 for a small, economically "
+                             "realistic effect size")
     args = parser.parse_args()
 
     def log(msg): print(msg, flush=True)
@@ -75,7 +80,8 @@ def main():
             from synthetic import generate_demo_dataset
         out_dir = args.out
         log(f"Generating {args.days} days of synthetic data...")
-        info = generate_demo_dataset(out_dir + "/synthetic", days=args.days)
+        info = generate_demo_dataset(out_dir + "/synthetic", days=args.days,
+                                     effect_scale=args.effect_scale)
         jao_df     = load_jao_csv(info["jao_path"])
         outages_df = pd.read_csv(info["outages_path"])
         log(f"  JAO: {len(jao_df):,} rows | Outages: {len(outages_df)}")
@@ -176,4 +182,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        # A raw Python traceback is not a useful CLI error for a data or
+        # config problem (bad path, malformed CSV, unreachable API) -- print
+        # a clear one-line message and exit non-zero. Re-raise unexpected
+        # internal errors with the full traceback so they're still
+        # debuggable, distinguished from the "known input problem" cases.
+        print(f"ERROR: {e}", file=sys.stderr)
+        if os.environ.get("FI_NO3_DEBUG"):
+            raise
+        sys.exit(1)

@@ -607,6 +607,16 @@ class App:
         self._log(f"Loaded manual outage CSV: {path}")
 
     def _fetch_outages(self):
+        # Guard against a second click starting an overlapping fetch while
+        # one is already running -- two workers writing self.outages_df
+        # concurrently would otherwise let whichever finishes last silently
+        # clobber or interleave with the other's result.
+        if getattr(self, "_outage_fetch_running", False):
+            messagebox.showinfo("Already fetching",
+                                "An outage fetch is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
+        self._outage_fetch_running = True
         # Run in a thread so the UI stays responsive
         threading.Thread(target=self._fetch_outages_worker, daemon=True).start()
 
@@ -634,13 +644,19 @@ class App:
             else:
                 self.outages_df = pipe.deduplicate_outages(pd.concat(collected, ignore_index=True))
 
-            self.status_out.set(f"Outages: {len(self.outages_df)} (deduped)")
+            # StringVar.set() drives the Tcl interpreter, which is not
+            # thread-safe -- every other update in this worker is correctly
+            # marshaled via root.after(); this one wasn't, unlike the rest.
+            n_outages = len(self.outages_df)
+            self.root.after(0, lambda: self.status_out.set(f"Outages: {n_outages} (deduped)"))
             self.root.after(0, self._refresh_outage_view)
             self.root.after(0, self._populate_event_selector)
-            log(f"Outage fetch complete: {len(self.outages_df)} events")
+            log(f"Outage fetch complete: {n_outages} events")
         except Exception as e:
             log("ERROR: " + str(e))
             log(traceback.format_exc())
+        finally:
+            self._outage_fetch_running = False
 
     # -----------------------------------------------------------------
     # Run tab
@@ -699,6 +715,16 @@ class App:
         self.log_box.see("end")
 
     def _run_pipeline(self):
+        # Guard against a double-click (or a click while a previous run is
+        # still going) starting a second overlapping worker thread: both
+        # would write the same output CSV paths and both assign
+        # self.results, so whichever finishes last silently wins with a
+        # report that may mix state from two different runs.
+        if getattr(self, "_pipeline_running", False):
+            messagebox.showinfo("Already running",
+                                "An analysis run is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
         if self.jao_df is None:
             messagebox.showinfo("No JAO data",
                                 "Load a JAO CSV (or generate synthetic) on the Setup tab first.")
@@ -710,6 +736,7 @@ class App:
                     "(Regressions will produce no useful results.)"):
                 return
 
+        self._pipeline_running = True
         self.run_status.set("Running...")
         self.progress.start(10)
         threading.Thread(target=self._run_pipeline_worker, daemon=True).start()
@@ -739,6 +766,7 @@ class App:
             self._log("ERROR: " + str(e))
             self._log(traceback.format_exc())
         finally:
+            self._pipeline_running = False
             self.root.after(0, self.progress.stop)
             self.root.after(0, lambda: self.run_status.set("Done"))
 
@@ -1373,6 +1401,11 @@ class App:
         return None
 
     def _run_single_event(self):
+        if getattr(self, "_single_event_running", False):
+            messagebox.showinfo("Already running",
+                                "A single-event analysis is already in progress. "
+                                "Wait for it to finish before starting another.")
+            return
         if not self.results:
             messagebox.showinfo("Run analysis first",
                                 "Complete the population analysis on Tab 3 first.")
@@ -1386,6 +1419,7 @@ class App:
         method_key = getattr(self, "_its_method_map", {}).get(its_label, its_label)
         if method_key not in pipe.ITS_METHOD_NAMES and method_key != "all":
             method_key = pipe.ITS_DEFAULT_METHOD
+        self._single_event_running = True
         threading.Thread(target=self._single_event_worker,
                          args=(row, method_key), daemon=True).start()
 
@@ -1405,6 +1439,8 @@ class App:
         except Exception as e:
             self._log(f"Single event error: {e}")
             import traceback; self._log(traceback.format_exc())
+        finally:
+            self._single_event_running = False
 
     def _display_single_event(self, res: dict, outage_row):
         try:

@@ -83,7 +83,15 @@ pytest test_pipeline.py -v
   offset, it's interpreted as CET/CEST (not UTC) — matching how a human
   actually thinks when typing into that file.
 - FRM is structural (yearly calibration); it should NOT move with individual outages (H6 placebo)
-- Two-way clustered SE fails on unbalanced panels -> silent fallback to entity-only clustering
+- run_panel_regression()'s SE fallback chain (whichever `cluster=` mode was
+  requested first, then time-clustered, entity-clustered, robust, unadjusted
+  in that order) is recorded, not silent: every regression result carries
+  `cov_type_used` and `se_fallback_occurred`, and summarize_hypotheses()
+  appends `n=…, se=…` to every H1-H4/H6 verdict so a reader can see when a
+  result rests on something weaker than the requested clustering. In
+  practice run_pipeline() always requests `cluster="time"` — `"two_way"` is
+  supported by run_panel_regression() but not currently invoked anywhere in
+  the pipeline.
 - Outage covariates are zero when no outage overlaps JAO window -> verdicts show as n/a
 - app_jao_NP_API_fix_d14.py's data fetch is day-batched (one PowerShell/
   Invoke-WebRequest call per calendar day, CET-aligned) rather than
@@ -102,12 +110,21 @@ pytest test_pipeline.py -v
 - ENTSO-E A77 returns "File is not a zip file" when no FI production outages exist in window
 - IVA is zero on NO3 CNECs in short windows; H5 logit needs longer history
 - FRM in synthetic data moves with outages (December 2024 regime change is encoded)
-- Two-way clustered SE always falls back to entity-only for unbalanced panels
 - With few independent outage episodes, a binary outage-active dummy and its
   paired MW-lost dose variable can be near-perfectly collinear;
-  run_panel_regression() drops the binary duplicate and keeps the dose
-  variable in that case (see _prune_collinear_dose_pairs) rather than let the
-  estimator split the coefficient arbitrarily between them.
+  run_panel_regression() calls _prune_collinear_dose_pairs() before fitting,
+  which drops the binary duplicate and keeps the dose variable in that case
+  (falling back to a deterministic column drop when neither/both candidates
+  are binary), rather than let the estimator split the coefficient
+  arbitrarily between them. This applies to any `indep` list, not just the
+  built-in H1-H6 specs.
+- Economic significance is checked alongside statistical significance:
+  ECONOMIC_SIGNIFICANCE_THRESHOLDS (propagation.py) sets a conservative,
+  documented minimum-magnitude floor per dependent variable; a coefficient
+  that clears p<0.05 but not that floor is reported as "statistically
+  significant" rather than "SUPPORTED"/"SIGNIFICANT". These floors are not
+  calibrated against live market data — adjust them if a better-grounded
+  number becomes available.
 - Credentials (ENTSO-E token, any Nord Pool key) are still hardcoded as
   source constants, and app_jao_NP_API_fix_d14.py's JAO fetch still shells
   out to Windows PowerShell per calendar day — both known, currently

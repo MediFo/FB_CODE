@@ -212,8 +212,59 @@ def get_np_access_token():
 
 API_URL = "https://publicationtool.jao.eu/nordic/api/data/fbDomainShadowPrice"
 
+_JAO_PAGE_SIZE = 15000
+_JAO_MAX_PAGES = 20  # 20 x 15000 = 300k rows/day -- far beyond any plausible day
+_PS_HTTP_TIMEOUT_S = 60
+_PS_PROCESS_TIMEOUT_S = _PS_HTTP_TIMEOUT_S + 30  # margin over the PS script's own HTTP timeout
+
+
+def _fetch_one_page(api_url, log_func):
+    """Run a single PowerShell Invoke-WebRequest call and return
+    (rows_or_None, error_or_None). Bounded by a Python-side subprocess
+    timeout in addition to the PS script's own -TimeoutSec, so a hung
+    `powershell` process (stuck TLS handshake, an unexpected prompt despite
+    -NonInteractive) can't block the fetch thread forever."""
+    ps_script = (
+        "$ProgressPreference = 'SilentlyContinue'; "
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+        "try { "
+        f"  $resp = Invoke-WebRequest -Uri '{api_url}' -Method Get -TimeoutSec {_PS_HTTP_TIMEOUT_S} -UseBasicParsing; "
+        "  if ($resp.Content) { $resp.Content } else { 'EMPTY_CONTENT' } "
+        "} catch { "
+        "  Write-Output ('PS_ERROR: ' + $_.Exception.Message) "
+        "}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=_PS_PROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (f"PowerShell process did not exit within "
+                       f"{_PS_PROCESS_TIMEOUT_S}s (hung past its own "
+                       f"{_PS_HTTP_TIMEOUT_S}s HTTP timeout) — treated as failed")
+
+    raw_out = result.stdout.strip()
+    if not raw_out or raw_out.startswith("PS_ERROR"):
+        return None, raw_out
+    if raw_out == "EMPTY_CONTENT":
+        return [], None
+    try:
+        return json.loads(raw_out).get("data", []), None
+    except json.JSONDecodeError as e:
+        return None, f"could not parse JAO response as JSON: {e}"
+
+
 def fetch_day_via_powershell(date_str, log_func):
-    """Fetch one full calendar day (CET) in a single PowerShell request.
+    """Fetch one full calendar day (CET), paginating in `take`-sized pages
+    until a short (or empty) page comes back. A full Nordic CNEC set at 96
+    MTUs/day can comfortably exceed one 15,000-row page; trusting a single
+    request and reporting whatever came back as "the whole day" (the
+    previous behaviour) silently truncates on any day that actually needs a
+    second page. _JAO_MAX_PAGES bounds the loop in case the API ever returns
+    exactly a full page indefinitely (e.g. a misbehaving server echoing the
+    same page), so this can't spin forever either.
     Uses stdlib datetime/zoneinfo, not pandas -- this module only imports
     pandas lazily inside the specific methods that need it."""
     try:
@@ -221,40 +272,44 @@ def fetch_day_via_powershell(date_str, log_func):
         d_from = day.replace(hour=0,  minute=0 ).astimezone(timezone.utc)
         d_to   = day.replace(hour=23, minute=59).astimezone(timezone.utc)
 
-        api_params = {
-            "FromUTC": d_from.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "ToUTC":   d_to.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "take":    15000,
-            "filter":  "{}",
-        }
-        query_string = urllib.parse.urlencode(api_params)
-        api_url = f"{API_URL}?{query_string}"
+        all_rows = []
+        skip = 0
+        for page in range(_JAO_MAX_PAGES):
+            api_params = {
+                "FromUTC": d_from.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "ToUTC":   d_to.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "take":    _JAO_PAGE_SIZE,
+                "skip":    skip,
+                "filter":  "{}",
+            }
+            query_string = urllib.parse.urlencode(api_params)
+            api_url = f"{API_URL}?{query_string}"
 
-        log_func(f"Requesting: {date_str}")
+            log_func(f"Requesting: {date_str}" +
+                     (f" (page {page + 1}, skip={skip})" if page else ""))
 
-        ps_script = (
-            "$ProgressPreference = 'SilentlyContinue'; "
-            "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
-            "try { "
-            f"  $resp = Invoke-WebRequest -Uri '{api_url}' -Method Get -TimeoutSec 60 -UseBasicParsing; "
-            "  if ($resp.Content) { $resp.Content } else { 'EMPTY_CONTENT' } "
-            "} catch { "
-            "  Write-Output ('PS_ERROR: ' + $_.Exception.Message) "
-            "}"
-        )
+            page_rows, err = _fetch_one_page(api_url, log_func)
+            if page_rows is None:
+                if all_rows:
+                    # Earlier pages already succeeded -- surface the error
+                    # but don't throw away what was fetched; the caller
+                    # decides whether a partial day is usable.
+                    return all_rows, (f"page {page + 1} failed after "
+                                       f"{len(all_rows)} row(s) already "
+                                       f"fetched: {err}")
+                return None, err
 
-        result = subprocess.run(
-            ["powershell", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-            capture_output=True, text=True, encoding='utf-8', errors='replace'
-        )
+            all_rows.extend(page_rows)
+            if len(page_rows) < _JAO_PAGE_SIZE:
+                if page > 0:
+                    log_func(f"  {date_str}: fetched {len(all_rows)} rows "
+                             f"across {page + 1} page(s)")
+                return all_rows, None
+            skip += _JAO_PAGE_SIZE
 
-        raw_out = result.stdout.strip()
-        if not raw_out or raw_out.startswith("PS_ERROR"):
-            return None, raw_out
-        if raw_out == "EMPTY_CONTENT":
-            return [], None
-
-        return json.loads(raw_out).get("data", []), None
+        return all_rows, (f"stopped after {_JAO_MAX_PAGES} pages "
+                           f"({len(all_rows)} rows) without a final short "
+                           f"page — data may still be incomplete")
     except Exception as e:
         return None, str(e)
 
@@ -309,7 +364,14 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
                 status_cb(f"  Failed: {d_str} ({err})")
         else:
             all_data.extend(batch)
-            if status_cb:
+            if err:
+                # Partial success: some pages came back before a failure or
+                # the page-count cap was hit. Don't report this the same as
+                # a clean "OK" -- the day's data may be incomplete.
+                failed_dates.append(f"{d_str} (partial: {err})")
+                if status_cb:
+                    status_cb(f"  ⚠ PARTIAL: {d_str} ({len(batch)} records, {err})")
+            elif status_cb:
                 status_cb(f"  OK: {d_str} ({len(batch)} records)")
 
     if params.get('shadow_price_filter') == 'positive':
@@ -559,6 +621,22 @@ class App:
             return float(v)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _safe_float_flagged(d: dict, key: str) -> tuple[float, bool]:
+        """Like _safe_float, but also reports whether the value was actually
+        missing/unparseable rather than a genuine 0 — the two are
+        indistinguishable once collapsed into a single float, and a missing
+        PTDF/shadow-price field (a typo'd zone code, or a CNEC row that
+        simply lacks that column) silently produces a plausible-looking
+        fabricated number if treated as 0 without this distinction."""
+        v = d.get(key)
+        if v is None or v == '':
+            return 0.0, True
+        try:
+            return float(v), False
+        except (TypeError, ValueError):
+            return 0.0, True
 
     @staticmethod
     def _np_headers(token: str) -> dict:
@@ -1484,6 +1562,24 @@ class App:
         try:
             with open(path, mode='r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
+                fieldnames = set(reader.fieldnames or [])
+                # Validate up front rather than let a missing column "load
+                # successfully" (badge shows N records) and only fail later,
+                # far from the actual cause, when a graph view does raw
+                # dict indexing on 'date'/'time'.
+                missing = []
+                if 'cneName' not in fieldnames:
+                    missing.append('cneName')
+                if 'dateTimeUtc' not in fieldnames and not {'date', 'time'} <= fieldnames:
+                    missing.append("dateTimeUtc' (or both 'date' and 'time')")
+                if missing:
+                    messagebox.showerror(
+                        "Missing required column(s)",
+                        f"This CSV is missing: {', '.join(missing)}.\n\n"
+                        f"Columns found: {', '.join(sorted(fieldnames)) or '(none)'}\n\n"
+                        f"'cneName' and either 'dateTimeUtc' or both 'date'+'time' "
+                        f"are required to load and display this data.")
+                    return
                 loaded_data = []
                 for row in reader:
                     for key in list(row.keys()):
@@ -1538,24 +1634,35 @@ class App:
         z_t = self.zone_to_entry.get()
 
         self.analysis_tree.delete(*self.analysis_tree.get_children())
-        rows, total = [], 0.0
+        rows, total, n_missing = [], 0.0, 0
         for d in self.raw_filtered_data:
             if str(d.get('date')) == d_str and d.get('time') == t_str:
-                sp     = self._safe_float(d, 'shadowPrice')
-                pf     = self._safe_float(d, f'ptdf_{z_f}')
-                pt     = self._safe_float(d, f'ptdf_{z_t}')
+                sp, sp_missing = self._safe_float_flagged(d, 'shadowPrice')
+                pf, pf_missing = self._safe_float_flagged(d, f'ptdf_{z_f}')
+                pt, pt_missing = self._safe_float_flagged(d, f'ptdf_{z_t}')
+                if sp_missing or pf_missing or pt_missing:
+                    # A missing field is NOT the same as a genuine 0 — don't
+                    # fold it into the total or display a fabricated impact
+                    # number for this row (see _safe_float_flagged).
+                    n_missing += 1
+                    rows.append((d.get('cneName'), d.get('biddingZoneFrom'),
+                                 d.get('biddingZoneTo'), None, None, None, None))
+                    continue
                 impact = sp * (pf - pt)
                 total += impact
                 rows.append((d.get('cneName'), d.get('biddingZoneFrom'),
                              d.get('biddingZoneTo'), sp, pf, pt, impact))
-        rows.sort(key=lambda r: abs(r[6]), reverse=True)
+        rows.sort(key=lambda r: abs(r[6]) if r[6] is not None else -1, reverse=True)
         for row_idx, (cne, zf, zt, sp, pf, pt, impact) in enumerate(rows):
             tag = 'evenrow' if row_idx % 2 == 0 else 'oddrow'
+            fmt = lambda v: f"{v:.4f}" if v is not None else "n/a"
             self.analysis_tree.insert('', tk.END, tags=(tag,),
-                values=(cne, zf, zt,
-                        f"{sp:.4f}", f"{pf:.4f}", f"{pt:.4f}", f"{impact:.4f}"))
+                values=(cne, zf, zt, fmt(sp), fmt(pf), fmt(pt), fmt(impact)))
         self.total_impact_var.set(f"{total:.4f}")
-        self._set_status(f"{len(rows)} CNECs shown  |  {d_str}  {t_str}  |  {z_f} → {z_t}")
+        status = f"{len(rows)} CNECs shown  |  {d_str}  {t_str}  |  {z_f} → {z_t}"
+        if n_missing:
+            status += f"  |  ⚠ {n_missing} row(s) excluded from total: missing data"
+        self._set_status(status)
         self._refresh_cnec_selector()
 
     def _show_all_histories(self):
@@ -1592,11 +1699,20 @@ class App:
         sp        = [self._safe_float(d, 'shadowPrice') for d in data]
         rams      = [self._safe_float(d, 'ram')         for d in data]
         fall_data = [self._safe_float(d, 'fall')        for d in data]
-        pf_l      = [self._safe_float(d, f'ptdf_{z_f}') for d in data]
-        pt_l      = [self._safe_float(d, f'ptdf_{z_t}') for d in data]
+        pf_flagged = [self._safe_float_flagged(d, f'ptdf_{z_f}') for d in data]
+        pt_flagged = [self._safe_float_flagged(d, f'ptdf_{z_t}') for d in data]
+        pf_l      = [v for v, _ in pf_flagged]
+        pt_l      = [v for v, _ in pt_flagged]
         imps      = [s * (f - t) for s, f, t in zip(sp, pf_l, pt_l)]
         diffs     = [f - t       for f, t     in zip(pf_l, pt_l)]
         fall_missing = all(v == 0.0 for v in fall_data)
+        # "Missing across every row" is a stronger, safer claim than "all
+        # zero" here (a genuinely zero PTDF is physically plausible for a
+        # CNEC far from the src/tgt zone; a column that's simply absent from
+        # the dataset is not) -- distinguish the two rather than silently
+        # plotting a fabricated flat-zero line for an absent field.
+        pf_missing = all(m for _, m in pf_flagged) if pf_flagged else False
+        pt_missing = all(m for _, m in pt_flagged) if pt_flagged else False
 
         # ── Tab 3 ──────────────────────────────────────────────────
         self.fig3.clear()
@@ -1629,7 +1745,8 @@ class App:
         a1.fill_between(x_idx, imps, alpha=0.1, color=C_PURPLE)
         a1.axhline(0, color=C_BORDER, linewidth=0.9, linestyle='--')
         a1.set_ylabel("€/MWh", fontsize=8.5)
-        a1.set_title("Price Impact")
+        a1.set_title("Price Impact" + ("  ⚠ derived from a missing PTDF field"
+                                        if ptdf_missing else ""))
         a1.set_xticks(list(x_idx)); a1.set_xticklabels(xs)
         self._setup_ax(a1, xs)
         self._legend(a1)
@@ -1638,7 +1755,10 @@ class App:
         a2.plot(x_idx, pt_l,  color=C_AMBER,   linewidth=1.5, label=z_t)
         a2.plot(x_idx, diffs, color=C_MUTED,   linewidth=1.0, linestyle='--', label='Δ PTDF')
         a2.set_ylabel("PTDF", fontsize=8.5)
-        a2.set_title("PTDF")
+        ptdf_missing = pf_missing or pt_missing
+        ptdf_title = "PTDF" + ("  ⚠ field absent for one or both zones — shown as 0"
+                                if ptdf_missing else "")
+        a2.set_title(ptdf_title, color=(C_AMBER if ptdf_missing else C_ACCENT))
         a2.set_xticks(list(x_idx)); a2.set_xticklabels(xs)
         self._setup_ax(a2, xs)
         self._legend(a2)
@@ -2533,14 +2653,22 @@ class App:
         end_raw   = self._ma_ent_end.get().strip()
         src       = self._ma_src_country.get()
         try:
-            s_cet = datetime.strptime(start_raw, "%Y-%m-%d %H:%M").replace(tzinfo=_CET)
-            e_cet = datetime.strptime(end_raw,   "%Y-%m-%d %H:%M").replace(tzinfo=_CET)
-        except ValueError:
+            # Delegate to propagation.cet_input_to_utc rather than
+            # re-parsing with datetime.replace(tzinfo=_CET) here: that
+            # local reimplementation used fold=0 (extend the pre-transition
+            # offset) for a nonexistent spring-forward local time, while
+            # propagation.py uses pandas' nonexistent="shift_forward" (skip
+            # past the gap) -- two DIFFERENT, silently divergent answers for
+            # the same typed string on the one hour/year this matters.
+            # Calling the same function both GUIs already depend on for
+            # every other CET conversion makes them agree by construction
+            # instead of by manually keeping two implementations in sync.
+            start_utc = self._prop.cet_input_to_utc(start_raw).strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_utc   = self._prop.cet_input_to_utc(end_raw).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except (ValueError, TypeError):
             messagebox.showerror("Date Error",
                 "Enter dates as  YYYY-MM-DD HH:MM  (CET local time).")
             return
-        start_utc = s_cet.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_utc   = e_cet.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._ma_outage_status.config(text="Fetching from ENTSO-E…", foreground=C_AMBER)
         self.root.update_idletasks()
 
@@ -2615,6 +2743,14 @@ class App:
         self._update_status(f"[Tab9] {msg}")
 
     def _ma_run_pipeline(self):
+        # Same reentrancy guard as _ma_apply_setup: disabling the button is
+        # not itself atomic with the click handler running, so a fast
+        # double-invocation could otherwise start two worker threads that
+        # both write self._ma_covariates/_ma_results/_ma_verdicts, letting
+        # _ma_on_result_select later pair verdicts from one run with
+        # regression detail from a different one.
+        if getattr(self, '_ma_pipeline_running', False):
+            return
         if self._ma_jao_df is None:
             messagebox.showwarning("Run", "Apply Setup first.")
             return
@@ -2624,6 +2760,7 @@ class App:
         if not self._prop:
             messagebox.showerror("Run", "propagation module not available.")
             return
+        self._ma_pipeline_running = True
         self._ma_run_btn.config(state=tk.DISABLED, text="Running…")
         self._ma_progress.start(10)
         self._ma_log.config(state='normal')
@@ -2731,6 +2868,7 @@ class App:
             self.root.after(0, self._ma_pipeline_done, False)
 
     def _ma_pipeline_done(self, ok):
+        self._ma_pipeline_running = False
         self._ma_run_btn.config(state=tk.NORMAL, text="▶  Run Full Pipeline")
         self._ma_progress.stop()
         if ok:

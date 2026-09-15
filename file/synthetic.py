@@ -151,8 +151,22 @@ def _interval_active_simple(times: np.ndarray, starts: np.ndarray,
 
 def generate_jao_csv(start: datetime, end: datetime,
                      outages: pd.DataFrame,
-                     out_path: str, rng_seed: int = 7) -> pd.DataFrame:
-    """Generate a synthetic JAO CSV with realistic FB params and embedded outage effects."""
+                     out_path: str, rng_seed: int = 7,
+                     effect_scale: float = 1.0) -> pd.DataFrame:
+    """Generate a synthetic JAO CSV with realistic FB params and embedded outage effects.
+
+    effect_scale: multiplier on the OUTAGE-INDUCED terms only (not the
+    baseline noise/diurnal/weekly/CNEC-bias terms). The default (1.0)
+    plants effects on the order of the whole FRM margin (~80 MW HVDC jump
+    against a ~65-180 MW frm_base) -- large enough to make the estimation
+    machinery easy to validate, but not representative of the small,
+    topologically-expected effect a non-adjacent zone pair like FI/NO3
+    should actually produce in practice (see H1/H2 economic-significance
+    discussion in propagation.py). Pass e.g. effect_scale=0.1 to generate a
+    small-effect scenario for testing whether the pipeline can still detect
+    (or correctly fails to detect) an economically realistic signal, rather
+    than only ever validating against an oversized one.
+    """
     rng = _seed(rng_seed)
     if start.tzinfo is None: start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo   is None: end   = end.replace(tzinfo=timezone.utc)
@@ -218,13 +232,13 @@ def generate_jao_csv(start: datetime, end: datetime,
         # that check a real test again.
         fall = (rng.normal(0, 30, n)                   # noise
               + diurnal + weekly                       # patterns
-              + 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
-              + 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
-              + 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
+              + effect_scale * 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
+              + effect_scale * 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
+              + effect_scale * 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
         fall += rng.uniform(-30, 30)  # CNEC-specific bias
 
         # PTDF_FI shifts only during AC line outages (small magnitude)
-        ptdf_FI = ptdf_FI_base + 0.025 * is_ac * np.sign(ptdf_FI_base) * (-1) \
+        ptdf_FI = ptdf_FI_base + effect_scale * 0.025 * is_ac * np.sign(ptdf_FI_base) * (-1) \
                   + rng.normal(0, 0.001, n)
 
         # FI_FS PTDF collapses to ~0 during HVDC outage on Fenno-Skan
@@ -251,7 +265,8 @@ def generate_jao_csv(start: datetime, end: datetime,
         faac = rng.uniform(0, 5, n)
 
         # IVA: more frequent during forced outages, especially HVDC forced
-        iva_prob = 0.01 + 0.10 * is_forced + 0.15 * (is_hvdc * is_forced)
+        # (0.01 baseline rate is not outage-induced and is left unscaled)
+        iva_prob = 0.01 + effect_scale * (0.10 * is_forced + 0.15 * (is_hvdc * is_forced))
         iva_active = rng.uniform(0, 1, n) < iva_prob
         iva = np.where(iva_active, rng.uniform(20, 150, n), 0.0)
 
@@ -315,8 +330,13 @@ def generate_jao_csv(start: datetime, end: datetime,
 
 
 def generate_demo_dataset(out_dir: str, days: int = 90,
-                          rng_seed: int = 7) -> dict:
-    """Generate both a synthetic JAO CSV and a synthetic outage CSV."""
+                          rng_seed: int = 7, effect_scale: float = 1.0) -> dict:
+    """Generate both a synthetic JAO CSV and a synthetic outage CSV.
+
+    effect_scale: forwarded to generate_jao_csv() -- 1.0 (default) plants
+    large, easy-to-detect outage effects; pass a smaller value (e.g. 0.1)
+    to generate a small, economically-realistic-effect scenario instead.
+    """
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     end = datetime(2025, 3, 1, tzinfo=timezone.utc)
     start = end - timedelta(days=days)
@@ -326,7 +346,8 @@ def generate_demo_dataset(out_dir: str, days: int = 90,
     outages.to_csv(outages_path, index=False)
 
     jao_path = str(out / "synthetic_jao.csv")
-    jao = generate_jao_csv(start, end, outages, jao_path, rng_seed=rng_seed)
+    jao = generate_jao_csv(start, end, outages, jao_path, rng_seed=rng_seed,
+                           effect_scale=effect_scale)
 
     return {"jao_path": jao_path, "outages_path": outages_path,
             "jao_rows": len(jao), "outage_events": len(outages),

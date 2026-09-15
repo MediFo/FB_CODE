@@ -16,9 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-regression = ["statsmodels>=0.14", "linearmodels>=6.0"]
+# scipy is already a transitive dependency of statsmodels/linearmodels, but
+# is listed explicitly since propagation.py imports scipy.stats.chi2 directly
+# (event-study pre-trend joint Wald test).
+regression = ["statsmodels>=0.14", "linearmodels>=6.0", "scipy>=1.10"]
 entsoe     = ["entsoe-py>=0.6"]
-dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-py>=0.6"]
+dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-py>=0.6", "scipy>=1.10"]
 
 [project.scripts]
 fi-no3-analyse = "fi_no3.propagation:main_cli"

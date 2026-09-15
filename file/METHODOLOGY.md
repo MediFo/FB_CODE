@@ -15,10 +15,11 @@ updated code.
 Actions and Other adjustments). This is the FRA term in the Nordic CCM formula.
 Without it, every RAM reconstruction was 300–400 MW wrong.
 
-**Correct Nordic RAM formula (from JAO Nordic Publication Handbook v1.5):**
+**Nordic RAM formula as implemented (and self-checked against the CSV, see
+below):**
 
 ```
-RAM = Fmax − FRM − Fref + fnrao + AMR − AAC − IVA
+RAM = Fmax − FRM − fall + fnrao + AMR − AAC − IVA
 ```
 
 Where:
@@ -26,23 +27,37 @@ Where:
 |----------|---------|
 | `fmax`   | Thermal rating of the CNE (MW) |
 | `frm`    | Flow Reliability Margin — statistical, backward-looking (MW) |
-| `fref`   | Reference flow at CGMA NP — the pre-calculated F0 (MW) |
+| `fall`   | F_allReference — the reference-flow term that actually enters the RAM formula (MW) |
 | `fnrao`  | Flow from Non-costly RAs / FRA — remedial action capacity (MW) |
 | `amr`    | Adjustment for Minimum RAM — ensures RAM ≥ 0 (MW) |
 | `aac`    | Already Allocated Capacity (FAAC) — pre-allocated reserves (MW) |
 | `iva`    | Individual Validation Adjustment — TSO discretionary (MW) |
-| `fall`   | Reference flow at the line limit — NOT an input to RAM |
+| `fref`   | Reference flow at CGMA NP — a DIFFERENT quantity, NOT an input to RAM (see note below) |
 
-**Note on f0 vs fref.** In the JAO export, `fref` and what JAO labels `f0`
-are numerically identical (correlation = 1.000, max |diff| = 0.0 MW). The
-JAO publication tool exports the CGMA-NP reference flow as both fields. The
-theoretical distinction (F0 at zero NP vs Fref at CGMA NP) requires per-MTU
-net-position data not available in the shadow-price CSV. For all analysis
-purposes, `fref` is the correct dependent variable and outage-propagation proxy.
+**Note on `fref`/`f0` vs `fall` — evidentiary basis, stated plainly.** An
+earlier draft of this document used `fref` in the formula above; that was
+wrong and has been corrected. The basis for preferring `fall` is:
+1. `fall` is what the code's own `build_covariates()` RAM self-check
+   verifies against the `ram` column present in a real JAO export — it
+   balances to within 1 MW on essentially every row (see "Fix applied"
+   below), which `fref` does not.
+2. On this project's own sample, `fref` and what JAO labels `f0` were found
+   to be numerically identical (correlation = 1.000, max |diff| = 0.0 MW).
+   **This is an empirical observation on one dataset, not a citation to the
+   JAO Nordic Publication Handbook** — it does not by itself prove `fref`/
+   `f0` are the wrong RAM input or that `fall` is the right one; it only
+   shows `fref` and `f0` track each other. The RAM-formula self-check in
+   point 1 is the actual evidence for using `fall`. If you have access to a
+   current JAO Nordic Publication Handbook, verify the "F_allReference" vs
+   "reference flow at CGMA NP" definitions against it directly before
+   treating this as settled for a new dataset or a different JAO schema
+   version — a schema change could make a formula that still numerically
+   "balances" nonetheless label the wrong field as `fall`.
 
 **Fix applied:** The pipeline now uses `fnrao` as `fra`, and the RAM formula
-is verified to balance before proceeding. A `verify_ram_formula()` function
-is added that reports percentage of rows within 1 MW tolerance.
+is verified to balance before proceeding (see `build_covariates()`'s
+`ram_check` in propagation.py, which reports the percentage of rows within
+1 MW tolerance and warns when it drops below 95%).
 
 ---
 
@@ -95,9 +110,9 @@ for `fall_signed` means "the outage loads the CNE in the congested direction
 for CNECs where FI normally loads that direction" — which is the correct
 physical hypothesis.
 
-**Note on `fref` / `f0` vs `fall`:** `fref` (identical to `f0` in JAO exports)
-is the flow at CGMA NP — it is NOT the reference flow in the RAM formula.
-`fall` (F_allReference) is the correct term. See Issue 1 for full details.
+**Note on `fref` / `f0` vs `fall`:** see Issue 1 for the full RAM-formula
+term list and the evidentiary basis for using `fall` (not `fref`) as the
+reference-flow input.
 
 ---
 

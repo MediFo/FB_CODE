@@ -117,6 +117,55 @@ class TestDataLoading:
         assert "faac"   in loaded.columns
 
 
+class TestSyntheticEffectScale:
+    """generate_jao_csv's effect_scale lets a caller shrink the planted
+    outage effects toward an economically realistic magnitude instead of
+    only ever validating detection against an oversized signal (the
+    default effect_scale=1.0 plants an ~80 MW HVDC jump against a
+    ~65-180 MW frm_base -- comparable to the whole structural margin)."""
+
+    def test_smaller_effect_scale_shrinks_hvdc_outage_impact_on_fall(self, tmp_path):
+        from synthetic import generate_outage_events, generate_jao_csv
+        start = pd.Timestamp("2025-01-01", tz="UTC").to_pydatetime()
+        end   = pd.Timestamp("2025-02-01", tz="UTC").to_pydatetime()
+        outages = generate_outage_events(start, end, rng_seed=1)
+
+        big   = generate_jao_csv(start, end, outages,
+                                 str(tmp_path / "big.csv"),   rng_seed=99, effect_scale=1.0)
+        small = generate_jao_csv(start, end, outages,
+                                 str(tmp_path / "small.csv"), rng_seed=99, effect_scale=0.1)
+
+        # Same rng_seed for both calls, and effect_scale only multiplies
+        # existing additive terms rather than adding/removing any rng.*()
+        # calls -- so every underlying noise draw is IDENTICAL between the
+        # two runs, and (fall_big - fall_small) is exactly the scaled-down
+        # portion of the outage-induced terms alone. That makes this an
+        # exact, deterministic check rather than a noisy statistical one.
+        merged = big[["dateTimeUtc", "cneName", "fall"]].merge(
+            small[["dateTimeUtc", "cneName", "fall"]],
+            on=["dateTimeUtc", "cneName"], suffixes=("_big", "_small"))
+        assert not merged.empty
+        diff = (merged["fall_big"] - merged["fall_small"]).abs()
+        # The largest single term is the HVDC jump: 80 MW * (1.0 - 0.1) = 72 MW
+        # for rows where an HVDC outage is active.
+        assert diff.max() > 30, (
+            f"expected a large difference from the HVDC-outage term "
+            f"(~72 MW at effect_scale 1.0 vs 0.1), got max diff={diff.max():.2f}")
+        # Most rows have no outage active at all, so should be unaffected.
+        assert (diff < 1e-9).mean() > 0.5, (
+            "most non-outage-active rows should be identical between the two "
+            "effect_scale runs")
+
+    def test_effect_scale_forwarded_through_generate_demo_dataset(self, tmp_path):
+        info_small = generate_demo_dataset(str(tmp_path / "small"), days=30,
+                                           rng_seed=5, effect_scale=0.1)
+        info_big   = generate_demo_dataset(str(tmp_path / "big"), days=30,
+                                           rng_seed=5, effect_scale=1.0)
+        small_df = load_jao_csv(info_small["jao_path"])
+        big_df   = load_jao_csv(info_big["jao_path"])
+        assert big_df["fall"].std() > small_df["fall"].std()
+
+
 # ── 2. NO3 filtering ─────────────────────────────────────────────────────────
 
 class TestNO3Filter:

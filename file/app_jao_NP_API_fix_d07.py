@@ -1,3 +1,20 @@
+"""
+SUPERSEDED -- reference only. Do not run or import this file.
+
+d14 (app_jao_NP_API_fix_d14.py) is the current, complete, maintained
+extended GUI in this package; this file is an earlier iteration kept
+alongside it purely as historical reference (see CLAUDE.md's file
+layout). Known issues specific to this superseded copy, not fixed here:
+  - It may still contain a "market-coupling" / "EUPHEMIA welfare-maximizing
+    MILP" / price-impact-derivation panel that reads as re-simulating the
+    day-ahead market clearing algorithm. It does not do that, and never
+    did -- this tool (in every version) only reads already-published
+    Nordic FBMC parameters. See README.md's scope disclaimer, which
+    reflects d14's actual, accurate behaviour, not necessarily this file's.
+  - Nord Pool / ENTSO-E credentials below are hardcoded, exactly as in
+    d14 -- see CLAUDE.md's "Known limitations" for the accepted,
+    out-of-scope status of that.
+"""
 import csv
 import json
 import os
