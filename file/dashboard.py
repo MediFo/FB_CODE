@@ -196,6 +196,20 @@ class App:
                   style="Hint.TLabel", wraplength=900).grid(
             row=1, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
+        ttk.Label(self.real_frame, text="dateTimeUtc column is actually in:").grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
+        self.jao_timestamp_zone = tk.StringVar(value="UTC")
+        ttk.Combobox(self.real_frame, textvariable=self.jao_timestamp_zone,
+                    values=["UTC", "CET"], state="readonly", width=6).grid(
+            row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(self.real_frame,
+                  text=("Leave at UTC unless outage/event timing looks consistently "
+                        "off by exactly 1h (winter) or 2h (summer) — JAO's own "
+                        "Publication Handbook notes this field can actually be CET. "
+                        "Only affects this Real JAO CSV path, not Synthetic data."),
+                  style="Hint.TLabel", wraplength=760).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(6, 0))
+
         # --- Synthetic block ---
         self.syn_frame = ttk.LabelFrame(f, text="Synthetic data", padding=10)
         self.syn_frame.grid(row=3, column=0, columnspan=3, sticky="ew",
@@ -372,7 +386,8 @@ class App:
             messagebox.showinfo("Pick a file", "Select a JAO CSV first.")
             return
         try:
-            df = pipe.load_jao_csv(path, log_cb=self._log)
+            df = pipe.load_jao_csv(path, log_cb=self._log,
+                                   jao_timestamp_zone=self.jao_timestamp_zone.get())
         except Exception as e:
             messagebox.showerror("Load failed", f"{e}")
             return
@@ -753,6 +768,7 @@ class App:
                 use_manual=self.use_manual.get(),
                 source_country=self.source_country.get().strip().upper() or "FI",
                 target_zone=self.target_zone.get().strip().upper() or "NO3",
+                jao_timestamp_zone=self.jao_timestamp_zone.get(),
             )
             self._log(f"Analysis scope: source={cfg.source_country}  target={cfg.target_zone}")
             res = pipe.run_pipeline(cfg, jao_df=self.jao_df,

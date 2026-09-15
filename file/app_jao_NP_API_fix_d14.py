@@ -139,6 +139,22 @@ def _utc_to_cet(ts: str) -> datetime:
     return datetime.fromisoformat(s).astimezone(_CET)
 
 
+def _jao_ts_to_cet(ts: str, source_tz: str = "UTC") -> datetime:
+    """Like _utc_to_cet, but source_tz="CET" treats `ts` as ALREADY CET/CEST
+    wall-clock (mirrors propagation.jao_datetime_to_utc's source_tz="CET"
+    path for this pandas-free file — see that function's docstring for why
+    this exists: JAO's own Nordic Publication Handbook documents that its
+    "dateTimeUtc" field can actually be CET despite the name). Any trailing
+    Z/offset is stripped first -- left in place it would be trusted as a
+    genuine UTC marker and mask the real CET reading underneath -- then the
+    remaining wall-clock digits are used as-is (no conversion: they're
+    already CET)."""
+    if source_tz.upper() == "CET":
+        s = _OFFSET_RE.sub('', ts.strip())
+        return datetime.fromisoformat(s).replace(tzinfo=_CET)
+    return _utc_to_cet(ts)
+
+
 def _cet_key(dt: datetime) -> str:
     """Return the 'YYYYMMDD_HH:MM' key used throughout for CET-aligned look-ups."""
     return f"{dt.strftime('%Y%m%d')}_{dt.strftime('%H:%M')}"
@@ -256,7 +272,51 @@ def _fetch_one_page(api_url, log_func):
         return None, f"could not parse JAO response as JSON: {e}"
 
 
-def fetch_day_via_powershell(date_str, log_func):
+def _check_jao_tz_assumption(date_str, rows, source_tz, log_func):
+    """Cross-check the jao_timestamp_zone setting against the data actually
+    returned for a day whose CET calendar-date boundaries we know exactly
+    (we built the request FromUtc/ToUtc from them). Genuine UTC data for a
+    CET calendar day never starts near 00:00 raw -- it starts 1h (winter) or
+    2h (summer/CEST) "into" the previous UTC day, i.e. ~22:00 or ~23:00.
+    Data that is actually CET but mislabeled "dateTimeUtc" (JAO's own Nordic
+    Publication Handbook v1.7 documents this — see jao_datetime_to_utc in
+    propagation.py) starts essentially exactly at 00:00, since that's the
+    literal CET request echoed back under the wrong label. This can't prove
+    which is true with certainty, but the two patterns are cleanly
+    distinguishable in every season, so a mismatch with the CURRENT setting
+    is worth surfacing rather than silently trusting either assumption."""
+    times = []
+    for r in rows:
+        v = r.get("dateTimeUtc")
+        if not v:
+            continue
+        try:
+            s = v.strip()
+            s = s[:-1] + "+00:00" if s.endswith("Z") else s
+            times.append(datetime.fromisoformat(s))
+        except Exception:
+            continue
+    if not times:
+        return
+    earliest = min(times)
+    starts_near_midnight = earliest.hour == 0 and earliest.minute < 30
+    if starts_near_midnight and source_tz.upper() == "UTC":
+        log_func(f"  ⚠ TIMEZONE CHECK for {date_str}: earliest returned dateTimeUtc "
+                 f"is {earliest.strftime('%H:%M')} -- genuine UTC data for a CET "
+                 f"calendar day should start ~22:00-23:00 the PREVIOUS day, not "
+                 f"~00:00 the same day. This matches JAO's own documented "
+                 f"\"dateTimeUtc is actually CET\" quirk. Current setting is UTC; "
+                 f"if outage/event alignment looks off by 1-2h, switch the "
+                 f"timestamp-zone option to CET.")
+    elif not starts_near_midnight and source_tz.upper() == "CET":
+        log_func(f"  ⚠ TIMEZONE CHECK for {date_str}: earliest returned dateTimeUtc "
+                 f"is {earliest.strftime('%H:%M')}, consistent with genuine UTC "
+                 f"(not the ~00:00 start expected if it were mislabeled CET). "
+                 f"Current setting is CET -- this data may actually be genuine "
+                 f"UTC; double check before trusting the CET-corrected results.")
+
+
+def fetch_day_via_powershell(date_str, log_func, source_tz="UTC"):
     """Fetch one full calendar day (CET), paginating in `take`-sized pages
     until a short (or empty) page comes back. A full Nordic CNEC set at 96
     MTUs/day can comfortably exceed one 15,000-row page; trusting a single
@@ -304,9 +364,11 @@ def fetch_day_via_powershell(date_str, log_func):
                 if page > 0:
                     log_func(f"  {date_str}: fetched {len(all_rows)} rows "
                              f"across {page + 1} page(s)")
+                _check_jao_tz_assumption(date_str, all_rows, source_tz, log_func)
                 return all_rows, None
             skip += _JAO_PAGE_SIZE
 
+        _check_jao_tz_assumption(date_str, all_rows, source_tz, log_func)
         return all_rows, (f"stopped after {_JAO_MAX_PAGES} pages "
                            f"({len(all_rows)} rows) without a final short "
                            f"page — data may still be incomplete")
@@ -344,6 +406,9 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
             status_cb(f"ERROR: Invalid date range: {e}")
         return []
 
+    jao_timestamp_zone = params.get('jao_timestamp_zone', 'UTC')
+    _log = status_cb if status_cb else (lambda m: None)
+
     all_data = []
     total_days = len(date_list)
     failed_dates = []
@@ -357,7 +422,10 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
         if progress_cb:
             progress_cb(day_num, total_days)
 
-        batch, err = fetch_day_via_powershell(d_str, lambda m: None)
+        # Was `lambda m: None` -- silently dropped every per-page message
+        # AND the timezone-assumption diagnostic below, which needs to
+        # actually reach the user to be of any use.
+        batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
         if batch is None:
             failed_dates.append(d_str)
             if status_cb:
@@ -387,7 +455,7 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
 
     for entry in all_data:
         if entry.get('dateTimeUtc'):
-            cet_dt = _utc_to_cet(entry['dateTimeUtc'])
+            cet_dt = _jao_ts_to_cet(entry['dateTimeUtc'], jao_timestamp_zone)
             entry['date'] = cet_dt.strftime('%Y%m%d')
             entry['time'] = cet_dt.strftime('%H:%M:%S')
 
@@ -735,6 +803,18 @@ class App:
         ttk.Radiobutton(settings_row, text="Shadow Price > 0",
                         variable=self.shadow_price_filter_var, value="positive"
                         ).grid(row=0, column=0, sticky='w')
+
+        tz_f = ttk.Frame(settings_row, style='Card.TFrame')
+        tz_f.grid(row=1, column=0, columnspan=3, sticky='w', pady=(8, 0))
+        ttk.Label(tz_f, text="JAO's dateTimeUtc is actually in:").pack(side=tk.LEFT)
+        self.jao_timestamp_zone_var = tk.StringVar(value="UTC")
+        ttk.Combobox(tz_f, textvariable=self.jao_timestamp_zone_var,
+                    values=["UTC", "CET"], state="readonly", width=6
+                    ).pack(side=tk.LEFT, padx=(6, 8))
+        ttk.Label(tz_f, style='Muted.TLabel',
+                  text=("leave at UTC unless outage timing is consistently "
+                        "1-2h off — JAO's own Handbook notes this field can "
+                        "actually be CET")).pack(side=tk.LEFT)
 
         fn_f = ttk.Frame(settings_row, style='Card.TFrame')
         fn_f.grid(row=0, column=1, sticky='w', padx=20)
@@ -1521,10 +1601,10 @@ class App:
         self.fig7.tight_layout(pad=2.0)
         self._add_toolbar(self.canvas7, self.toolbar_f7)
 
-    def _apply_cet_conversion(self, data):
+    def _apply_cet_conversion(self, data, source_tz: str = "UTC"):
         for entry in data:
             if entry.get('dateTimeUtc'):
-                cet_dt = _utc_to_cet(entry['dateTimeUtc'])
+                cet_dt = _jao_ts_to_cet(entry['dateTimeUtc'], source_tz)
                 entry['date'] = cet_dt.strftime('%Y%m%d')
                 entry['time'] = cet_dt.strftime('%H:%M:%S')
         return data
@@ -1590,7 +1670,8 @@ class App:
                             except (TypeError, ValueError):
                                 row[key] = 0.0
                     loaded_data.append(row)
-            self.raw_filtered_data = self._apply_cet_conversion(loaded_data)
+            self.raw_filtered_data = self._apply_cet_conversion(
+                loaded_data, self.jao_timestamp_zone_var.get())
             name = os.path.basename(path)
             self.upload_label.config(text=f"✓  {name}", foreground=C_GREEN)
             self._update_status(f"Loaded {len(self.raw_filtered_data):,} records  ←  {name}")
@@ -1787,7 +1868,8 @@ class App:
             'start_cet':           f"{self.start_date_entry.get()}T00:00:00",
             'end_cet':             f"{self.end_date_entry.get()}T00:00:00",
             'output_file':         os.path.join(self.save_folder, self.filename_entry.get()),
-            'shadow_price_filter': self.shadow_price_filter_var.get()
+            'shadow_price_filter': self.shadow_price_filter_var.get(),
+            'jao_timestamp_zone':  self.jao_timestamp_zone_var.get(),
         }
         self.run_button.config(state=tk.DISABLED, text="⏳  Fetching…")
         self._fetch_progress['value'] = 0
@@ -2273,6 +2355,23 @@ class App:
         self._ma_setup_status = ttk.Label(src_f, text="", style='Muted.TLabel')
         self._ma_setup_status.pack(anchor='w', pady=(6,0))
 
+        tz_row = ttk.Frame(src_f, style='Card.TFrame')
+        tz_row.pack(anchor='w', pady=(6,0))
+        ttk.Label(tz_row, text="JAO's dateTimeUtc is actually in:").pack(side=tk.LEFT)
+        # Independent from Tab 1's own toggle -- this tab re-reads Tab 1's
+        # raw data through propagation.load_jao_csv on every Apply Setup, so
+        # you can try a different timestamp assumption here for analysis
+        # without needing to re-fetch on Tab 1. Only applies to the "Use
+        # data loaded in Tab 1" source; the synthetic generator always
+        # produces genuine UTC.
+        self._ma_jao_timestamp_zone = tk.StringVar(value="UTC")
+        ttk.Combobox(tz_row, textvariable=self._ma_jao_timestamp_zone,
+                    values=["UTC", "CET"], state="readonly", width=6
+                    ).pack(side=tk.LEFT, padx=(6,8))
+        ttk.Label(tz_row, style='Muted.TLabel',
+                  text="independent of Tab 1's setting; only used when source is Tab 1 data"
+                  ).pack(side=tk.LEFT)
+
         # Analysis scope
         scope_f = ttk.LabelFrame(f, text=" Analysis Scope ", padding=12)
         scope_f.pack(fill=tk.X, pady=(0,10))
@@ -2461,11 +2560,18 @@ class App:
         self._ma_apply_wait_lbl.config(text="⏳  Please wait…")
         self.root.update_idletasks()
 
+        # Read the StringVar on the main thread, same as mode/out_dir above --
+        # not from inside the worker thread, where a Tk variable read is not
+        # guaranteed safe.
+        jao_timestamp_zone = self._ma_jao_timestamp_zone.get()
         threading.Thread(target=self._ma_apply_setup_thread,
-                         args=(mode, out_dir), daemon=True).start()
+                         args=(mode, out_dir, jao_timestamp_zone), daemon=True).start()
 
-    def _ma_apply_setup_thread(self, mode, out_dir):
-        """Worker: runs setup in background, posts result to main thread."""
+    def _ma_apply_setup_thread(self, mode, out_dir, jao_timestamp_zone="UTC"):
+        """Worker: runs setup in background, posts result to main thread.
+        jao_timestamp_zone is read from the StringVar on the main thread by
+        the caller and passed in explicitly -- not re-read here, since a Tk
+        variable read from a background thread is not guaranteed safe."""
         import pandas as pd
         result = {"ok": False, "msg": "", "kind": "info",
                   "jao_df": None, "outages_df": None,
@@ -2510,7 +2616,13 @@ class App:
                 if self._prop:
                     tmp_path = os.path.join(out_dir, '_tab1_tmp.csv')
                     df.to_csv(tmp_path, index=False)
-                    jao_df = self._prop.load_jao_csv(tmp_path)
+                    # Tab 9's OWN timestamp-zone setting, independent of
+                    # Tab 1's -- this re-reads Tab 1's already-fetched raw
+                    # data through propagation.load_jao_csv, so a different
+                    # assumption can be tried here for analysis without
+                    # re-fetching on Tab 1.
+                    jao_df = self._prop.load_jao_csv(
+                        tmp_path, jao_timestamp_zone=jao_timestamp_zone)
                 else:
                     jao_df = df
                 cnec_dates = None

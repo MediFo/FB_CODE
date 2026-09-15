@@ -35,7 +35,7 @@ from propagation import (
     load_jao_csv, filter_no3, build_covariates, deduplicate_outages,
     run_panel_regression, run_logit_iva, decompose_delta_ram,
     summarize_hypotheses, PipelineConfig, run_pipeline,
-    DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str,
+    DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str, jao_datetime_to_utc,
     build_event_time_dummies, run_event_study,
     single_event_analysis, pre_period_abs_ptdf,
 )
@@ -643,6 +643,71 @@ class TestAuditFixes:
         assert explicit == utc_ts
 
 
+class TestJaoDatetimeZoneOption:
+    """jao_datetime_to_utc(source_tz=...) — the optional override for JAO's
+    own documented "dateTimeUtc" quirk (Nordic Publication Handbook v1.7:
+    the field can actually be CET despite its name). Default must reproduce
+    the pipeline's original, unchanged behaviour exactly; the override must
+    correctly compensate in both DST regimes."""
+
+    def test_default_utc_matches_original_behaviour(self):
+        raw = pd.Series(["2025-06-15T00:00:00Z", "2025-06-15T23:45:00Z"])
+        result = jao_datetime_to_utc(raw)  # source_tz not passed -> default
+        expected = pd.to_datetime(raw, utc=True)
+        assert (result == expected).all()
+        assert jao_datetime_to_utc(raw, source_tz="UTC").equals(result)
+
+    def test_cet_override_summer_cest(self):
+        # 2025-06-15 is CEST (UTC+2): 00:00 CEST wall-clock == 22:00 UTC the
+        # PREVIOUS day, not the same day the naive "Z" suffix would imply.
+        raw = pd.Series(["2025-06-15T00:00:00Z"])
+        result = jao_datetime_to_utc(raw, source_tz="CET")
+        assert result.iloc[0] == pd.Timestamp("2025-06-14T22:00:00", tz="UTC")
+
+    def test_cet_override_winter_cet(self):
+        # 2025-01-15 is plain CET (UTC+1): 00:00 CET == 23:00 UTC the
+        # previous day.
+        raw = pd.Series(["2025-01-15T00:00:00Z"])
+        result = jao_datetime_to_utc(raw, source_tz="CET")
+        assert result.iloc[0] == pd.Timestamp("2025-01-14T23:00:00", tz="UTC")
+
+    def test_cet_override_strips_offset_before_reinterpreting(self):
+        """The whole point of source_tz="CET" is that the field's own
+        Z/offset is NOT to be trusted -- it must be discarded and the raw
+        wall-clock digits re-interpreted as CET, not merely converted from
+        whatever offset happens to be attached."""
+        with_z    = jao_datetime_to_utc(pd.Series(["2025-06-15T14:00:00Z"]), source_tz="CET")
+        with_plus = jao_datetime_to_utc(pd.Series(["2025-06-15T14:00:00+05:00"]), source_tz="CET")
+        assert with_z.iloc[0] == with_plus.iloc[0], (
+            "source_tz='CET' must ignore whatever offset is attached and "
+            "treat the wall-clock digits themselves as CET/CEST in every case"
+        )
+
+    def test_load_jao_csv_default_unchanged(self, tmp_path):
+        """load_jao_csv's new jao_timestamp_zone parameter must default to
+        the pipeline's original behaviour when callers don't pass it."""
+        df = pd.DataFrame({
+            "dateTimeUtc": ["2025-06-15T00:00:00Z"],
+            "cneName": ["TEST_CNEC"],
+            "ram": [100.0],
+        })
+        p = str(tmp_path / "jao_tz_default.csv")
+        df.to_csv(p, index=False)
+        loaded = load_jao_csv(p)  # no jao_timestamp_zone argument at all
+        assert loaded["dateTimeUtc"].iloc[0] == pd.Timestamp("2025-06-15T00:00:00", tz="UTC")
+
+    def test_load_jao_csv_cet_override_shifts_timestamps(self, tmp_path):
+        df = pd.DataFrame({
+            "dateTimeUtc": ["2025-06-15T00:00:00Z"],
+            "cneName": ["TEST_CNEC"],
+            "ram": [100.0],
+        })
+        p = str(tmp_path / "jao_tz_cet.csv")
+        df.to_csv(p, index=False)
+        loaded = load_jao_csv(p, jao_timestamp_zone="CET")
+        assert loaded["dateTimeUtc"].iloc[0] == pd.Timestamp("2025-06-14T22:00:00", tz="UTC")
+
+
 # ── 11. Event study ───────────────────────────────────────────────────────────
 # build_event_time_dummies/run_event_study previously had two independent,
 # unconditional bugs: a hardcoded-nanosecond distance threshold that silently
@@ -735,12 +800,21 @@ class TestClusterModeSelection:
                 captured["n_cols"] = np.asarray(kw["clusters"]).shape[1]
             return orig_fit(self, *a, **kw)
         monkeypatch.setattr(PanelOLS, "fit", spy_fit)
-        run_panel_regression(no3_cov, "ram", cluster="two_way")
+        r = run_panel_regression(no3_cov, "ram", cluster="two_way")
         assert captured.get("n_cols") == 2, (
             f"cluster='two_way' should pass a 2-column (entity,time) cluster "
             f"array to the FIRST fit attempt; got {captured.get('n_cols')} "
             f"column(s) — looks like it silently fell back to one-way "
             f"time clustering")
+        # The shape being right isn't enough on its own -- the previous
+        # regression here was that the FIRST attempt raised despite being
+        # shaped correctly (linearmodels rejected a bare NumPy array with no
+        # entity/time index attached) and every fit silently fell through to
+        # entity-clustered, invisibly, while this exact shape assertion kept
+        # passing. Assert the attempt actually SUCCEEDED as requested too.
+        assert r.get("cov_type_used") == "two-way-clustered", (
+            f"cluster='two_way' should not fall back when the two-way fit "
+            f"itself is viable; got cov_type_used={r.get('cov_type_used')!r}")
 
     def test_entity_does_not_attempt_two_way_first(self, no3_cov, monkeypatch):
         from linearmodels.panel import PanelOLS
@@ -751,18 +825,38 @@ class TestClusterModeSelection:
                 captured["first_kwargs"] = dict(kw)
             return orig_fit(self, *a, **kw)
         monkeypatch.setattr(PanelOLS, "fit", spy_fit)
-        run_panel_regression(no3_cov, "ram", cluster="entity")
+        r = run_panel_regression(no3_cov, "ram", cluster="entity")
         first = captured.get("first_kwargs", {})
         assert first.get("cluster_entity") is True, (
             f"cluster='entity' should request cluster_entity=True on the "
             f"FIRST fit attempt; got {first} — looks like it tried two-way "
             f"clustering before falling back to real entity-only clustering")
+        assert r.get("cov_type_used") == "entity-clustered"
 
-    def test_time_cluster_still_the_default(self, no3_cov):
-        """Default behaviour (the only mode any current caller actually
-        uses) must be unaffected by the fix."""
-        r = run_panel_regression(no3_cov, "ram")
+    def test_time_cluster_actually_succeeds_not_just_returns_something(self, no3_cov):
+        """Regression guard for a real bug: run_panel_regression's default
+        (cluster="time", the function's own docstring calls this "the
+        methodologically correct choice") passed cluster codes as
+        cluster_series_time.values.reshape(-1, 1) -- a bare NumPy array with
+        the (entity, time) MultiIndex stripped off. linearmodels'
+        PanelOLS.fit(cov_type="clustered", clusters=...) re-wraps whatever it
+        receives in its own PanelData and validates ITS inferred entity/time
+        shape against the model's, which an index-less array can never
+        satisfy -- so the very first fit attempt ALWAYS raised "clusters
+        must have the same number of entities and time periods as the model
+        data", and every regression in this pipeline's history silently fell
+        through to the entity-clustered fallback the docstring itself calls
+        "traditional but underestimates SE here". A prior test here only
+        asserted `run_panel_regression(...)` returned a truthy dict --
+        which it always did, via the fallback, so it never caught this.
+        Assert the REQUESTED method is the one that actually ran."""
+        r = run_panel_regression(no3_cov, "ram")  # cluster="time" is the default
         assert r
+        assert r.get("cov_type_used") == "time-clustered", (
+            f"expected the default cluster='time' request to succeed "
+            f"without falling back, got cov_type_used={r.get('cov_type_used')!r} "
+            f"(se_fallback_occurred={r.get('se_fallback_occurred')})")
+        assert r.get("se_fallback_occurred") is False
 
 
 # ── 13. Event-aware clustering key ────────────────────────────────────────────

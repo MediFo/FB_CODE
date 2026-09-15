@@ -109,6 +109,48 @@ def utc_to_cet_str(ts_utc, fmt: str = "%Y-%m-%d %H:%M") -> str:
     except (ValueError, TypeError):
         return "n/a"
 
+
+_JAO_TZ_SUFFIX_RE = re.compile(r'(Z|[+-]\d{2}:?\d{2})$')
+
+
+def jao_datetime_to_utc(raw: pd.Series, source_tz: str = "UTC") -> pd.Series:
+    """Convert a JAO 'dateTimeUtc'-style column to true UTC.
+
+    source_tz="UTC" (default, unchanged from this pipeline's original
+    behaviour): trust the field at face value via pd.to_datetime(raw,
+    utc=True). Correct if the JAO export genuinely publishes true UTC.
+
+    source_tz="CET": the JAO Nordic Publication Handbook (v1.7, pages 21-22,
+    fetched directly from publicationtool.jao.eu) documents that despite the
+    field's name, its published values are actually CET/CEST wall-clock, not
+    true UTC — verbatim: "'dateTimeUtc': CET time stamp (yes… CET?!)". This
+    has NOT been confirmed against a live fetch from this codebase (see
+    CLAUDE.md) — it is a documented possibility from JAO's own Handbook, not
+    a proven defect in every JAO export, which is why this is an explicit
+    opt-in rather than the new default. Symptom to watch for if you leave
+    this at the default "UTC" and are working from real (non-synthetic) JAO
+    data: outage/event alignment that looks systematically off by a whole
+    1h (winter/CET) or 2h (summer/CEST) — e.g. a known outage's effect
+    consistently shows up "early" or "late" by exactly that amount across
+    many events, rather than at approximately time zero. That pattern is
+    what this setting exists to fix; ordinary noise or a single mistimed
+    event is not.
+
+    When source_tz="CET": any trailing Z/offset on the raw value is first
+    stripped (left in place, it would be trusted as a genuine UTC marker and
+    mask the real CET reading underneath), the remaining wall-clock digits
+    are localized as CET/CEST, and the result is converted to true UTC —
+    the same DST policy cet_input_to_utc() uses for human-typed input,
+    applied here to a machine-published field carrying the same quirk.
+    """
+    if source_tz.upper() == "CET":
+        naive_str = raw.astype(str).str.replace(_JAO_TZ_SUFFIX_RE, "", regex=True)
+        naive = pd.to_datetime(naive_str, errors="coerce")
+        return naive.dt.tz_localize(
+            CET_ZONE, ambiguous=True, nonexistent="shift_forward"
+        ).dt.tz_convert("UTC")
+    return pd.to_datetime(raw, utc=True, errors="coerce")
+
 # ---------------------------------------------------------------------------
 # 1. JAO CSV loader
 # ---------------------------------------------------------------------------
@@ -118,11 +160,21 @@ EXPECTED_NUMERIC = [
 ]
 EXPECTED_PTDF_PREFIXES = ("ptdf_",)
 
-def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
+def load_jao_csv(path: str, log_cb: LogCallback = _noop,
+                 jao_timestamp_zone: str = "UTC") -> pd.DataFrame:
     """Load a JAO CSV exported from the user's existing tool.
-    Robust to missing columns - they are filled with NaN."""
+    Robust to missing columns - they are filled with NaN.
+
+    jao_timestamp_zone: "UTC" (default) or "CET" — see jao_datetime_to_utc()
+    for why this is optional and what symptom should make you try "CET"."""
     df = pd.read_csv(path, low_memory=False)
     df.columns = [c.strip() for c in df.columns]
+
+    if jao_timestamp_zone.upper() == "CET":
+        log_cb("  JAO timestamp zone override: treating dateTimeUtc-style "
+               "column values as CET/CEST wall-clock (not true UTC) per "
+               "jao_timestamp_zone='CET' — see CLAUDE.md for why this "
+               "option exists before relying on it.")
 
     # Find datetime column under any common name
     dt_col = None
@@ -146,7 +198,7 @@ def load_jao_csv(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
         else:
             raise ValueError("JAO CSV has no recognizable datetime column")
     else:
-        df["dateTimeUtc"] = pd.to_datetime(df[dt_col], utc=True, errors="coerce")
+        df["dateTimeUtc"] = jao_datetime_to_utc(df[dt_col], source_tz=jao_timestamp_zone)
 
     df = df.dropna(subset=["dateTimeUtc"]).copy()
 
@@ -1381,9 +1433,25 @@ def run_panel_regression(df: pd.DataFrame, dep_var: str,
     cluster_series_entity = cluster_series_entity.loc[y.index]
     cluster_series_time   = cluster_series_time.loc[y.index]
 
-    cluster_codes_twoway = np.column_stack([cluster_series_entity.values,
-                                             cluster_series_time.values])
-    cluster_codes_time   = cluster_series_time.values.reshape(-1, 1)
+    # IMPORTANT: pass the (entity, time)-indexed pandas objects themselves,
+    # NOT their bare .values — linearmodels' PanelOLS.fit(cov_type=
+    # "clustered", clusters=...) re-wraps whatever it receives in its own
+    # internal PanelData and validates that PanelData's inferred entity/time
+    # shape against the model's. A raw NumPy array (what .values.reshape(-1,
+    # 1)/np.column_stack(...) previously produced here) carries no index for
+    # PanelData to recover that shape from, so this ALWAYS raised "clusters
+    # must have the same number of entities and time periods as the model
+    # data" -- meaning time-clustered and two-way-clustered SEs could never
+    # actually succeed, and every fit silently fell through to the
+    # entity-clustered fallback further down this function's attempt chain,
+    # with no trace of that having happened before cov_type_used/
+    # se_fallback_occurred were added below. Verified against linearmodels
+    # directly: the identical cluster codes succeed immediately once passed
+    # as a properly-indexed Series/DataFrame instead of a stripped array.
+    cluster_codes_twoway = pd.concat(
+        [cluster_series_entity.rename("entity"), cluster_series_time.rename("time")],
+        axis=1)
+    cluster_codes_time   = cluster_series_time
 
     _time_kwargs   = {"cov_type": "clustered", "clusters": cluster_codes_time,
                       "group_debias": True}
@@ -2051,6 +2119,7 @@ class PipelineConfig:
     source_country: str   = "FI"    # ENTSO-E country code for the outage source
     target_zone:    str   = "NO3"   # Bidding zone to analyse (CNEC filter)
     no3_patterns:   tuple = DEFAULT_NO3_PATTERNS  # auto-updated in __post_init__
+    jao_timestamp_zone: str = "UTC"  # "UTC" (default) or "CET" — see jao_datetime_to_utc()
 
     def __post_init__(self):
         # If no3_patterns is the default, auto-populate from target_zone
@@ -2068,7 +2137,8 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
     # 1. JAO
     if jao_df is None:
         log_cb(f"Loading JAO CSV: {cfg.jao_csv}")
-        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb)
+        jao = load_jao_csv(cfg.jao_csv, log_cb=log_cb,
+                           jao_timestamp_zone=cfg.jao_timestamp_zone)
     else:
         jao = jao_df.copy()
     log_cb(f"  JAO rows: {len(jao)}, CNECs: {jao['cneName'].nunique()}")

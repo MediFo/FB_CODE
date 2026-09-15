@@ -103,6 +103,14 @@ failed H6 placebo demotes significance claims elsewhere in the report.
 - `app_jao_NP_API_fix_d14.py`'s fetch is day-batched (one request per
   calendar day) via a Windows PowerShell subprocess, not per-15-minute MTU
   — it only runs where PowerShell is available.
+- JAO's own Publication Handbook documents that its `dateTimeUtc` field can
+  actually be CET, not UTC, despite the name. Every real-data entry point
+  (dashboard.py, both GUIs, the CLI) has its own independent, optional
+  "UTC"/"CET" toggle for this — default stays UTC (unverified against live
+  data; not changed without confirmation), separate per tab so you can
+  compare interpretations without re-fetching. If outage/event alignment
+  looks consistently off by 1h (winter) or 2h (summer), try the CET setting
+  on the relevant tab. See `CLAUDE.md` for the full mechanism.
 
 See `CLAUDE.md` for the fuller list of domain facts and known limitations
 this codebase currently has, and the JAO Nordic Publication Handbook for the

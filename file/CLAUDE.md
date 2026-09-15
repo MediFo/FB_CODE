@@ -83,15 +83,53 @@ pytest test_pipeline.py -v
   offset, it's interpreted as CET/CEST (not UTC) — matching how a human
   actually thinks when typing into that file.
 - FRM is structural (yearly calibration); it should NOT move with individual outages (H6 placebo)
-- run_panel_regression()'s SE fallback chain (whichever `cluster=` mode was
-  requested first, then time-clustered, entity-clustered, robust, unadjusted
-  in that order) is recorded, not silent: every regression result carries
-  `cov_type_used` and `se_fallback_occurred`, and summarize_hypotheses()
-  appends `n=…, se=…` to every H1-H4/H6 verdict so a reader can see when a
-  result rests on something weaker than the requested clustering. In
-  practice run_pipeline() always requests `cluster="time"` — `"two_way"` is
-  supported by run_panel_regression() but not currently invoked anywhere in
-  the pipeline.
+- run_panel_regression()'s cluster codes MUST be passed to
+  `PanelOLS.fit(cov_type="clustered", clusters=...)` as (entity, time)
+  -indexed pandas objects (a Series for one-way, a DataFrame for two-way),
+  never `.values`/`.values.reshape(...)`. linearmodels re-wraps whatever it
+  receives in its own PanelData and validates ITS inferred entity/time
+  shape against the model's; an index-less NumPy array can never satisfy
+  that, so it always raised "clusters must have the same number of
+  entities and time periods as the model data" — meaning time-clustered
+  and two-way-clustered SEs could never actually succeed until this was
+  fixed, and every regression silently fell back to entity-clustered
+  (verified via an isolated linearmodels repro and a live run showing
+  every H1-H6 verdict's `se=` field). If you ever see that exact error in
+  the logs again, this is almost certainly the regression to check first.
+- The SE fallback chain (requested mode first, then time-clustered,
+  entity-clustered, robust, unadjusted in that order) is recorded, not
+  silent: every regression result carries `cov_type_used` and
+  `se_fallback_occurred`, and summarize_hypotheses() appends `n=…, se=…`
+  to every H1-H4/H6 verdict so a reader can see when a result rests on
+  something weaker than the requested clustering. run_pipeline() always
+  requests `cluster="time"`, which now actually succeeds (see above) —
+  `"two_way"` is supported by run_panel_regression() but not currently
+  invoked anywhere in the pipeline.
+- JAO's own Nordic Publication Handbook (v1.7, fetched directly from
+  publicationtool.jao.eu) documents that its "dateTimeUtc" API field can
+  actually be CET/CEST wall-clock despite the name (verbatim: "'dateTimeUtc':
+  CET time stamp (yes… CET?!)"), for the same fbDomainShadowPrice endpoint
+  this codebase's live fetch uses. This has NOT been confirmed against a
+  live fetch from here — it's a documented possibility, not a proven defect
+  in every JAO export — so the default stays "UTC" (unchanged original
+  behaviour). `jao_datetime_to_utc()` / `load_jao_csv(jao_timestamp_zone=...)`
+  in propagation.py are the conversion points; every fetch/load surface that
+  touches real (non-synthetic) JAO data has its OWN independent "UTC"/"CET"
+  toggle, deliberately not shared, so you can try a different assumption on
+  one tab (e.g. re-running Tab 9's analysis under "CET") without disturbing
+  another (e.g. Tab 1's already-fetched display): dashboard.py's Real JAO
+  CSV section, app_jao_NP_API_fix_d14.py's Tab 1 (covers both Option A
+  upload and Option B live fetch) and Tab 9 Data Source section, and
+  run_analysis.py's `--jao-timestamp-zone` flag. The live-fetch path
+  (app_jao_NP_API_fix_d14.py's `fetch_day_via_powershell`) also runs an
+  automatic `_check_jao_tz_assumption()` diagnostic per day fetched: since
+  it knows the exact requested CET calendar-day boundary, it checks whether
+  the earliest returned row starts near 00:00 raw (consistent with
+  mislabeled-CET) or ~22:00-23:00 the previous day (consistent with genuine
+  UTC) and warns in the log if that pattern disagrees with the current
+  toggle — this is a heuristic, not proof, but it's a season-independent,
+  cheap, per-fetch cross-check rather than requiring a user to notice wrong
+  results on their own.
 - Outage covariates are zero when no outage overlaps JAO window -> verdicts show as n/a
 - app_jao_NP_API_fix_d14.py's data fetch is day-batched (one PowerShell/
   Invoke-WebRequest call per calendar day, CET-aligned) rather than

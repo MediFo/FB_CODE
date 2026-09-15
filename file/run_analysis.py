@@ -30,11 +30,13 @@ try:
     from fi_no3.propagation import (
         PipelineConfig, run_pipeline, load_jao_csv,
         load_manual_outages, render_html_report, summarize_hypotheses,
+        utc_to_cet_str,
     )
 except ImportError:
     from propagation import (
         PipelineConfig, run_pipeline, load_jao_csv,
         load_manual_outages, render_html_report, summarize_hypotheses,
+        utc_to_cet_str,
     )
 import pandas as pd
 
@@ -68,6 +70,18 @@ def main():
                              "(with --synthetic); 1.0 = large/easy-to-detect "
                              "default, e.g. 0.1 for a small, economically "
                              "realistic effect size")
+    parser.add_argument("--jao-timestamp-zone", choices=["UTC", "CET"], default="UTC",
+                        help="What timezone the JAO CSV's dateTimeUtc column "
+                             "is ACTUALLY in (with --jao; ignored with "
+                             "--synthetic, which always generates genuine "
+                             "UTC). Default UTC trusts the field at face "
+                             "value, matching this pipeline's original "
+                             "behaviour. JAO's own Nordic Publication "
+                             "Handbook documents that despite the field's "
+                             "name, its values can actually be CET/CEST -- "
+                             "if outage/event alignment looks consistently "
+                             "off by exactly 1h (winter) or 2h (summer), "
+                             "try --jao-timestamp-zone CET.")
     args = parser.parse_args()
 
     def log(msg): print(msg, flush=True)
@@ -94,10 +108,16 @@ def main():
             print(f"ERROR: JAO file not found: {jao_path}")
             sys.exit(1)
         log(f"Loading JAO: {jao_path}")
-        jao_df = load_jao_csv(jao_path)
+        if args.jao_timestamp_zone == "CET":
+            log("  NOTE: treating dateTimeUtc as CET/CEST wall-clock, not "
+                "true UTC, per --jao-timestamp-zone CET.")
+        jao_df = load_jao_csv(jao_path, jao_timestamp_zone=args.jao_timestamp_zone)
         log(f"  Rows: {len(jao_df):,} | CNECs: {jao_df['cneName'].nunique()}")
-        log(f"  Window: {jao_df['dateTimeUtc'].min().date()} → "
-            f"{jao_df['dateTimeUtc'].max().date()}")
+        # CET, matching this codebase's documented human-facing time
+        # convention -- a raw .date() here would show the previous UTC
+        # calendar day for any window starting just after CET midnight.
+        log(f"  Window: {utc_to_cet_str(jao_df['dateTimeUtc'].min(), '%Y-%m-%d')} → "
+            f"{utc_to_cet_str(jao_df['dateTimeUtc'].max(), '%Y-%m-%d')} CET")
         outages_df = None
 
     # ── Config ─────────────────────────────────────────────────────────────
@@ -129,6 +149,7 @@ def main():
         end_utc        = args.end,
         use_entsoe     = not args.no_entsoe,
         use_manual     = True,
+        jao_timestamp_zone = args.jao_timestamp_zone,
     )
 
     # ── Run ────────────────────────────────────────────────────────────────
