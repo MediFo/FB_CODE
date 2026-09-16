@@ -55,8 +55,9 @@ pytest test_pipeline.py -v
 __init__.py                    fi_no3 package init — re-exports the public API
 dashboard.py                   6-tab tkinter GUI — primary entry point
 app_jao_NP_API_fix_d14.py      9-tab GUI — adds JAO/Nord Pool data-fetch
-                                tooling; d07–d13 are superseded prior
-                                iterations kept for reference only
+                                tooling (superseded d07–d13 prior
+                                iterations were removed in a repo cleanup;
+                                nothing else referenced them)
 propagation.py                 analytical pipeline (CET/UTC boundary, JAO/
                                 ENTSO-E ingestion, covariate construction,
                                 panel regressions, hypothesis tests H1–H6,

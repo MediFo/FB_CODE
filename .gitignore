@@ -1,6 +1,8 @@
 # Generated analysis outputs
 results/
 data/synthetic/
+ma_output/*
+!ma_output/.gitkeep
 
 # Python
 __pycache__/

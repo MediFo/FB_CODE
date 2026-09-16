@@ -42,9 +42,13 @@ __init__.py                    — re-exports the fi_no3 public API
 dashboard.py                   — tkinter 6-tab GUI  ← MAIN ENTRY POINT
 app_jao_NP_API_fix_d14.py      — tkinter 9-tab GUI, adds JAO/Nord Pool fetch
                                   tooling (day-batched PowerShell fetch) on
-                                  top of the same propagation.py backend;
-                                  d07–d13 are superseded prior iterations,
-                                  kept for reference only — d14 is current
+                                  top of the same propagation.py backend.
+                                  d07–d13, its superseded prior iterations,
+                                  were removed (repo cleanup) — d14 was
+                                  always the only one referenced by anything
+                                  else; `Old/` (see above) still keeps the
+                                  independent pre-fi_no3 generation of this
+                                  same GUI as historical reference.
 propagation.py                 — analytical pipeline (no UI code)
 synthetic.py                   — synthetic JAO + outage data generator for testing
 test_pipeline.py                — full test suite (pytest)
@@ -57,7 +61,9 @@ manual_outages.csv             — hand-curated outage events for any Nordic
                                   source country (edit this; bidding_zone
                                   column selects which country/zone a row
                                   belongs to)
-ma_output/                     — generated Maintenance-Analysis outputs (Tab 9)
+ma_output/                     — generated Maintenance-Analysis outputs (Tab 9);
+                                  gitignored except a .gitkeep placeholder —
+                                  don't commit run output here
 map.png, map2.png, Slide1w.PNG — reference images used by the GUIs
 ```
 
