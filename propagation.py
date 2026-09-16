@@ -574,7 +574,18 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         log_cb("ENTSO-E: 'entsoe-py' library NOT INSTALLED.")
         log_cb("           Run:  pip install entsoe-py")
         log_cb("           Then restart the dashboard.")
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        # Set the same entsoe_fetch_failures marker the full function sets
+        # at the end (see below) -- this early return skips straight past
+        # that point, so without this a missing entsoe-py install produces
+        # an empty DataFrame indistinguishable from "genuinely zero events
+        # this window", and a caller showing that as a plain green success
+        # (as Tab 9 used to) hides the real, easily-fixed cause.
+        result.attrs["entsoe_fetch_failures"] = {
+            "library_missing": True,
+            "a77_failed": False, "a78_borders_failed": 0, "a78_borders_total": 0,
+        }
+        return result
     log_cb(f"ENTSO-E: fetching with token {ENTSOE_TOKEN[:8]}...{ENTSOE_TOKEN[-4:]}")
 
     client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
@@ -768,6 +779,7 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
     # so a caller can tell "confirmed zero" from "fetch mostly/entirely
     # failed" instead of treating both as a clean, trustworthy zero.
     result.attrs["entsoe_fetch_failures"] = {
+        "library_missing": False,
         "a77_failed": a77_err is not None,
         "a78_borders_failed": len(failed_borders),
         "a78_borders_total": len(borders),

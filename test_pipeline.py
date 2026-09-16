@@ -320,6 +320,37 @@ class TestEntsoeCapacityField:
         assert (cov["fi_hvdc_outage_mw_lost"] == 0).all()
 
 
+class TestEntsoeFetchFailureMarker:
+    """fetch_entsoe_outages() returns an empty-or-partial DataFrame both when
+    a window genuinely has zero events AND when every query silently failed
+    (missing entsoe-py, bad network/token, etc.) -- those look identical to
+    a caller unless the DataFrame's .attrs distinguish them (found via a
+    real user whose entsoe-py wasn't installed: the GUI showed a plain
+    green '0 outage events' with no hint anything was wrong)."""
+
+    def test_missing_library_sets_library_missing_flag(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient", None)
+        df = fetch_entsoe_outages("2026-03-01T00:00:00Z", "2026-04-21T00:00:00Z",
+                                  country_code="FI")
+        assert df.empty
+        failures = df.attrs.get("entsoe_fetch_failures")
+        assert failures is not None, (
+            "an empty result from a missing entsoe-py install must still "
+            "carry entsoe_fetch_failures -- this is an early return, before "
+            "the normal end-of-function .attrs assignment")
+        assert failures["library_missing"] is True
+
+    def test_successful_fetch_sets_library_missing_false(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient",
+                            TestEntsoeCapacityField._FakeEntsoeClient)
+        df = fetch_entsoe_outages("2024-11-01T00:00:00Z", "2024-11-03T00:00:00Z",
+                                  country_code="FI")
+        failures = df.attrs.get("entsoe_fetch_failures")
+        assert failures is not None
+        assert failures["library_missing"] is False
+        assert failures["a77_failed"] is False
+
+
 # ── 4. Covariate building ─────────────────────────────────────────────────────
 
 class TestCovariates:

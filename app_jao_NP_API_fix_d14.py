@@ -2882,7 +2882,13 @@ class App:
         self._ma_populate_outage_tree(df)
         self._ma_refresh_single_list()
         msg = f"{len(df)} outage events after deduplication."
-        if failures and (failures["a77_failed"] or failures["a78_borders_failed"] > 0):
+        if failures and failures.get("library_missing"):
+            warn = ("⚠ the 'entsoe-py' library isn't installed in this Python/venv "
+                    "— 0 is not a real result. Run:  pip install entsoe-py  "
+                    "then fetch again.")
+            self._ma_outage_status.config(text=f"{msg}  {warn}", foreground=C_AMBER)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg} {warn}")
+        elif failures and (failures["a77_failed"] or failures["a78_borders_failed"] > 0):
             n_failed = failures["a78_borders_failed"]
             n_total  = failures["a78_borders_total"]
             parts = []
