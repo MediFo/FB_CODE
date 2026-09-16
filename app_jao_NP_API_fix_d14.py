@@ -20,8 +20,18 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
-except ImportError:
-    pass  # error shown after Tk is up
+    MATPLOTLIB_OK = True
+    MATPLOTLIB_IMPORT_ERROR = None
+except ImportError as _mpl_exc:
+    # Swallowed here rather than crashing at import time because messagebox
+    # needs a Tk root to exist first -- App.__init__ checks MATPLOTLIB_OK as
+    # its first step and shows this exact error, instead of letting a tab
+    # builder crash deep in the widget tree with a bare "name 'Figure' is
+    # not defined" NameError that gives no hint the actual problem is an
+    # import failure (e.g. matplotlib not installed in this venv, or a
+    # broken Tk backend).
+    MATPLOTLIB_OK = False
+    MATPLOTLIB_IMPORT_ERROR = str(_mpl_exc)
 
 try:
     from reportlab.lib.pagesizes import A4
@@ -486,6 +496,24 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
 class App:
     def __init__(self, root):
         self.root = root
+        if not MATPLOTLIB_OK:
+            # Tk root exists now, so a real dialog can be shown here (see the
+            # import try/except above) instead of letting tab construction
+            # crash later with an opaque NameError on Figure/FigureCanvasTkAgg.
+            messagebox.showerror(
+                "Missing dependency: matplotlib",
+                "This app could not import matplotlib, which most tabs "
+                "(Shadow/RAM, Impact/PTDF, Gen/Cons, Price History, "
+                "Maintenance Analysis) require for charts.\n\n"
+                f"Import error: {MATPLOTLIB_IMPORT_ERROR}\n\n"
+                "Fix: install it into the SAME Python/venv you're running "
+                "this script with, e.g.:\n"
+                "    python -m pip install matplotlib\n\n"
+                "If matplotlib is already installed, this is usually a "
+                "broken/partial install or a version mismatch with another "
+                "package (numpy, etc.) — check the import error above.")
+            root.destroy()
+            raise SystemExit(1)
         self.root.title("JAO & Nordpool Analytics")
         self.root.geometry("1280x980")
         self.root.configure(bg=C_BG)
