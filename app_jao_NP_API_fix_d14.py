@@ -2827,6 +2827,36 @@ class App:
                 "or from the repo root:\n"
                 "    python -m pip install -e .[dev]")
 
+    def _regression_libs_missing(self) -> list:
+        """Names of required regression libraries that failed to import
+        into propagation.py (statsmodels/linearmodels are both optional
+        imports there, guarded so the module itself still loads without
+        them). Every panel regression, the IVA logit, and the DiD estimate
+        silently return empty ({}/pd.DataFrame()) when either is missing --
+        run_panel_regression() logs "linearmodels/statsmodels missing;
+        skip" when this happens, but that's one line buried in a scrolling
+        log, while Results/Single Event just show a generic "no regression
+        detail"/"No DiD data available" with nothing pointing back to why."""
+        if not self._prop:
+            return []
+        missing = []
+        if getattr(self._prop, "sm", None) is None:
+            missing.append("statsmodels")
+        if getattr(self._prop, "PanelOLS", None) is None:
+            missing.append("linearmodels")
+        return missing
+
+    def _regression_libs_missing_message(self, missing: list) -> str:
+        return (f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
+                "not installed/importable in this Python/venv, so every panel "
+                "regression, the IVA logit, and the DiD estimate will come "
+                "back empty — that's why Results shows \"no regression "
+                "detail\" and Single Event shows \"No DiD data available\", "
+                "not a data problem.\n\n"
+                f"Fix:  python -m pip install {' '.join(m.lower() for m in missing)}\n\n"
+                "Continue anyway? Covariates and non-regression outputs "
+                "(CNEC table, plots of raw values) will still be built.")
+
     def _ma_fetch_entsoe(self):
         if not self._prop:
             messagebox.showerror("Error", self._prop_not_loaded_message())
@@ -2965,6 +2995,11 @@ class App:
             return
         if not self._prop:
             messagebox.showerror("Run", self._prop_not_loaded_message())
+            return
+        missing = self._regression_libs_missing()
+        if missing and not messagebox.askyesno(
+                "Missing regression libraries",
+                self._regression_libs_missing_message(missing)):
             return
         self._ma_pipeline_running = True
         self._ma_run_btn.config(state=tk.DISABLED, text="Running…")
@@ -3526,6 +3561,16 @@ class App:
         oid = self._ma_single_id.get().strip()
         if not oid:
             messagebox.showwarning("Single Event", "Select an outage ID.")
+            return
+        if not self._prop:
+            messagebox.showerror("Single Event", self._prop_not_loaded_message())
+            return
+        missing = self._regression_libs_missing()
+        if missing and not messagebox.askyesno(
+                "Missing regression libraries",
+                self._regression_libs_missing_message(missing) +
+                "\n\n(The DiD estimate specifically needs statsmodels; "
+                "ITS/decomposition plots don't and will still work.)"):
             return
         bd = int(self._ma_baseline_days.get())
         pd_days = int(self._ma_post_days.get())
