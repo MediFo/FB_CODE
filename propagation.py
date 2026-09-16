@@ -758,7 +758,21 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                f"outages on these routes are NOT included below.")
 
     log_cb(f"ENTSO-E events recorded: {len(events)}")
-    return pd.DataFrame(events)
+    result = pd.DataFrame(events)
+    # A caller sees an empty (or half-empty) DataFrame either way whether
+    # this window genuinely had zero events, or every query to ENTSO-E
+    # failed (bad network/proxy, expired token, 403 from this IP, etc.) --
+    # those are very different situations for a user to act on, but look
+    # identical without this. Attach failure counts via .attrs (the same
+    # mechanism build_covariates() already uses for planned_forced_confound)
+    # so a caller can tell "confirmed zero" from "fetch mostly/entirely
+    # failed" instead of treating both as a clean, trustworthy zero.
+    result.attrs["entsoe_fetch_failures"] = {
+        "a77_failed": a77_err is not None,
+        "a78_borders_failed": len(failed_borders),
+        "a78_borders_total": len(borders),
+    }
+    return result
 
 
 def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:

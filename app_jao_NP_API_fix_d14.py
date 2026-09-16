@@ -2870,6 +2870,11 @@ class App:
 
     def _ma_entsoe_done(self, df):
         import pandas as pd
+        # Capture before concat/dedup -- .attrs isn't reliably preserved
+        # through those, and an empty result means something very different
+        # depending on whether every ENTSO-E query actually failed (bad
+        # network/proxy/token) vs. this window genuinely having zero events.
+        failures = df.attrs.get("entsoe_fetch_failures")
         if self._ma_outages_df is not None and not self._ma_outages_df.empty:
             df = self._prop.deduplicate_outages(
                 pd.concat([self._ma_outages_df, df], ignore_index=True))
@@ -2877,8 +2882,21 @@ class App:
         self._ma_populate_outage_tree(df)
         self._ma_refresh_single_list()
         msg = f"{len(df)} outage events after deduplication."
-        self._ma_outage_status.config(text=msg, foreground=C_GREEN)
-        self._update_status(f"[Tab9] ENTSO-E fetch done — {msg}")
+        if failures and (failures["a77_failed"] or failures["a78_borders_failed"] > 0):
+            n_failed = failures["a78_borders_failed"]
+            n_total  = failures["a78_borders_total"]
+            parts = []
+            if failures["a77_failed"]:
+                parts.append("production outages (A77) query failed")
+            if n_failed:
+                parts.append(f"{n_failed}/{n_total} transmission border (A78) queries failed")
+            warn = f"⚠ {'; '.join(parts)} — this count may be understated, not a confirmed zero. " \
+                   "Check your network/proxy/ENTSO-E token, or the main status log above for details."
+            self._ma_outage_status.config(text=f"{msg}  {warn}", foreground=C_AMBER)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg} {warn}")
+        else:
+            self._ma_outage_status.config(text=msg, foreground=C_GREEN)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg}")
 
     def _ma_populate_outage_tree(self, df):
         self._ma_out_tree.delete(*self._ma_out_tree.get_children())
