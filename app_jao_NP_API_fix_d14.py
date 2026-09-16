@@ -1733,6 +1733,10 @@ class App:
 
     def _run_analysis(self):
         if not self.raw_filtered_data:
+            messagebox.showinfo(
+                "No data loaded",
+                "Tab 1 hasn't loaded any data yet — upload a JAO CSV or run "
+                "a live fetch there first, then come back to Tab 2.")
             return
         d_str = self.analysis_date_entry.get().replace('-', '')
         t_str = self.analysis_time_entry.get().strip()
@@ -1777,11 +1781,26 @@ class App:
     def _show_all_histories(self):
         cnec = self._get_selected_cnec()
         if not cnec:
+            if not self.raw_filtered_data:
+                messagebox.showinfo(
+                    "No data loaded",
+                    "Tab 1 hasn't loaded any data yet — upload a JAO CSV or "
+                    "run a live fetch there first, then come back to Tab 2.")
+            else:
+                messagebox.showinfo(
+                    "No CNEC selected",
+                    "Pick a CNEC from the \"Selected CNEC\" dropdown, or "
+                    "click a row in the results table below, first.")
             return
 
         data = sorted([d for d in self.raw_filtered_data if d.get('cneName') == cnec],
                       key=lambda x: (str(x['date']), x['time']))
         if not data:
+            messagebox.showinfo(
+                "No data for this CNEC",
+                f"No loaded rows match CNEC '{cnec}' — the data in Tab 1 "
+                f"may have changed since it was selected. Reselect it from "
+                f"the dropdown/table.")
             return
 
         # Show loading on both canvases, then defer heavy render by 30 ms
