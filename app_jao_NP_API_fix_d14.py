@@ -2440,10 +2440,18 @@ class App:
         self._ma_src_country.pack(side=tk.LEFT, padx=(4,20))
 
         ttk.Label(row1, text="Target CNEC:").pack(side=tk.LEFT)
-        self._ma_target_cnec = ttk.Combobox(row1, values=[], width=36, state='readonly')
+        # Editable (not readonly) so typing filters the dropdown live -- with
+        # ~1500+ CNECs in a real JAO export, scrolling a flat readonly list
+        # to find one by eye was the actual complaint this was built for.
+        # self._ma_cnec_all_values holds the full unfiltered list; the
+        # combobox's own ['values'] is narrowed to matches while typing (see
+        # _ma_filter_target_cnec) and restored to the full list on blur/clear.
+        self._ma_cnec_all_values = []
+        self._ma_target_cnec = ttk.Combobox(row1, values=[], width=36)
         self._ma_target_cnec.set("")
         self._ma_target_cnec.pack(side=tk.LEFT, padx=(4,6))
-        ttk.Label(row1, text="(auto-filled from Tab 1 data)",
+        self._ma_target_cnec.bind('<KeyRelease>', self._ma_filter_target_cnec)
+        ttk.Label(row1, text="(auto-filled from Tab 1 data; type to search)",
                   style='Muted.TLabel').pack(side=tk.LEFT)
 
         row2 = ttk.Frame(scope_f, style='Card.TFrame')
@@ -2530,6 +2538,7 @@ class App:
                            if d.get('cneName', '').strip()))
         if cnecs:
             tab2_cnec = self._get_selected_cnec() or ''
+            self._ma_cnec_all_values = cnecs
             self._ma_target_cnec.config(values=cnecs)
             if tab2_cnec and tab2_cnec in cnecs:
                 self._ma_target_cnec.set(tab2_cnec)
@@ -2553,8 +2562,10 @@ class App:
         cnec = self._get_selected_cnec() or ''
         if not cnec:
             return
-        current_values = list(self._ma_target_cnec['values'])
-        if cnec in current_values:
+        # Check against the full master list, not whatever subset is
+        # currently shown in the dropdown -- that's narrowed to search
+        # matches while the user is typing (see _ma_filter_target_cnec).
+        if cnec in self._ma_cnec_all_values:
             self._ma_target_cnec.set(cnec)
 
     def _ma_browse_dir(self):
@@ -2573,11 +2584,43 @@ class App:
             return
         # Default: use Tab 2's currently selected CNEC if it exists in the data
         tab2_cnec = self._get_selected_cnec() or ""
+        self._ma_cnec_all_values = cnecs
         self._ma_target_cnec.config(values=cnecs)
         if tab2_cnec and tab2_cnec in cnecs:
             self._ma_target_cnec.set(tab2_cnec)
         elif self._ma_target_cnec.get() not in cnecs:
             self._ma_target_cnec.set(cnecs[0])
+
+    def _ma_filter_target_cnec(self, event=None):
+        """Live search-as-you-type for the Target CNEC combobox: narrows the
+        dropdown to names containing what's typed, prefix matches (closest)
+        first, then other substring matches, each group alphabetical. Real
+        JAO exports carry 1000+ CNECs -- scrolling a flat list to find one by
+        eye was the actual complaint this replaces."""
+        # Let normal combobox/entry navigation and selection keys behave
+        # exactly as before -- only re-filter on keys that changed the text.
+        if event is not None and event.keysym in (
+                'Up', 'Down', 'Left', 'Right', 'Return', 'KP_Enter',
+                'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R'):
+            return
+        typed = self._ma_target_cnec.get().strip().lower()
+        all_values = self._ma_cnec_all_values
+        if not typed:
+            filtered = all_values
+        else:
+            starts_with = sorted(v for v in all_values if v.lower().startswith(typed))
+            contains    = sorted(v for v in all_values
+                                 if typed in v.lower() and not v.lower().startswith(typed))
+            filtered = starts_with + contains
+        self._ma_target_cnec['values'] = filtered
+        # Best-effort: pop the dropdown open so matches are visible without
+        # an extra click. Never let this break typing if it misbehaves on
+        # some Tk/platform combination.
+        if filtered:
+            try:
+                self._ma_target_cnec.event_generate('<Down>')
+            except tk.TclError:
+                pass
 
     def _ma_apply_setup(self):
         # Guard: don't start a second run while one is in progress
