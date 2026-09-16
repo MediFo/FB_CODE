@@ -47,6 +47,13 @@ app_jao_NP_API_fix_d14.py      — tkinter 9-tab GUI, adds JAO/Nord Pool fetch
                                   always the only one referenced by anything
                                   else.
 propagation.py                 — analytical pipeline (no UI code)
+check_entsoe.py                — standalone ENTSO-E connectivity diagnostic
+                                  (DNS/TCP → TLS → raw HTTPS → entsoe-py, in
+                                  that order); run this first whenever an
+                                  ENTSO-E fetch returns 0 events and you
+                                  can't tell if that's genuine or a network/
+                                  firewall/proxy problem — it has no GUI/
+                                  pandas-stack dependency of its own
 synthetic.py                   — synthetic JAO + outage data generator for testing
 test_pipeline.py                — full test suite (pytest)
 run_analysis.py                — CLI entry point (also installed as the
@@ -220,7 +227,11 @@ pytest test_pipeline.py -v
 - ENTSO-E API returning 403 from cloud/server IPs is environment-dependent,
   not universal — a live call succeeded from this Claude Code sandbox's
   outbound proxy. Don't assume either outcome; test from wherever you're
-  actually deploying.
+  actually deploying — run `python check_entsoe.py` there to check layer
+  by layer (DNS/TCP, TLS, raw HTTP, entsoe-py) rather than guessing from
+  the app's "0 events" alone, which looks identical whether every query
+  failed or the window genuinely had none (see fetch_entsoe_outages()'s
+  entsoe_fetch_failures DataFrame.attrs, added to disambiguate the two).
 - ENTSO-E A77 returns "File is not a zip file" when no FI production outages exist in window
 - IVA is zero on NO3 CNECs in short windows; H5 logit needs longer history
 - FRM in synthetic data moves with outages (December 2024 regime change is encoded)
