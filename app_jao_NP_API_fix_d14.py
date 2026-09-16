@@ -2312,12 +2312,20 @@ class App:
     #  TAB 9 – Maintenance Analysis  (FB_CODE integration)
     # ------------------------------------------------------------------
     def _create_tab9_widgets(self):
-        # lazy-import propagation backend
+        # lazy-import propagation backend. The bare except here used to
+        # discard the real reason (missing pandas/numpy, a broken
+        # statsmodels/numpy version pairing, propagation.py itself failing
+        # to import, etc.), leaving only the generic "propagation module
+        # not loaded" dialog with no way to diagnose it -- same failure
+        # shape as the matplotlib import above. Keep the actual error so
+        # both Tab 9 guard points below can show it.
         try:
             import propagation as _prop
             self._prop = _prop
-        except Exception:
+            self._prop_import_error = None
+        except Exception as e:
             self._prop = None
+            self._prop_import_error = str(e)
 
         # state shared across sub-tabs
         self._ma_jao_df      = None   # pd.DataFrame built from Tab 1 data
@@ -2785,9 +2793,24 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    def _prop_not_loaded_message(self) -> str:
+        detail = (f"Import error: {self._prop_import_error}"
+                  if self._prop_import_error else
+                  "No error was recorded, but propagation.py's import "
+                  "didn't succeed.")
+        return ("The propagation.py analysis backend could not be "
+                "loaded, so Tab 9 (Maintenance Analysis) can't run.\n\n"
+                f"{detail}\n\n"
+                "Fix: install this project's dependencies into the SAME "
+                "Python/venv you're running this script with, e.g.:\n"
+                "    python -m pip install pandas numpy statsmodels "
+                "linearmodels entsoe-py\n"
+                "or from the repo root:\n"
+                "    python -m pip install -e .[dev]")
+
     def _ma_fetch_entsoe(self):
         if not self._prop:
-            messagebox.showerror("Error", "propagation module not loaded.")
+            messagebox.showerror("Error", self._prop_not_loaded_message())
             return
         start_raw = self._ma_ent_start.get().strip()
         end_raw   = self._ma_ent_end.get().strip()
@@ -2898,7 +2921,7 @@ class App:
             messagebox.showwarning("Run", "Load outages first (Outage Sources tab).")
             return
         if not self._prop:
-            messagebox.showerror("Run", "propagation module not available.")
+            messagebox.showerror("Run", self._prop_not_loaded_message())
             return
         self._ma_pipeline_running = True
         self._ma_run_btn.config(state=tk.DISABLED, text="Running…")
