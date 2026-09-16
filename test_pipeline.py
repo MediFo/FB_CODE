@@ -7,6 +7,7 @@ All tests use synthetic data — no API keys required.
 """
 import sys
 import os
+import json
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -40,6 +41,7 @@ from propagation import (
     single_event_analysis, pre_period_abs_ptdf,
     build_report_ctx, run_nordic_matrix, render_nordic_matrix_report,
     NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
+    fetch_entsoe_outages,
 )
 import propagation as _pipe
 
@@ -231,6 +233,91 @@ class TestOutageDedup:
         out = deduplicate_outages(pd.DataFrame(rows))
         assert len(out) == 2, (
             "Non-overlapping outages for the same asset must both be retained")
+
+
+class TestEntsoeCapacityField:
+    """ENTSO-E A78 (transmission) rows only carry 'avail_qty' — the capacity
+    STILL AVAILABLE on the border during the outage — with no nominal/rated
+    capacity to net it against, unlike A77 (production) which has both
+    nominal_power and avail_qty. capacity_mw is treated everywhere downstream
+    (build_covariates' *_hvdc_outage_mw_lost / *_ac_outage_mw_lost dose
+    variables) as MW LOST, so writing raw avail_qty into it for A78 rows
+    silently fed the wrong quantity (and in the wrong direction) into those
+    regressions. fetch_entsoe_outages() must leave capacity_mw unset (None)
+    for A78 rows rather than mislabel avail_qty as lost capacity, while still
+    computing a genuine lost-capacity figure for A77 rows."""
+
+    class _FakeEntsoeClient:
+        def __init__(self, api_key=None):
+            pass
+
+        def query_unavailability_of_production_units(self, country_code, start, end,
+                                                       docstatus=None):
+            return pd.DataFrame([{
+                "start": pd.Timestamp("2024-11-01T00:00:00Z"),
+                "end":   pd.Timestamp("2024-11-02T00:00:00Z"),
+                "nominal_power": 1000.0,
+                "avail_qty": 400.0,
+                "businesstype": "A54",
+                "mrid": "a77-1",
+                "production_resource_id": "GEN1",
+                "production_resource_name": "Test Plant",
+            }])
+
+        def query_unavailability_transmission(self, country_code_from, country_code_to,
+                                               start, end, docstatus=None):
+            return pd.DataFrame([{
+                "start": pd.Timestamp("2024-11-01T00:00:00Z"),
+                "end":   pd.Timestamp("2024-11-02T00:00:00Z"),
+                "avail_qty": 300.0,
+                "mrid": "a78-1",
+            }])
+
+    def test_a78_rows_leave_capacity_mw_unset(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient", self._FakeEntsoeClient)
+        df = fetch_entsoe_outages("2024-11-01T00:00:00Z", "2024-11-03T00:00:00Z",
+                                  country_code="FI")
+        a78 = df[df["source"] == "entsoe_a78"]
+        assert not a78.empty
+        assert a78["capacity_mw"].isna().all(), (
+            "A78 rows must not carry avail_qty (available capacity) as "
+            "capacity_mw — that field means MW LOST everywhere downstream")
+
+    def test_a78_avail_qty_preserved_in_raw_payload(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient", self._FakeEntsoeClient)
+        df = fetch_entsoe_outages("2024-11-01T00:00:00Z", "2024-11-03T00:00:00Z",
+                                  country_code="FI")
+        a78 = df[df["source"] == "entsoe_a78"]
+        payload = json.loads(a78.iloc[0]["raw_payload"])
+        assert payload["avail_qty_mw"] == 300.0
+
+    def test_a77_rows_still_compute_genuine_mw_lost(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient", self._FakeEntsoeClient)
+        df = fetch_entsoe_outages("2024-11-01T00:00:00Z", "2024-11-03T00:00:00Z",
+                                  country_code="FI")
+        a77 = df[df["source"] == "entsoe_a77"]
+        assert not a77.empty
+        # nominal_power=1000, avail_qty=400 -> 600 MW genuinely lost
+        assert a77.iloc[0]["capacity_mw"] == pytest.approx(600.0)
+
+    def test_a78_capacity_mw_none_zeroes_dose_not_active_dummy(self, no3_df):
+        """End-to-end: an A78-sourced HVDC outage with capacity_mw=None must
+        still set the binary *_active dummy (interval-based) but contribute
+        nothing to the *_hvdc_outage_mw_lost dose variable, rather than
+        silently coercing None into a nonzero 'lost MW' figure."""
+        jao_mid = no3_df["dateTimeUtc"].min() + pd.Timedelta(days=5)
+        outages = pd.DataFrame([{
+            "outage_id": "entsoe_a78:FI-SE_1:x:2024-11-01",
+            "start_utc": jao_mid.isoformat(),
+            "end_utc": (jao_mid + pd.Timedelta(hours=12)).isoformat(),
+            "asset_id": None, "asset_name": "FI->SE_1", "asset_type": "hvdc",
+            "voltage_kv": None, "capacity_mw": None, "planned_or_forced": "forced",
+            "bidding_zone": "FI", "control_area": "FI", "source": "entsoe_a78",
+            "raw_payload": "{}",
+        }])
+        cov = build_covariates(no3_df, outages, src="fi")
+        assert cov["fi_hvdc_outage_active"].sum() > 0
+        assert (cov["fi_hvdc_outage_mw_lost"] == 0).all()
 
 
 # ── 4. Covariate building ─────────────────────────────────────────────────────

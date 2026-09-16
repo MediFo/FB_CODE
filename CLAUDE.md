@@ -182,6 +182,27 @@ pytest test_pipeline.py -v
   toggle — this is a heuristic, not proof, but it's a season-independent,
   cheap, per-fetch cross-check rather than requiring a user to notice wrong
   results on their own.
+- ENTSO-E A78 (transmission unavailability) rows only carry `avail_qty` —
+  the capacity STILL AVAILABLE on that border during the outage — with no
+  nominal/rated capacity in entsoe-py's A78 parser to net it against.
+  This is NOT the same quantity as A77 (production), which carries both
+  `nominal_power` and `avail_qty`, so `cap_lost = nominal - avail` is
+  computable there. `capacity_mw` is treated everywhere downstream
+  (`build_covariates()`'s `*_hvdc_outage_mw_lost` / `*_ac_outage_mw_lost`
+  dose variables) as MW LOST — `fetch_entsoe_outages()` used to write raw
+  `avail_qty` straight into `capacity_mw` for A78 rows, silently feeding
+  the wrong quantity (available capacity, not lost capacity — roughly the
+  inverse relationship) into those regressions' dose covariates. Fixed:
+  A78 rows now leave `capacity_mw` unset (None/NULL) — `avail_qty` is kept
+  under `avail_qty_mw` in `raw_payload` for reference, but there is
+  currently no way to derive a genuine "MW lost" figure for a transmission
+  outage from ENTSO-E data alone. The binary `*_hvdc_outage_active` /
+  `*_ac_line_outage_active` dummies (built from the outage interval, not
+  capacity_mw) are unaffected and remain the primary H1/H2 treatment
+  variables — only the secondary continuous dose covariates lose their
+  A78 contribution; a genuine dose is still available wherever a manual
+  CSV row (human-curated as lost capacity directly) or an A77 row covers
+  the window.
 - Outage covariates are zero when no outage overlaps JAO window -> verdicts show as n/a
 - app_jao_NP_API_fix_d14.py's data fetch is day-batched (one PowerShell/
   Invoke-WebRequest call per calendar day, CET-aligned) rather than

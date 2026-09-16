@@ -697,7 +697,7 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                 continue
             for i, row in df.reset_index().iterrows():
                 try:
-                    cap = float(row.get("avail_qty", 0) or 0)
+                    avail_qty = float(row.get("avail_qty", 0) or 0)
                     is_hvdc = frozenset({fr, to}) in _HVDC_PAIRS
                     # Skip implausibly long records (>30 days = ENTSO-E status
                     # updates stored as new events, not real outages)
@@ -719,12 +719,26 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                         "asset_name": f"{fr}->{to}",
                         "asset_type": "hvdc" if is_hvdc else "ac_line",
                         "voltage_kv": None,
-                        "capacity_mw": cap,
+                        # A78's "avail_qty" is the capacity STILL AVAILABLE on this
+                        # border during the outage, not the MW lost — and unlike
+                        # A77, entsoe-py's A78 parser exposes no nominal/rated
+                        # capacity to net avail_qty against, so a genuine "MW lost"
+                        # figure isn't computable from this source alone. Leave
+                        # capacity_mw unset (None/NULL) rather than write avail_qty
+                        # into a field build_covariates() treats everywhere as a
+                        # dose (MW-lost) variable — it only gets that meaning right
+                        # for A77 rows (nominal - avail, computed above) and manual
+                        # CSV rows (curated as lost capacity directly by a human).
+                        # avail_qty is kept in raw_payload for reference. The
+                        # binary *_active dummy for this event comes from the
+                        # interval alone and is unaffected either way.
+                        "capacity_mw": None,
                         "planned_or_forced": "forced",  # entsoe-py issue #137
                         "bidding_zone": country_code,
                         "control_area": country_code,
                         "source": "entsoe_a78",
-                        "raw_payload": json.dumps({"from": fr, "to": to}),
+                        "raw_payload": json.dumps({"from": fr, "to": to,
+                                                   "avail_qty_mw": avail_qty}),
                     })
                 except Exception as e:
                     log_cb(f"  A78 row err: {e}")
