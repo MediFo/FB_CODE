@@ -1,10 +1,29 @@
-# FI -> NO3 Flow-Based Propagation — Claude Code Project
+# Nordic Flow-Based Propagation — Claude Code Project
 
 ## What this project does
-Validates whether Finnish (FI) maintenance outages propagate to NO3 CNEC
-parameters (F0, PTDF_FI, RAM, shadow price) in the Nordic day-ahead
-flow-based capacity calculation. Uses real JAO publication-tool data and
-ENTSO-E outage events. Runs PanelOLS regressions and produces an HTML report.
+Validates whether a Nordic country's maintenance outages propagate to a
+given bidding zone's CNEC parameters (F0/fall, PTDF, RAM, shadow price) in
+the Nordic day-ahead flow-based capacity calculation. Uses real JAO
+publication-tool data and ENTSO-E outage events. Runs PanelOLS regressions
+and produces an HTML report.
+
+The pipeline was originally scoped to a single FI -> NO3 check, but
+`run_pipeline()` has always taken `source_country`/`target_zone` as
+parameters (see `PipelineConfig`), so any Nordic source country
+(FI/SE/NO/DK) can be checked against any Nordic target zone
+(FI, SE1-4, NO1-5, DK1-2) in one run. `run_nordic_matrix()` (propagation.py)
+sweeps the full source x target grid in one go and produces a consolidated
+`nordic_matrix_report.html` alongside each pair's own `report.html` — use
+`run_analysis.py --all-nordic-zones` (optionally with
+`--source-countries`/`--target-zones` to narrow the sweep) rather than
+re-running `--source`/`--target` one pair at a time. FI -> NO3 remains the
+best-tested pair (it's what the synthetic generator and most of the manual
+outage curation target) but nothing in the pipeline is FI/NO3-specific
+anymore; `_ZONE_PATTERNS`/`_KNOWN_BORDERS` in propagation.py also carry
+Baltic zones (EE/LV/LT) for the same FB coupling, though those are excluded
+from the *default* Nordic sweep (`NORDIC_SOURCE_COUNTRIES`/
+`NORDIC_TARGET_ZONES`) — pass them explicitly via `run_nordic_matrix`'s
+`source_countries`/`target_zones` args if needed.
 
 This is the `fi_no3` installable package (see `pyproject.toml`) — the repo
 root doubles as the package root (`package-dir = {"fi_no3" = "."}`). This
@@ -34,7 +53,10 @@ run_analysis.py                — CLI entry point (also installed as the
 pyproject.toml                 — packaging: `pip install -e .` gives you
                                   `fi-no3-analyse` / `fi-no3-dash` console
                                   scripts
-manual_outages.csv             — hand-curated FI outage events (edit this)
+manual_outages.csv             — hand-curated outage events for any Nordic
+                                  source country (edit this; bidding_zone
+                                  column selects which country/zone a row
+                                  belongs to)
 ma_output/                     — generated Maintenance-Analysis outputs (Tab 9)
 map.png, map2.png, Slide1w.PNG — reference images used by the GUIs
 ```
@@ -55,16 +77,40 @@ fi-no3-dash
 # Launch the extended 9-tab GUI (JAO/Nord Pool fetch tooling)
 python app_jao_NP_API_fix_d14.py
 
-# CLI (no GUI)
-python run_analysis.py --synthetic --days 30 --out results/report.html
+# CLI (no GUI) — single source/target pair (defaults to FI -> NO3)
+python run_analysis.py --synthetic --days 30 --out results/
+python run_analysis.py --jao data/jao_export.csv --source SE --target NO1 --out results/
 # or, if installed:
-fi-no3-analyse --synthetic --days 30 --out results/report.html
+fi-no3-analyse --synthetic --days 30 --out results/
+
+# CLI — all Nordic bidding zones in one sweep (writes nordic_matrix_report.html
+# plus a per-pair results/<SRC>_<TGT>/report.html for every pair)
+python run_analysis.py --jao data/jao_export.csv --all-nordic-zones --out results/
+# narrow the sweep:
+python run_analysis.py --jao data/jao_export.csv --all-nordic-zones \
+    --source-countries FI,SE --target-zones NO1,NO2,NO3 --out results/
 
 # Run tests
 pytest test_pipeline.py -v
 ```
 
 ## Key domain facts Claude Code should know
+- All-Nordic-zones batch mode: `run_nordic_matrix()` in propagation.py runs
+  `run_pipeline()` once per (source_country, target_zone) pair — defaulting
+  to `NORDIC_SOURCE_COUNTRIES` (FI, SE, NO, DK) x `NORDIC_TARGET_ZONES`
+  (FI, SE1-4, NO1-5, DK1-2) — loading the JAO CSV once and fetching outages
+  once per source country (not once per pair) since the target zone is just
+  a CNEC-name filter over the same JAO export. A pair with no matching CNECs
+  or no overlapping outage data is recorded in the result's "skipped" list
+  with its reason rather than aborting the sweep; `build_report_ctx()` is
+  the ctx builder both the single-pair CLI path and each matrix pair use to
+  call `render_html_report()`, and `render_nordic_matrix_report()` writes
+  the consolidated `nordic_matrix_report.html` index (verdict-count matrix,
+  links to each pair's own report.html). Only wired into run_analysis.py
+  (`--all-nordic-zones`) so far — dashboard.py and
+  app_jao_NP_API_fix_d14.py's GUIs still only run one source/target pair
+  per click; extending them to launch a matrix sweep is a natural follow-up
+  but hasn't been done.
 - Nordic RAM formula: RAM = Fmax - FRM - fall + fnrao + AMR - FAAC - IVA
   (build_covariates() and decompose_delta_ram() implement all 7 terms — a
   previous version silently dropped AMR/IVA; the only in-repo check of that

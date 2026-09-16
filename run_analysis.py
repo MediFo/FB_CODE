@@ -1,13 +1,14 @@
 """
 scripts/run_analysis.py
 =======================
-CLI entry point for the FI -> NO3 propagation pipeline.
+CLI entry point for the Nordic flow-based propagation pipeline. Runs a
+single source-country -> bidding-zone pair (FI -> NO3 by default) or, with
+--all-nordic-zones, sweeps every Nordic source-country x target-zone pair.
 
 Usage:
     python scripts/run_analysis.py --jao data/jao_export.csv --out results/
-    python scripts/run_analysis.py --jao data/jao_export.csv \\
-        --outages data/manual_outages.csv --out results/ \\
-        --entsoe-key $ENTSOE_API_KEY
+    python scripts/run_analysis.py --jao data/jao_export.csv --source SE --target NO1
+    python scripts/run_analysis.py --jao data/jao_export.csv --all-nordic-zones --out results/
 
 Or run without arguments for interactive prompts.
 """
@@ -30,20 +31,24 @@ try:
     from fi_no3.propagation import (
         PipelineConfig, run_pipeline, load_jao_csv,
         load_manual_outages, render_html_report, summarize_hypotheses,
-        utc_to_cet_str,
+        utc_to_cet_str, build_report_ctx, run_nordic_matrix,
+        render_nordic_matrix_report, NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
     )
 except ImportError:
     from propagation import (
         PipelineConfig, run_pipeline, load_jao_csv,
         load_manual_outages, render_html_report, summarize_hypotheses,
-        utc_to_cet_str,
+        utc_to_cet_str, build_report_ctx, run_nordic_matrix,
+        render_nordic_matrix_report, NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
     )
 import pandas as pd
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="FI -> NO3 Flow-Based Propagation Analysis")
+        description="Nordic Flow-Based Propagation Analysis "
+                    "(any Nordic source-country -> bidding-zone pair, or "
+                    "--all-nordic-zones for the full sweep)")
     parser.add_argument("--jao",      required=False,
                         help="Path to JAO CSV export")
     parser.add_argument("--outages",  default="data/manual_outages.csv",
@@ -70,6 +75,30 @@ def main():
                              "(with --synthetic); 1.0 = large/easy-to-detect "
                              "default, e.g. 0.1 for a small, economically "
                              "realistic effect size")
+    parser.add_argument("--all-nordic-zones", action="store_true",
+                        help="Batch mode: run the pipeline across every Nordic "
+                             "source-country x target-zone pair (default: "
+                             f"sources={','.join(NORDIC_SOURCE_COUNTRIES)}, "
+                             f"targets={','.join(NORDIC_TARGET_ZONES)}) instead "
+                             "of the single --source/--target pair, and write "
+                             "one consolidated nordic_matrix_report.html plus "
+                             "a per-pair report.html under --out/<SRC>_<TGT>/.")
+    parser.add_argument("--source-countries", default="",
+                        help="Comma-separated ENTSO-E country codes to sweep "
+                             "with --all-nordic-zones (default: all Nordic "
+                             f"countries, {','.join(NORDIC_SOURCE_COUNTRIES)})")
+    parser.add_argument("--target-zones", default="",
+                        help="Comma-separated bidding-zone codes to sweep "
+                             "with --all-nordic-zones (default: all Nordic "
+                             f"zones, {','.join(NORDIC_TARGET_ZONES)})")
+    parser.add_argument("--source", default="FI",
+                        help="ENTSO-E country code for the outage source "
+                             "(single-pair mode only; ignored with "
+                             "--all-nordic-zones)")
+    parser.add_argument("--target", default="NO3",
+                        help="Bidding zone to analyse / CNEC filter "
+                             "(single-pair mode only; ignored with "
+                             "--all-nordic-zones)")
     parser.add_argument("--jao-timestamp-zone", choices=["UTC", "CET"], default="UTC",
                         help="What timezone the JAO CSV's dateTimeUtc column "
                              "is ACTUALLY in (with --jao; ignored with "
@@ -149,11 +178,50 @@ def main():
         end_utc        = args.end,
         use_entsoe     = not args.no_entsoe,
         use_manual     = True,
+        source_country = args.source.upper(),
+        target_zone    = args.target.upper(),
         jao_timestamp_zone = args.jao_timestamp_zone,
     )
 
-    # ── Run ────────────────────────────────────────────────────────────────
+    # ── All-Nordic-zones batch mode ───────────────────────────────────────────
+    if args.all_nordic_zones:
+        src_list = ([s.strip().upper() for s in args.source_countries.split(",") if s.strip()]
+                   or list(NORDIC_SOURCE_COUNTRIES))
+        tgt_list = ([t.strip().upper() for t in args.target_zones.split(",") if t.strip()]
+                   or list(NORDIC_TARGET_ZONES))
+        log(f"Running all-Nordic-zones sweep: {len(src_list)} source countries x "
+            f"{len(tgt_list)} target zones = {len(src_list) * len(tgt_list)} pairs...")
+        matrix = run_nordic_matrix(cfg, jao_df=jao_df, outages_df=outages_df,
+                                   source_countries=src_list, target_zones=tgt_list,
+                                   log_cb=log)
+        index_path = render_nordic_matrix_report(cfg.out_dir, matrix)
+
+        print()
+        print("=" * 65)
+        print("NORDIC BIDDING-ZONE SWEEP SUMMARY")
+        print("=" * 65)
+        for (src, tgt), pair in matrix["pairs"].items():
+            n_sig = sum(1 for h in pair["hypotheses"]
+                       if h["id"] in ("H1", "H2", "H3", "H4")
+                       and ("SIGNIFICANT" in h["verdict"] or "SUPPORTED" in h["verdict"]))
+            print(f"  {src:>3} -> {tgt:<4}  {n_sig}/4 significant  "
+                 f"(n_no3={pair['n_no3']:,}, n_outages={pair['n_outages']})")
+        if matrix["skipped"]:
+            print()
+            print(f"  {len(matrix['skipped'])} pair(s) skipped (no CNECs/outage overlap/regression failure):")
+            for s in matrix["skipped"]:
+                print(f"    {s['source_country']} -> {s['target_zone']}: "
+                     f"{str(s['reason']).splitlines()[0][:120]}")
+
+        print()
+        print(f"Outputs saved to: {matrix['out_dir']}/")
+        print(f"  nordic_matrix_report.html  (open in browser — {index_path})")
+        print("  <SRC>_<TGT>/report.html  (per-pair detail, one per successful pair)")
+        return
+
+    # ── Run (single source/target pair) ───────────────────────────────────────
     res = run_pipeline(cfg, jao_df=jao_df, outages_df=outages_df, log_cb=log)
+    report_path = render_html_report(cfg.out_dir, build_report_ctx(res, n_jao=len(jao_df)))
 
     # ── Print results ──────────────────────────────────────────────────────
     print()
@@ -171,17 +239,20 @@ def main():
     print("=" * 65)
     print("REGRESSION SUMMARIES")
     print("=" * 65)
-    for name, label in [("f0","F0"), ("ptdf_FI","PTDF_FI"), ("ram","RAM"),
-                         ("shadowPrice","Shadow price"), ("frm","FRM (H6 placebo)")]:
+    _src = cfg.source_country.lower()
+    for name, label in [("f0", cfg.source_country + " reference flow (F0)"),
+                         (f"ptdf_{cfg.source_country}_abs", f"|PTDF_{cfg.source_country}|"),
+                         ("ram", "RAM"), ("shadowPrice", "Shadow price"),
+                         ("frm", "FRM (H6 placebo)")]:
         r = res["regressions"].get(name)
         if not r:
             print(f"  {label}: not available")
             continue
         print(f"  {label}: n={r['n_obs']:,}  R²_within={r['rsquared_within']:.3f}")
         cf = r["coefs"]
-        outage_vars = ["fi_planned_outage_active", "fi_forced_outage_active",
-                       "fi_hvdc_outage_active", "fi_ac_line_outage_active",
-                       "fi_gen_outage_mw_lost"]
+        outage_vars = [f"{_src}_planned_outage_active", f"{_src}_forced_outage_active",
+                       f"{_src}_hvdc_outage_active", f"{_src}_ac_line_outage_active",
+                       f"{_src}_gen_outage_mw_lost"]
         for v in outage_vars:
             row = cf[cf.param == v]
             if not row.empty:

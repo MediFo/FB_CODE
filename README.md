@@ -1,10 +1,14 @@
-# fi_no3 — FI → NO3 Flow-Based Propagation
+# fi_no3 — Nordic Flow-Based Propagation
 
-Validates whether Finnish (FI) maintenance and forced outages propagate to
-NO3 CNEC parameters (`F_allReference`, `PTDF_FI`, `RAM`, shadow price) in the
-Nordic day-ahead flow-based capacity calculation. The pipeline works from
-real JAO Publication Tool exports and ENTSO-E outage events, runs panel
-regressions per hypothesis, and produces an HTML report.
+Validates whether a Nordic country's maintenance and forced outages
+propagate to a given bidding zone's CNEC parameters (`F_allReference`,
+PTDF, `RAM`, shadow price) in the Nordic day-ahead flow-based capacity
+calculation. The pipeline works from real JAO Publication Tool exports and
+ENTSO-E outage events, runs panel regressions per hypothesis, and produces
+an HTML report — either for a single source-country → target-zone pair
+(FI → NO3 by default) or, with `--all-nordic-zones`, for every Nordic
+source country (FI/SE/NO/DK) against every Nordic bidding zone
+(FI, SE1–4, NO1–5, DK1–2) in one consolidated report.
 
 This is a diagnostic/statistical analysis tool that reads already-published
 Nordic FBMC parameters — it does not implement or simulate the capacity
@@ -34,8 +38,12 @@ python dashboard.py
 # Windows PowerShell, on top of the same propagation.py backend)
 python app_jao_NP_API_fix_d14.py
 
-# CLI, no GUI required
-python run_analysis.py --synthetic --days 30 --out results/report.html
+# CLI, no GUI required — single pair (defaults to FI -> NO3)
+python run_analysis.py --synthetic --days 30 --out results/
+python run_analysis.py --jao data/jao_export.csv --source SE --target NO1 --out results/
+
+# CLI — every Nordic source-country x bidding-zone pair in one sweep
+python run_analysis.py --jao data/jao_export.csv --all-nordic-zones --out results/
 
 # Test suite
 pytest test_pipeline.py -v
@@ -76,13 +84,18 @@ template the code writes when the file is missing, not curated data. Point
 
 ## What it tests
 
+Shown below for the FI → NO3 default; the same six hypotheses are built for
+any source country / target zone pair (`SRC`/`TGT`) via
+`_build_hypotheses(src, tgt)` — running `--all-nordic-zones` evaluates all
+six for every pair in the sweep.
+
 | ID | Hypothesis |
 |----|------------|
-| H1 | FI HVDC outage shifts `fall` (sign-normalised F_allReference) on NO3 CNECs |
-| H2 | FI AC line outage shifts `|PTDF_FI|` on NO3 CNECs (topology-only effect) |
-| H3 | FI forced outage changes RAM on NO3 CNECs |
-| H4 | FI forced outage changes shadow price on binding NO3 CNECs |
-| H5 | IVA is more frequent under forced than planned FI outages |
+| H1 | SRC HVDC outage shifts `fall` (sign-normalised F_allReference) on TGT CNECs |
+| H2 | SRC AC line outage shifts `|PTDF_SRC|` on TGT CNECs (topology-only effect) |
+| H3 | SRC forced outage changes RAM on TGT CNECs |
+| H4 | SRC forced outage changes shadow price on binding TGT CNECs |
+| H5 | IVA is more frequent under forced than planned SRC outages |
 | H6 | Placebo — FRM should **not** move with individual outage events |
 
 Multiple-testing correction (Holm–Bonferroni) is applied across H1–H4, and a

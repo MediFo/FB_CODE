@@ -25,7 +25,7 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
@@ -297,6 +297,21 @@ DEFAULT_NO3_PATTERNS: tuple = _ZONE_PATTERNS["NO3"]
 def zone_patterns(target_zone: str) -> tuple:
     """Return CNEC name regex patterns for a given bidding zone code."""
     return _ZONE_PATTERNS.get(target_zone.upper(), ())
+
+
+# ── All-Nordic-zones batch mode ──────────────────────────────────────────────
+# This app was originally scoped to a single FI -> NO3 outage-propagation
+# check. run_pipeline() itself has always been parameterised by
+# source_country/target_zone; NORDIC_SOURCE_COUNTRIES x NORDIC_TARGET_ZONES is
+# the full sweep run_nordic_matrix() drives so the app covers every Nordic
+# bidding zone, not just FI/NO3. Baltic zones (EE/LV/LT) are in _ZONE_PATTERNS
+# too (they're part of the same FB coupling) but are deliberately excluded
+# from the default Nordic sweep — add them explicitly via run_nordic_matrix's
+# source_countries/target_zones args if needed.
+NORDIC_SOURCE_COUNTRIES: tuple = ("FI", "SE", "NO", "DK")
+NORDIC_TARGET_ZONES: tuple = ("FI", "SE1", "SE2", "SE3", "SE4",
+                              "NO1", "NO2", "NO3", "NO4", "NO5",
+                              "DK1", "DK2")
 
 
 # ---------- ENTSO-E A78 cross-border query configuration --------------------
@@ -2027,8 +2042,10 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     html_parts = []
     a = html_parts.append
+    src_lbl = ctx.get("source_country", "FI")
+    tgt_lbl = ctx.get("target_zone", "NO3")
     a("<!doctype html><html><head><meta charset='utf-8'>")
-    a("<title>FI -> NO3 FB Propagation Report</title>")
+    a(f"<title>{src_lbl} -> {tgt_lbl} FB Propagation Report</title>")
     a("<style>")
     a("body{font-family:Georgia,serif;max-width:1100px;margin:32px auto;padding:0 24px;color:#1a1a1a;line-height:1.55}")
     a("h1,h2{font-family:'Helvetica Neue',sans-serif;letter-spacing:-0.02em}")
@@ -2042,8 +2059,6 @@ def render_html_report(out_dir: str, ctx: dict) -> str:
     a(".v-supported{color:#27ae60;font-weight:600}.v-no{color:#c0392b;font-weight:600}")
     a("img{max-width:100%;margin:12px 0;border:1px solid #ccc}")
     a("</style></head><body>")
-    src_lbl = ctx.get("source_country", "FI")
-    tgt_lbl = ctx.get("target_zone", "NO3")
     a(f"<h1>{src_lbl} → {tgt_lbl} Flow-Based Propagation: Validation Report</h1>")
     a(f"<p><em>Generated {ctx.get('ts','')}.</em> "
       f"JAO rows: {ctx.get('n_jao',0)} | NO3 rows analysed: {ctx.get('n_no3',0)} | "
@@ -2368,6 +2383,188 @@ def run_pipeline(cfg: PipelineConfig, jao_df: pd.DataFrame | None = None,
         "target_zone": cfg.target_zone,
         "overlapping_outages": overlapping if not outages.empty else pd.DataFrame(),
     }
+
+
+def build_report_ctx(res: dict, n_jao: int = 0) -> dict:
+    """Build the ctx dict render_html_report() expects, from a run_pipeline()
+    result. Shared by the single-pair CLI path and run_nordic_matrix()'s
+    per-pair reports; carries no diagnostic figures (dashboard.py builds
+    those separately with matplotlib for its own report)."""
+    def block(name: str) -> str:
+        r = res["regressions"].get(name)
+        return r.get("summary_text", "n/a") if r else "n/a"
+
+    src = res["source_country"]
+    tgt = res["target_zone"]
+    logit = res.get("logit") or {}
+    return {
+        "ts": utc_to_cet_str(datetime.now(timezone.utc), "%Y-%m-%d %H:%M:%S") + " CET",
+        "n_jao": n_jao,
+        "source_country": src,
+        "target_zone": tgt,
+        "n_no3": len(res["no3"]),
+        "n_outages": len(res["outages"]),
+        "hypotheses": res["hypotheses"],
+        "summary_f0": block("fall_signed"),
+        "summary_ptdf_FI": block(f"ptdf_{src}_abs"),
+        "summary_ram": block("ram"),
+        "summary_shadowPrice": block("shadowPrice"),
+        "summary_frm": block("frm"),
+        "summary_logit": logit.get("summary_text", "n/a"),
+        "figures": [],
+        "caveats": (
+            f"Outage source: {src}. Target zone: {tgt}. "
+            f"ENTSO-E A78 returns mostly forced events; planned {src} line "
+            f"outages are best curated manually via the manual CSV. Use the "
+            f"placebo on FRM (H6) as a sanity check; if FRM moves with outage "
+            f"covariates, the model is mis-specified. See CLAUDE.md for the "
+            f"economic-significance floors and standard-error fallback notes "
+            f"that apply to every regression above."
+        ),
+    }
+
+
+def run_nordic_matrix(base_cfg: PipelineConfig,
+                      jao_df: pd.DataFrame | None = None,
+                      outages_df: pd.DataFrame | None = None,
+                      source_countries: Sequence[str] = NORDIC_SOURCE_COUNTRIES,
+                      target_zones: Sequence[str] = NORDIC_TARGET_ZONES,
+                      log_cb: LogCallback = _noop) -> dict:
+    """Run the propagation pipeline across every (source_country, target_zone)
+    combination in the Nordic bidding-zone grid and return a consolidated
+    result, instead of the single FI -> NO3 pair run_pipeline() checks alone.
+
+    The JAO CSV is loaded once (every target zone is just a CNEC-name filter
+    over the same file), and outages are fetched once per source country
+    (shared across that country's target zones) rather than once per pair —
+    both to avoid redundant ENTSO-E calls and to keep a 4x12-pair sweep
+    tractable. Per-pair failures (no CNECs for that zone in this JAO export,
+    no outages overlapping the window, a regression that didn't converge) are
+    recorded in "skipped" rather than aborting the whole sweep.
+    """
+    out_root = Path(base_cfg.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    if jao_df is None:
+        log_cb(f"Loading JAO CSV: {base_cfg.jao_csv}")
+        jao_df = load_jao_csv(base_cfg.jao_csv, log_cb=log_cb,
+                              jao_timestamp_zone=base_cfg.jao_timestamp_zone)
+    log_cb(f"  JAO rows: {len(jao_df)}, CNECs: {jao_df['cneName'].nunique()}")
+
+    pairs: dict = {}
+    skipped: list = []
+    outages_by_src: dict = {}
+
+    for src in source_countries:
+        if outages_df is not None:
+            outages_by_src[src] = outages_df
+        else:
+            log_cb(f"--- Fetching outages for source country {src} ---")
+            con = open_cache(base_cfg.cache_db)
+            if base_cfg.use_entsoe:
+                df_es = fetch_entsoe_outages(base_cfg.start_utc, base_cfg.end_utc,
+                                             log_cb=log_cb, country_code=src)
+                if not df_es.empty:
+                    upsert_events(con, df_es.to_dict("records"))
+            if base_cfg.use_manual:
+                df_m = load_manual_outages(base_cfg.manual_csv, log_cb=log_cb)
+                if not df_m.empty:
+                    upsert_events(con, df_m.to_dict("records"))
+            all_outages = load_cached_outages(con)
+            all_outages = deduplicate_outages(all_outages, log_cb=log_cb)
+            con.close()
+            outages_by_src[src] = all_outages
+
+        for tgt in target_zones:
+            pair_out = str(out_root / f"{src}_{tgt}")
+            pair_cfg = replace(base_cfg, source_country=src, target_zone=tgt,
+                               no3_patterns=zone_patterns(tgt) or DEFAULT_NO3_PATTERNS,
+                               out_dir=pair_out)
+            log_cb(f"=== {src} -> {tgt} ===")
+            try:
+                res = run_pipeline(pair_cfg, jao_df=jao_df,
+                                   outages_df=outages_by_src[src], log_cb=log_cb)
+            except Exception as e:
+                log_cb(f"  skipped: {e}")
+                skipped.append({"source_country": src, "target_zone": tgt,
+                                "reason": str(e)})
+                continue
+
+            report_path = render_html_report(pair_out, build_report_ctx(res, n_jao=len(jao_df)))
+            pairs[(src, tgt)] = {
+                "hypotheses": res["hypotheses"],
+                "n_no3": len(res["no3"]),
+                "n_outages": len(res["outages"]),
+                "report_path": report_path,
+            }
+
+    return {
+        "pairs": pairs,
+        "skipped": skipped,
+        "out_dir": str(out_root),
+        "source_countries": list(source_countries),
+        "target_zones": list(target_zones),
+    }
+
+
+def render_nordic_matrix_report(out_dir: str, matrix: dict) -> str:
+    """Render a consolidated index.html for run_nordic_matrix()'s sweep: a
+    source x target verdict-count matrix, each cell linking to that pair's
+    full report.html (written alongside it by run_nordic_matrix)."""
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    ts = utc_to_cet_str(datetime.now(timezone.utc), "%Y-%m-%d %H:%M:%S") + " CET"
+    html_parts = []
+    a = html_parts.append
+    a("<!doctype html><html><head><meta charset='utf-8'>")
+    a("<title>Nordic Flow-Based Propagation — All Bidding Zones</title>")
+    a("<style>")
+    a("body{font-family:Georgia,serif;max-width:1200px;margin:32px auto;padding:0 24px;color:#1a1a1a;line-height:1.55}")
+    a("h1,h2{font-family:'Helvetica Neue',sans-serif;letter-spacing:-0.02em}")
+    a("h1{border-bottom:3px solid #c0392b;padding-bottom:8px}")
+    a("table{border-collapse:collapse;margin:10px 0;font-size:0.9em}")
+    a("th,td{border:1px solid #aaa;padding:5px 9px;text-align:center}")
+    a("th{background:#f4f4f4}")
+    a("th.src-hdr{text-align:left}")
+    a("a{color:#2c3e50;text-decoration:none}a:hover{text-decoration:underline}")
+    a(".n-sig{background:#fde9e7}.n-none{color:#888}")
+    a("</style></head><body>")
+    a("<h1>Nordic Flow-Based Propagation — All Bidding Zones</h1>")
+    a(f"<p><em>Generated {ts}.</em> Source countries: {', '.join(matrix['source_countries'])} | "
+      f"Target zones: {', '.join(matrix['target_zones'])}</p>")
+
+    a("<h2>Verdict matrix</h2>")
+    a("<p>Each cell counts how many of H1–H4 (of 4) came back SIGNIFICANT/SUPPORTED for "
+      "that source → target pair; H5/H6 are diagnostics and not counted here. Click a "
+      "cell to open its full regression report. A dash means that pair had no overlapping "
+      "CNECs or outage data in this JAO/outage window and was skipped.</p>")
+    a("<table><tr><th class='src-hdr'>Source \\ Target</th>" +
+      "".join(f"<th>{t}</th>" for t in matrix["target_zones"]) + "</tr>")
+    for src in matrix["source_countries"]:
+        a(f"<tr><th class='src-hdr'>{src}</th>")
+        for tgt in matrix["target_zones"]:
+            pair = matrix["pairs"].get((src, tgt))
+            if pair is None:
+                a("<td>—</td>")
+                continue
+            n_sig = sum(1 for h in pair["hypotheses"]
+                       if h["id"] in ("H1", "H2", "H3", "H4")
+                       and ("SIGNIFICANT" in h["verdict"] or "SUPPORTED" in h["verdict"]))
+            cls = "n-sig" if n_sig > 0 else "n-none"
+            a(f"<td class='{cls}'><a href='{src}_{tgt}/report.html'>{n_sig}/4</a></td>")
+        a("</tr>")
+    a("</table>")
+
+    if matrix.get("skipped"):
+        a("<h2>Skipped pairs</h2><table><tr><th>Source</th><th>Target</th><th>Reason</th></tr>")
+        for s in matrix["skipped"]:
+            reason = str(s["reason"]).split("\n")[0][:200]
+            a(f"<tr><td>{s['source_country']}</td><td>{s['target_zone']}</td><td>{reason}</td></tr>")
+        a("</table>")
+
+    a("</body></html>")
+    out_file = out / "nordic_matrix_report.html"
+    out_file.write_text("\n".join(html_parts), encoding="utf-8")
+    return str(out_file)
 
 
 # ===========================================================================

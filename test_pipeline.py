@@ -38,6 +38,8 @@ from propagation import (
     DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str, jao_datetime_to_utc,
     build_event_time_dummies, run_event_study,
     single_event_analysis, pre_period_abs_ptdf,
+    build_report_ctx, run_nordic_matrix, render_nordic_matrix_report,
+    NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
 )
 import propagation as _pipe
 
@@ -535,6 +537,82 @@ class TestFullPipeline:
                              use_entsoe=False, use_manual=False)
         res = run_pipeline(cfg, jao_df=jao, outages_df=single)
         assert "hypotheses" in res
+
+
+class TestNordicMatrix:
+    """The all-Nordic-zones batch mode: run_nordic_matrix() sweeps every
+    (source_country, target_zone) pair instead of the single FI -> NO3 pair
+    run_pipeline() checks alone. The synthetic dataset only has CNECs
+    labelled NO3/NO4/NO5, so a wider sweep (incl. SE1, a zone absent from
+    the synthetic file) also exercises the "gracefully skip, don't crash"
+    path for a target zone with no matching CNECs."""
+
+    def test_matrix_constants_cover_all_nordic_zones(self):
+        assert set(NORDIC_SOURCE_COUNTRIES) == {"FI", "SE", "NO", "DK"}
+        assert set(NORDIC_TARGET_ZONES) == {
+            "FI", "SE1", "SE2", "SE3", "SE4",
+            "NO1", "NO2", "NO3", "NO4", "NO5", "DK1", "DK2",
+        }
+
+    def test_matrix_runs_successful_and_skipped_pairs(self, synthetic_dir, tmp_path):
+        jao     = load_jao_csv(synthetic_dir["jao_path"])
+        outages = pd.read_csv(synthetic_dir["outages_path"])
+        cfg = PipelineConfig(out_dir=str(tmp_path / "matrix"),
+                             use_entsoe=False, use_manual=False)
+        matrix = run_nordic_matrix(
+            cfg, jao_df=jao, outages_df=outages,
+            source_countries=["FI", "NO"], target_zones=["NO3", "NO4", "SE1"])
+
+        # NO3/NO4 exist in the synthetic file for both source countries
+        assert ("FI", "NO3") in matrix["pairs"]
+        assert ("FI", "NO4") in matrix["pairs"]
+        assert ("NO", "NO3") in matrix["pairs"]
+        assert ("NO", "NO4") in matrix["pairs"]
+        # SE1 has no CNECs in the synthetic file for either source -> skipped, not crashed
+        skipped_pairs = {(s["source_country"], s["target_zone"]) for s in matrix["skipped"]}
+        assert ("FI", "SE1") in skipped_pairs
+        assert ("NO", "SE1") in skipped_pairs
+
+    def test_matrix_pair_result_has_hypotheses_and_report(self, synthetic_dir, tmp_path):
+        jao     = load_jao_csv(synthetic_dir["jao_path"])
+        outages = pd.read_csv(synthetic_dir["outages_path"])
+        cfg = PipelineConfig(out_dir=str(tmp_path / "matrix2"),
+                             use_entsoe=False, use_manual=False)
+        matrix = run_nordic_matrix(
+            cfg, jao_df=jao, outages_df=outages,
+            source_countries=["FI"], target_zones=["NO3"])
+        pair = matrix["pairs"][("FI", "NO3")]
+        assert len(pair["hypotheses"]) == 6
+        assert Path(pair["report_path"]).exists()
+
+    def test_matrix_default_zones_used_when_not_specified(self, synthetic_dir, tmp_path):
+        jao     = load_jao_csv(synthetic_dir["jao_path"])
+        outages = pd.read_csv(synthetic_dir["outages_path"])
+        cfg = PipelineConfig(out_dir=str(tmp_path / "matrix3"),
+                             use_entsoe=False, use_manual=False)
+        matrix = run_nordic_matrix(cfg, jao_df=jao, outages_df=outages)
+        assert matrix["source_countries"] == list(NORDIC_SOURCE_COUNTRIES)
+        assert matrix["target_zones"] == list(NORDIC_TARGET_ZONES)
+        # Every Nordic source country x zone pair was attempted (either
+        # succeeded or was recorded as skipped) -- nothing silently dropped.
+        attempted = set(matrix["pairs"].keys()) | {
+            (s["source_country"], s["target_zone"]) for s in matrix["skipped"]}
+        expected = {(s, t) for s in NORDIC_SOURCE_COUNTRIES for t in NORDIC_TARGET_ZONES}
+        assert attempted == expected
+
+    def test_matrix_index_report_rendered(self, synthetic_dir, tmp_path):
+        jao     = load_jao_csv(synthetic_dir["jao_path"])
+        outages = pd.read_csv(synthetic_dir["outages_path"])
+        cfg = PipelineConfig(out_dir=str(tmp_path / "matrix4"),
+                             use_entsoe=False, use_manual=False)
+        matrix = run_nordic_matrix(
+            cfg, jao_df=jao, outages_df=outages,
+            source_countries=["FI"], target_zones=["NO3", "SE1"])
+        index_path = render_nordic_matrix_report(cfg.out_dir, matrix)
+        assert Path(index_path).exists()
+        html = Path(index_path).read_text()
+        assert "FI_NO3/report.html" in html
+        assert "Skipped pairs" in html  # SE1 has no CNECs in synthetic data
 
 
 # ── 10. Regressions for previously-fixed bugs (audit) ─────────────────────────
