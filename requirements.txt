@@ -1,0 +1,32 @@
+# Full dependency set for this project (GUIs, CLI, regressions, ENTSO-E
+# fetch, and the test suite). Mirrors pyproject.toml's [project.dependencies]
+# plus its "regression" and "entsoe" optional-dependency groups -- keep the
+# two in sync if either changes.
+#
+# Install with:
+#     pip install -r requirements.txt
+#
+# (Editable install via `pip install -e .` also works and additionally
+# gives you the fi-no3-analyse / fi-no3-dash console scripts -- see
+# CLAUDE.md's "How to run" section. Use requirements.txt instead when you
+# just want the dependencies without installing this package itself.)
+
+# ── Core (always required) ───────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+requests>=2.28
+jinja2>=3.1
+
+# ── Regression stack (Run Analysis / Results / Single Event / DiD in
+#    Tab 9, and run_panel_regression()/run_logit_iva() in propagation.py) ──
+statsmodels>=0.14
+linearmodels>=6.0
+scipy>=1.10
+
+# ── ENTSO-E live outage fetch (Tab 9's "Fetch from ENTSO-E" button,
+#    fetch_entsoe_outages() in propagation.py) ──────────────────────────
+entsoe-py>=0.6
+
+# ── Test suite ────────────────────────────────────────────────────────────
+pytest>=7.0

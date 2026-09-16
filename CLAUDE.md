@@ -61,6 +61,10 @@ run_analysis.py                — CLI entry point (also installed as the
 pyproject.toml                 — packaging: `pip install -e .` gives you
                                   `fi-no3-analyse` / `fi-no3-dash` console
                                   scripts
+requirements.txt                — plain dependency list (core + regression +
+                                  entsoe-py + pytest, mirrors pyproject.toml)
+                                  for `pip install -r requirements.txt`
+                                  without installing this package itself
 manual_outages.csv             — hand-curated outage events for any Nordic
                                   source country (edit this; bidding_zone
                                   column selects which country/zone a row
@@ -76,8 +80,13 @@ map.png, map2.png, Slide1w.PNG — reference images used by the GUIs
 # Editable install (one time) — also creates the fi-no3-analyse /
 # fi-no3-dash console scripts
 pip install -e .
-# or, without installing: pip install pandas numpy matplotlib requests jinja2 \
-#   statsmodels linearmodels entsoe-py
+# or, without installing: pip install -r requirements.txt
+# Either way, install into the SAME Python/venv you'll actually run the
+# scripts with -- a missing statsmodels/linearmodels/entsoe-py doesn't
+# crash the app, it silently degrades (empty regressions/DiD, "0 events"
+# fetches) with the real cause easy to miss; app_jao_NP_API_fix_d14.py
+# now surfaces these explicitly where they matter (see below) but
+# installing everything up front avoids hitting them one at a time.
 
 # Launch the main dashboard
 python dashboard.py

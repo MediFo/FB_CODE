@@ -27,6 +27,11 @@ copy of the same project — see `CLAUDE.md` for background if you need it.
 # Editable install — also creates the fi-no3-analyse / fi-no3-dash console
 # scripts
 pip install -e .
+# or, without installing this package: pip install -r requirements.txt
+# Either way, use the SAME Python/venv you'll run the scripts with — a
+# missing statsmodels/linearmodels/entsoe-py degrades silently rather than
+# crashing (empty regressions, "0 events" fetches), so install everything
+# up front rather than one at a time as each gap surfaces.
 
 # Main GUI (6 tabs — outage sources, JAO load, hypotheses, single-event,
 # report, and the reverse-engineered richer pipeline)
@@ -65,6 +70,8 @@ synthetic.py                   synthetic JAO + outage data generator, for
 run_analysis.py                CLI entry point / fi-no3-analyse console script
 test_pipeline.py               pytest suite
 pyproject.toml                 packaging (editable install, console scripts)
+requirements.txt                plain dependency list (mirrors pyproject.toml)
+                                for `pip install -r requirements.txt`
 manual_outages.csv             hand-curated FI outage events (edit this; the
                                 checked-in copy is the auto-generated template
                                 — replace it with real events before relying
