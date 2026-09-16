@@ -1822,6 +1822,7 @@ class App:
         # plotting a fabricated flat-zero line for an absent field.
         pf_missing = all(m for _, m in pf_flagged) if pf_flagged else False
         pt_missing = all(m for _, m in pt_flagged) if pt_flagged else False
+        ptdf_missing = pf_missing or pt_missing
 
         # ── Tab 3 ──────────────────────────────────────────────────
         self.fig3.clear()
@@ -1864,7 +1865,6 @@ class App:
         a2.plot(x_idx, pt_l,  color=C_AMBER,   linewidth=1.5, label=z_t)
         a2.plot(x_idx, diffs, color=C_MUTED,   linewidth=1.0, linestyle='--', label='Δ PTDF')
         a2.set_ylabel("PTDF", fontsize=8.5)
-        ptdf_missing = pf_missing or pt_missing
         ptdf_title = "PTDF" + ("  ⚠ field absent for one or both zones — shown as 0"
                                 if ptdf_missing else "")
         a2.set_title(ptdf_title, color=(C_AMBER if ptdf_missing else C_ACCENT))
