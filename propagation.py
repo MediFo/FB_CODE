@@ -62,6 +62,13 @@ try:
 except (ImportError, AttributeError, Exception):
     EntsoePandasClient = None
 
+try:
+    from entsoe.exceptions import NoMatchingDataError as _EntsoeNoDataError
+except (ImportError, AttributeError, Exception):
+    class _EntsoeNoDataError(Exception):
+        """Placeholder used only for isinstance() checks when entsoe-py
+        isn't installed -- never actually raised."""
+
 
 LogCallback = Callable[[str], None]
 def _noop(msg: str) -> None: ...
@@ -610,17 +617,39 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         except Exception:
             return None
 
+    def _is_no_matching_data(e: Exception) -> bool:
+        """True if e signals "this query genuinely has no data" rather than
+        a real failure. entsoe-py itself parses ENTSO-E's XML acknowledgement
+        body for "No matching data found" and re-raises a CLEAN, EMPTY-
+        MESSAGE entsoe.exceptions.NoMatchingDataError (str(e) == '') -- it
+        does not surface the original text, so a plain string check for
+        "400"/"No matching data found" against str(e) (still checked below,
+        for a raw requests.HTTPError that hasn't gone through entsoe-py's own
+        parsing) never matches entsoe-py's own exception. Confirmed live:
+        several genuinely-unpublished NO/SE/DE/GB A78 border pairs each
+        raised NoMatchingDataError with an empty message, which fell through
+        to 2 wasted retries per border and got counted as a real fetch
+        failure (surfacing as a false "N/M borders failed" warning) before
+        this check existed."""
+        if isinstance(e, _EntsoeNoDataError):
+            return True
+        err_str = str(e)
+        return "400" in err_str or "No matching data found" in err_str
+
     def _with_retry(fn, label: str, retries: int = 2, delay_s: float = 2.0):
         """Retry a transient ENTSO-E query failure (timeout, connection
         reset, 5xx) instead of dropping that query's events for the whole
-        run after a single blip. A 4xx/"no data" response is not transient
-        (retrying it wastes time and gets the same answer), so the caller
-        is expected to have already excluded those before calling this."""
+        run after a single blip. A "no data" response is not transient
+        (retrying it wastes time and gets the same answer) and is not a
+        failure either -- it's short-circuited here as an empty success."""
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
                 return fn(), None
             except Exception as e:
+                if _is_no_matching_data(e):
+                    log_cb(f"  {label}: no data in ENTSO-E TP (skipped)")
+                    return pd.DataFrame(), None
                 last_exc = e
                 if attempt < retries:
                     log_cb(f"  {label}: attempt {attempt} failed ({e}); retrying...")
@@ -691,10 +720,12 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         try:
             df = _query_this_border()
         except Exception as e:
-            err_str = str(e)
-            if "400" in err_str or "No matching data found" in err_str:
-                # 400 = border not published in ENTSO-E TP (normal for many
-                # FI borders) -- not transient, retrying gets the same answer.
+            if _is_no_matching_data(e):
+                # Border not published in ENTSO-E TP (normal for many FI
+                # borders) -- not transient, retrying gets the same answer.
+                # (_with_retry() below also catches this, but checking here
+                # too avoids one redundant network round-trip for a border
+                # we already know is no-data from this very attempt.)
                 log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
                 continue
             df, retry_err = _with_retry(_query_this_border, label=f"ENTSO-E A78 {fr}->{to}",
