@@ -20,8 +20,6 @@ is the `fi-no3-app` branch: the package flattened to the repo root, split
 off from `claude/energy-model-audit-fafl07`, which keeps the same code
 nested under a `file/` directory next to an older, independent flat-file
 copy of the same project — see `CLAUDE.md` for background if you need it.
-`Old/` in this repo predates both and is unrelated: an even earlier
-generation of the flat-file app, kept as-is.
 
 ## Quick start
 

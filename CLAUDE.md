@@ -31,10 +31,9 @@ branch (`fi-no3-app`) carries only this package, flattened to the repo
 root; it was split off from `claude/energy-model-audit-fafl07`, which still
 keeps this same code nested under a `file/` directory alongside an older,
 independent flat-file copy of the same project (the one this branch's own
-root-level files replaced). `Old/` in this listing predates both of those —
-it's an even earlier generation of the flat-file app, inherited as-is from
-before the fi_no3 package existed; it isn't part of this package and isn't
-touched by anything in this file.
+root-level files replaced). An even earlier generation of the flat-file
+app, inherited as-is from before the fi_no3 package existed under `Old/`,
+was removed in a repo cleanup — it wasn't part of this package.
 
 ## File layout (flat — all in the repo root, doubles as the `fi_no3` package)
 ```
@@ -46,9 +45,7 @@ app_jao_NP_API_fix_d14.py      — tkinter 9-tab GUI, adds JAO/Nord Pool fetch
                                   d07–d13, its superseded prior iterations,
                                   were removed (repo cleanup) — d14 was
                                   always the only one referenced by anything
-                                  else; `Old/` (see above) still keeps the
-                                  independent pre-fi_no3 generation of this
-                                  same GUI as historical reference.
+                                  else.
 propagation.py                 — analytical pipeline (no UI code)
 synthetic.py                   — synthetic JAO + outage data generator for testing
 test_pipeline.py                — full test suite (pytest)
