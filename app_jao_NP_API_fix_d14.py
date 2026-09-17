@@ -88,24 +88,50 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # ----------------------------------------------------------------------
 #  DESIGN TOKENS
 # ----------------------------------------------------------------------
-C_BG      = '#FDFCF6'
-C_PANEL   = '#ffffff'
-C_ACCENT  = '#163C2C'
-C_PRIMARY = '#C9A227'
-C_BORDER  = '#E7E2D2'
-C_TEXT    = '#16140F'
-C_MUTED   = '#6B6656'
-C_GREEN   = '#1F5138'
-C_RED     = '#8C3B2E'
-C_PURPLE  = '#7A5C2E'
-C_AMBER   = '#B7791F'
+C_BG        = '#FFFFFF'
+C_PANEL     = '#ffffff'
+C_SURFACE   = '#F6F6F7'   # subtle neutral surface -- ghost-button fill, hover
+C_ACCENT    = '#111113'   # near-black, used for emphasis text (no colored
+                          # header block in this design -- restraint over
+                          # brand-color repetition is the point)
+C_PRIMARY   = '#2F3B52'   # the single accent color: primary actions, focus,
+                          # selection. Everything else in this design stays
+                          # neutral grayscale so this one color still reads
+                          # as a deliberate signal, not just "the palette"
+C_BORDER    = '#E6E6E9'
+C_BORDER_LO = '#F0F0F2'   # hairline separators
+C_TEXT      = '#18181B'
+C_MUTED     = '#6B6B73'
+C_GREEN     = '#15803D'   # status/data semantics only -- not a brand color
+C_RED       = '#B91C1C'
+C_PURPLE    = '#6D5B97'
+C_AMBER     = '#B45309'
+C_TINT      = '#EEF0F4'   # light accent-tinted surface: hover, selection,
+                          # light text on a dark panel
+C_INK       = '#1F1F23'   # dark panel fill for log/diagnostic panes --
+                          # deliberately NOT the same value as C_TEXT, or a
+                          # scrollbar sitting on one of these panels (styled
+                          # bg=C_TEXT to match body text elsewhere) would be
+                          # visually indistinguishable from the panel itself
 
-FONT_UI   = ('Segoe UI', 9)
-FONT_BOLD = ('Segoe UI', 9,  'bold')
-FONT_H1   = ('Segoe UI', 11, 'bold')
-FONT_MONO = ('Consolas',  10)
+# One family throughout (native on Windows), varied by size/weight only --
+# nothing silently falls back to a substitute font on a machine that lacks
+# an exotic family name. A real hierarchy (not just 3 sizes) is what makes
+# a plain, undecorated design still read as considered rather than bare.
+FONT_UI       = ('Segoe UI', 9)
+FONT_UI_SM    = ('Segoe UI', 8)
+FONT_BOLD     = ('Segoe UI', 9,  'bold')
+FONT_LABEL    = ('Segoe UI', 8,  'bold')   # field captions
+FONT_H1       = ('Segoe UI', 12, 'bold')   # section headers
+FONT_H2       = ('Segoe UI', 10, 'bold')   # sub-section headers
+FONT_TITLE    = ('Segoe UI', 14)           # app header title -- regular
+                                            # weight, not bold: restraint is
+                                            # the whole point of this design
+FONT_SUBTITLE = ('Segoe UI', 9)
+FONT_MONO     = ('Consolas', 10)
+FONT_MONO_SM  = ('Consolas', 9)
 
-CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#4C7A5E', '#9C6B3C']
+CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#8B8B93', '#52525B']
 
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
@@ -558,31 +584,39 @@ class App:
     #  HEADER BAR
     # ------------------------------------------------------------------
     def _create_header(self):
-        hdr = tk.Frame(self.root, bg=C_ACCENT, height=52)
+        # Plain panel background, not a colored block -- separation from the
+        # content below comes from a single hairline, not a filled bar. The
+        # accent color appears nowhere in this header at all; restraint is
+        # the point, not just "a different set of colors."
+        hdr = tk.Frame(self.root, bg=C_PANEL, height=56)
         hdr.pack(fill=tk.X, side=tk.TOP)
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="JAO & Nordpool Analytics",
-                 bg=C_ACCENT, fg='white', font=('Segoe UI', 13, 'bold')
-                 ).pack(side=tk.LEFT, padx=20)
+        title_box = tk.Frame(hdr, bg=C_PANEL)
+        title_box.pack(side=tk.LEFT, padx=24)
+        tk.Label(title_box, text="JAO & Nordpool Analytics",
+                 bg=C_PANEL, fg=C_TEXT, font=FONT_TITLE, anchor='w'
+                 ).pack(anchor='w')
+        tk.Label(title_box, text="Energy Market Intelligence Platform",
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_SUBTITLE, anchor='w'
+                 ).pack(anchor='w')
 
-        tk.Label(hdr, text="Energy Market Intelligence Platform",
-                 bg=C_ACCENT, fg='#EFE1AE', font=('Segoe UI', 9)
-                 ).pack(side=tk.LEFT, padx=(0, 20))
-
-        # Data status badge (right-aligned)
-        self.data_badge_var = tk.StringVar(value="No data loaded")
-        badge = tk.Label(hdr, textvariable=self.data_badge_var,
-                         bg='#1F5138', fg='#EFE1AE',
-                         font=('Segoe UI', 8), padx=12, pady=4)
-        badge.pack(side=tk.RIGHT, padx=16, pady=10)
-
-        # Clock
+        # Clock (packed first so it lands in the far corner)
         self._clock_var = tk.StringVar()
         tk.Label(hdr, textvariable=self._clock_var,
-                 bg=C_ACCENT, fg='#6B6656', font=('Segoe UI', 8)
-                 ).pack(side=tk.RIGHT, padx=4)
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM
+                 ).pack(side=tk.RIGHT, padx=(0, 24))
         self._tick_clock()
+
+        # Data status -- plain text, no colored pill; a decorative badge
+        # for a two-state "loaded / not loaded" fact would be the chrome
+        # outweighing the content it's reporting on.
+        self.data_badge_var = tk.StringVar(value="No data loaded")
+        tk.Label(hdr, textvariable=self.data_badge_var,
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM
+                 ).pack(side=tk.RIGHT)
+
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X, side=tk.TOP)
 
     def _tick_clock(self):
         self._clock_var.set(datetime.now().strftime('%Y-%m-%d  %H:%M:%S'))
@@ -592,12 +626,17 @@ class App:
     #  STATUS BAR
     # ------------------------------------------------------------------
     def _create_statusbar(self):
-        sb = tk.Frame(self.root, bg='#E7E2D2', height=26)
+        # Plain panel background with a single top hairline -- pack the bar
+        # itself FIRST (side=BOTTOM stacks in call order from the bottom
+        # edge upward, so packing the hairline first would put it below the
+        # bar, at the window's true edge, doing nothing).
+        sb = tk.Frame(self.root, bg=C_PANEL, height=28)
         sb.pack(fill=tk.X, side=tk.BOTTOM)
         sb.pack_propagate(False)
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
 
-        self._sb_left  = tk.Label(sb, text="Ready", bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
-        self._sb_right = tk.Label(sb, text="",      bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
+        self._sb_left  = tk.Label(sb, text="Ready", bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM)
+        self._sb_right = tk.Label(sb, text="",      bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM)
         self._sb_left.pack(side=tk.LEFT,  padx=10)
         self._sb_right.pack(side=tk.RIGHT, padx=10)
 
@@ -618,52 +657,81 @@ class App:
         s.configure('TLabel',       background=C_PANEL, foreground=C_TEXT,   font=FONT_UI)
         s.configure('Muted.TLabel', background=C_PANEL, foreground=C_MUTED,  font=FONT_UI)
         s.configure('H1.TLabel',    background=C_PANEL, foreground=C_ACCENT, font=FONT_H1)
-        s.configure('Sum.TLabel',   background='#D7E4D2', foreground='#163C2C',
+        s.configure('Eyebrow.TLabel', background=C_PANEL, foreground=C_MUTED,
+                    font=FONT_LABEL)
+        s.configure('Sum.TLabel',   background=C_SURFACE, foreground=C_ACCENT,
                     font=FONT_BOLD, padding=(10, 5), relief='flat')
 
-        s.configure('TLabelframe',       background=C_PANEL, relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
-        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT, font=FONT_BOLD)
+        # No drawn border at all -- grouping comes from whitespace and the
+        # section label alone. A bordered box around every panel is the
+        # single most common tell of an unstyled/template UI; the point of
+        # a minimal design is trusting spacing to do that job instead.
+        s.configure('TLabelframe',       background=C_PANEL, relief='flat',
+                    borderwidth=0)
+        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT,
+                    font=FONT_H2)
 
+        # Default buttons: flat, borderless, same fill as the surrounding
+        # panel until hovered -- present when you need them, invisible when
+        # you don't, rather than a permanent bordered box competing for
+        # attention with actual content.
         s.configure('TButton', background=C_PANEL, foreground=C_TEXT,
-                    font=FONT_UI, padding=(10, 5), relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
+                    font=FONT_UI, padding=(12, 6), relief='flat', borderwidth=0)
         s.map('TButton',
-              background=[('active', '#EFE1AE'), ('disabled', '#F5F1E4')],
+              background=[('pressed', C_BORDER), ('active', C_SURFACE),
+                          ('disabled', C_PANEL)],
               foreground=[('disabled', C_MUTED)])
 
+        # One accent color, used deliberately: the single primary action on
+        # a screen is the only thing that gets it. Plain white text on a
+        # solid fill -- no cleverness, just legible and obvious.
         s.configure('Accent.TButton', background=C_PRIMARY, foreground='white',
-                    font=FONT_BOLD, padding=(12, 6), relief='flat', borderwidth=0)
+                    font=FONT_BOLD, padding=(14, 7), relief='flat', borderwidth=0)
         s.map('Accent.TButton',
-              background=[('active', '#A5811A'), ('disabled', '#EFE1AE')],
-              foreground=[('disabled', 'white')])
+              background=[('pressed', '#161D29'), ('active', '#20293B'),
+                          ('disabled', C_BORDER)],
+              foreground=[('disabled', C_MUTED)])
 
         s.configure('TEntry',    fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI, padding=(4, 3))
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TEntry', bordercolor=[('focus', C_PRIMARY)],
+              lightcolor=[('focus', C_PRIMARY)])
         s.configure('TCombobox', fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI)
-        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)])
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)],
+              bordercolor=[('focus', C_PRIMARY)])
 
         s.configure('TRadiobutton', background=C_PANEL, foreground=C_TEXT, font=FONT_UI)
 
-        s.configure('App.TNotebook', background=C_BG, bordercolor=C_BORDER, borderwidth=1)
-        s.configure('App.TNotebook.Tab', padding=(14, 7), font=FONT_UI,
-                    background='#E7E2D2', foreground=C_MUTED)
+        # Tabs carry zero decoration of their own -- no fill change, no
+        # border, nothing but a change in text weight and color between
+        # selected and unselected. This is the most restrained a tab bar
+        # can be while still being unambiguous about which tab is active.
+        s.configure('App.TNotebook', background=C_BG, borderwidth=0)
+        s.configure('App.TNotebook.Tab', padding=(16, 10), font=FONT_UI,
+                    background=C_BG, foreground=C_MUTED, borderwidth=0)
         s.map('App.TNotebook.Tab',
-              background=[('selected', C_PANEL)],
+              background=[('selected', C_BG)],
               foreground=[('selected', C_ACCENT)],
               font=[('selected', FONT_BOLD)])
 
         s.configure('Treeview', background=C_PANEL, foreground=C_TEXT,
-                    fieldbackground=C_PANEL, rowheight=24, font=FONT_UI, borderwidth=0)
-        s.configure('Treeview.Heading', background=C_ACCENT, foreground='white',
-                    font=FONT_BOLD, relief='flat', padding=(6, 4))
+                    fieldbackground=C_PANEL, rowheight=27, font=FONT_UI, borderwidth=0)
+        # A quiet header -- a hairline rule under it, not a solid block of
+        # color, so the emphasis stays on the data rather than the chrome
+        # around it.
+        s.configure('Treeview.Heading', background=C_PANEL, foreground=C_TEXT,
+                    font=FONT_H2, relief='flat', padding=(8, 6),
+                    bordercolor=C_BORDER, borderwidth=1)
+        s.map('Treeview.Heading', background=[('active', C_PANEL)])
         s.map('Treeview',
-              background=[('selected', '#EFE1AE')],
+              background=[('selected', C_TINT)],
               foreground=[('selected', C_ACCENT)])
 
         s.configure('TScrollbar', background=C_BORDER, troughcolor=C_BG,
-                    bordercolor=C_BG, arrowcolor=C_MUTED)
+                    bordercolor=C_BG, arrowcolor=C_MUTED, relief='flat',
+                    borderwidth=0)
+        s.map('TScrollbar', background=[('active', C_PRIMARY)])
 
     # ------------------------------------------------------------------
     #  MATPLOTLIB HELPERS
@@ -672,7 +740,7 @@ class App:
         fig.patch.set_facecolor(C_PANEL)
 
     def _setup_ax(self, ax, labels):
-        ax.set_facecolor('#FAF7ED')
+        ax.set_facecolor(C_PANEL)
         for sp in ['top', 'right']:
             ax.spines[sp].set_visible(False)
         for sp in ['left', 'bottom']:
@@ -686,7 +754,7 @@ class App:
         ax.title.set_color(C_ACCENT)
         ax.title.set_fontsize(9.5)
         ax.title.set_fontweight('bold')
-        ax.grid(True, color='#E7E2D2', linewidth=0.7, linestyle='-', alpha=0.8)
+        ax.grid(True, color=C_BORDER_LO, linewidth=0.7, linestyle='-', alpha=0.9)
         ax.set_axisbelow(True)
 
     def _style_twin(self, ax, color):
@@ -872,15 +940,15 @@ class App:
 
         # ── Status log ───────────────────────────────────────────────
         ttk.Label(main, text="Status Log", style='H1.TLabel').pack(anchor='w', pady=(4, 2))
-        log_frame = tk.Frame(main, bg='#14201A', padx=2, pady=2)
+        log_frame = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.status_text = tk.Text(
             log_frame, font=FONT_MONO,
-            background='#14201A', foreground='#EFE1AE',
+            background=C_INK, foreground=C_TINT,
             insertbackground='white', relief='flat',
             borderwidth=0, padx=10, pady=8
         )
-        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#16140F')
+        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#18181B')
         self.status_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.status_text.pack(fill=tk.BOTH, expand=True)
@@ -979,7 +1047,7 @@ class App:
             self.analysis_tree.heading(col, text=lbl)
             self.analysis_tree.column(col, width=120, anchor='center')
         self.analysis_tree.tag_configure('oddrow',  background=C_PANEL)
-        self.analysis_tree.tag_configure('evenrow', background='#F5F1E4')
+        self.analysis_tree.tag_configure('evenrow', background=C_SURFACE)
         self.analysis_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
@@ -991,9 +1059,9 @@ class App:
     #  TAB 2b – Strategic Briefing (UI shell; not yet implemented)
     # ------------------------------------------------------------------
     def _create_tab2_briefing(self, parent):
-        toolbar = tk.Frame(parent, bg='#163C2C', height=46)
+        toolbar = tk.Frame(parent, bg='#111113', height=46)
         toolbar.pack(fill=tk.X, side=tk.TOP)
-        btn_frame = tk.Frame(toolbar, bg='#163C2C')
+        btn_frame = tk.Frame(toolbar, bg='#111113')
         btn_frame.pack(side=tk.RIGHT, padx=14, pady=8)
         self._brfg_refresh_btn = tk.Button(btn_frame, text="Refresh",
                                            command=self._refresh_briefing)
@@ -1001,7 +1069,7 @@ class App:
         self._brfg_export_btn = tk.Button(btn_frame, text="Export PDF",
                                           command=self._export_briefing_pdf)
         self._brfg_export_btn.pack(side=tk.LEFT, padx=(8, 0))
-        body = tk.Frame(parent, bg='#F5F1E4')
+        body = tk.Frame(parent, bg=C_SURFACE)
         body.pack(fill=tk.BOTH, expand=True)
         self._brfg_text = tk.Text(body, font=('Segoe UI', 9), state='disabled',
                                   wrap='word', padx=16, pady=16)
@@ -2016,15 +2084,15 @@ class App:
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
-        diag_f = tk.Frame(main, bg='#14201A', padx=2, pady=2)
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         diag_f.pack(fill=tk.X, pady=(4, 0))
         self._t8_diag = tk.Text(
             diag_f, font=('Consolas', 8),
-            background='#14201A', foreground='#EFE1AE',
+            background=C_INK, foreground=C_TINT,
             height=5, relief='flat', borderwidth=0, padx=8, pady=4,
             state='disabled'
         )
-        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#16140F')
+        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#18181B')
         self._t8_diag.config(yscrollcommand=sb8.set)
         sb8.pack(side=tk.RIGHT, fill=tk.Y)
         self._t8_diag.pack(fill=tk.X)
@@ -2372,7 +2440,7 @@ class App:
                 ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
         else:
             ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-            ax.set_facecolor('#C9D9CE')
+            ax.set_facecolor('#DCE3EA')
 
         # ── Price colour scale ────────────────────────────────────────
         valid_prices = [v for v in prices.values() if v is not None]
@@ -3146,12 +3214,12 @@ class App:
         self._ma_progress = ttk.Progressbar(f, mode='indeterminate', length=400)
         self._ma_progress.pack(anchor='w', pady=(8,0))
 
-        log_frame = tk.Frame(f, bg='#14201A', padx=2, pady=2)
+        log_frame = tk.Frame(f, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(8,0))
-        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background='#14201A',
-                               foreground='#EFE1AE', insertbackground='white',
+        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background=C_INK,
+                               foreground=C_TINT, insertbackground='white',
                                relief='flat', borderwidth=0, padx=10, pady=8)
-        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#16140F')
+        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#18181B')
         self._ma_log.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_log.pack(fill=tk.BOTH, expand=True)
@@ -3322,20 +3390,20 @@ class App:
         for col, w in zip(cols, widths):
             self._ma_res_tree.heading(col, text=col.replace('_',' ').title())
             self._ma_res_tree.column(col, width=w, anchor='center')
-        self._ma_res_tree.tag_configure('support',  background='#D7E4D2')
-        self._ma_res_tree.tag_configure('reject',   background='#EAD9D2')
-        self._ma_res_tree.tag_configure('inconc',   background='#F5EBC0')
+        self._ma_res_tree.tag_configure('support',  background='#E8F3EC')
+        self._ma_res_tree.tag_configure('reject',   background='#FBEAEA')
+        self._ma_res_tree.tag_configure('inconc',   background='#FDF3E4')
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_tree.pack(fill=tk.BOTH, expand=True)
 
         # Regression detail text
         ttk.Label(f, text="Regression Detail", style='H1.TLabel').pack(anchor='w', pady=(10,4))
-        det_f = tk.Frame(f, bg='#14201A')
+        det_f = tk.Frame(f, bg=C_INK)
         det_f.pack(fill=tk.BOTH, expand=True)
-        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background='#14201A',
-                                       foreground='#EFE1AE', relief='flat',
+        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background=C_INK,
+                                       foreground=C_TINT, relief='flat',
                                        borderwidth=0, padx=10, pady=8, height=10)
-        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#16140F')
+        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#18181B')
         self._ma_res_detail.config(yscrollcommand=sb2.set)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_detail.pack(fill=tk.BOTH, expand=True)
@@ -4253,12 +4321,12 @@ class App:
 <meta charset="utf-8">
 <title>Maintenance Analysis Report</title>
 <style>
-body{{font-family:Segoe UI,sans-serif;margin:40px;color:#16140F;}}
-h1{{color:#163C2C;}} h2{{color:#C9A227;border-bottom:1px solid #E7E2D2;padding-bottom:4px;}}
+body{{font-family:Segoe UI,sans-serif;margin:40px;color:#18181B;}}
+h1{{color:#111113;}} h2{{color:#2F3B52;border-bottom:1px solid #E6E6E9;padding-bottom:4px;}}
 table{{border-collapse:collapse;width:100%;margin-bottom:24px;}}
-th{{background:#163C2C;color:white;padding:8px;text-align:left;}}
-td{{padding:6px 8px;border-bottom:1px solid #E7E2D2;}}
-pre{{background:#F5F1E4;padding:16px;border-radius:4px;overflow:auto;}}
+th{{background:#111113;color:white;padding:8px;text-align:left;}}
+td{{padding:6px 8px;border-bottom:1px solid #E6E6E9;}}
+pre{{background:#F6F6F7;padding:16px;border-radius:4px;overflow:auto;}}
 </style></head><body>
 <h1>Maintenance Analysis Report</h1>
 <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
