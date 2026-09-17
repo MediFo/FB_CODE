@@ -88,22 +88,39 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # ----------------------------------------------------------------------
 #  DESIGN TOKENS
 # ----------------------------------------------------------------------
-C_BG      = '#FDFCF6'
-C_PANEL   = '#ffffff'
-C_ACCENT  = '#163C2C'
-C_PRIMARY = '#C9A227'
-C_BORDER  = '#E7E2D2'
-C_TEXT    = '#16140F'
-C_MUTED   = '#6B6656'
-C_GREEN   = '#1F5138'
-C_RED     = '#8C3B2E'
-C_PURPLE  = '#7A5C2E'
-C_AMBER   = '#B7791F'
+C_BG        = '#FDFCF6'
+C_PANEL     = '#ffffff'
+C_SURFACE   = '#F7F3E7'   # tinted surface, one step off pure white -- used for
+                          # ghost-button fills and other elements that need
+                          # quiet presence without a drawn border around them
+C_ACCENT    = '#163C2C'
+C_PRIMARY   = '#C9A227'
+C_BORDER    = '#E7E2D2'
+C_BORDER_LO = '#EFEBDD'   # hairline separators, one step lighter than C_BORDER
+                          # -- for dividing space without drawing a "box"
+C_TEXT      = '#16140F'
+C_MUTED     = '#6B6656'
+C_GREEN     = '#1F5138'
+C_RED       = '#8C3B2E'
+C_PURPLE    = '#7A5C2E'
+C_AMBER     = '#B7791F'
+C_GOLD_SOFT = '#EFE1AE'   # light gold -- header subtitle, hover/selection
+                          # tints, disabled-accent state, dark-panel text
+C_INK       = '#14201A'   # near-black panel fill for dark log/diagnostic panes
 
-FONT_UI   = ('Segoe UI', 9)
-FONT_BOLD = ('Segoe UI', 9,  'bold')
-FONT_H1   = ('Segoe UI', 11, 'bold')
-FONT_MONO = ('Consolas',  10)
+# Type scale -- one family (native on Windows), varied by size/weight only,
+# so nothing silently falls back to a substitute font on a machine that
+# lacks an exotic family name.
+FONT_UI       = ('Segoe UI', 9)
+FONT_UI_SM    = ('Segoe UI', 8)
+FONT_BOLD     = ('Segoe UI', 9,  'bold')
+FONT_LABEL    = ('Segoe UI', 8,  'bold')   # field captions / eyebrow labels
+FONT_H1       = ('Segoe UI', 12, 'bold')   # section headers
+FONT_H2       = ('Segoe UI', 10, 'bold')   # sub-section headers
+FONT_TITLE    = ('Segoe UI', 16, 'bold')   # app header title
+FONT_SUBTITLE = ('Segoe UI', 9)            # app header subtitle
+FONT_MONO     = ('Consolas', 10)
+FONT_MONO_SM  = ('Consolas', 9)
 
 CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#4C7A5E', '#9C6B3C']
 
@@ -558,31 +575,45 @@ class App:
     #  HEADER BAR
     # ------------------------------------------------------------------
     def _create_header(self):
-        hdr = tk.Frame(self.root, bg=C_ACCENT, height=52)
+        hdr = tk.Frame(self.root, bg=C_ACCENT, height=64)
         hdr.pack(fill=tk.X, side=tk.TOP)
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="JAO & Nordpool Analytics",
-                 bg=C_ACCENT, fg='white', font=('Segoe UI', 13, 'bold')
-                 ).pack(side=tk.LEFT, padx=20)
+        # Title stacked over a small caption, masthead-style, rather than
+        # two labels racing each other left-to-right in a single row -- one
+        # clear focal point instead of a toolbar-style row of equal-weight
+        # text.
+        title_box = tk.Frame(hdr, bg=C_ACCENT)
+        title_box.pack(side=tk.LEFT, padx=22)
+        tk.Label(title_box, text="JAO & Nordpool Analytics",
+                 bg=C_ACCENT, fg='white', font=FONT_TITLE, anchor='w'
+                 ).pack(anchor='w')
+        tk.Label(title_box, text="Energy Market Intelligence Platform",
+                 bg=C_ACCENT, fg=C_GOLD_SOFT, font=FONT_SUBTITLE, anchor='w'
+                 ).pack(anchor='w')
 
-        tk.Label(hdr, text="Energy Market Intelligence Platform",
-                 bg=C_ACCENT, fg='#EFE1AE', font=('Segoe UI', 9)
-                 ).pack(side=tk.LEFT, padx=(0, 20))
-
-        # Data status badge (right-aligned)
+        # Data status badge (right-aligned) -- a thin gold outline turns the
+        # flat colour fill into a proper "pill", not just a label with a
+        # background colour.
         self.data_badge_var = tk.StringVar(value="No data loaded")
         badge = tk.Label(hdr, textvariable=self.data_badge_var,
-                         bg='#1F5138', fg='#EFE1AE',
-                         font=('Segoe UI', 8), padx=12, pady=4)
-        badge.pack(side=tk.RIGHT, padx=16, pady=10)
+                         bg=C_GREEN, fg=C_GOLD_SOFT,
+                         font=FONT_LABEL, padx=14, pady=5,
+                         highlightthickness=1, highlightbackground=C_PRIMARY,
+                         highlightcolor=C_PRIMARY)
+        badge.pack(side=tk.RIGHT, padx=20, pady=10)
 
         # Clock
         self._clock_var = tk.StringVar()
         tk.Label(hdr, textvariable=self._clock_var,
-                 bg=C_ACCENT, fg='#6B6656', font=('Segoe UI', 8)
-                 ).pack(side=tk.RIGHT, padx=4)
+                 bg=C_ACCENT, fg='#8FA893', font=FONT_UI_SM
+                 ).pack(side=tk.RIGHT, padx=6)
         self._tick_clock()
+
+        # Signature accent rule -- a thin gold line is a far more distinctive
+        # "brand mark" than another flat-coloured bar, and costs one extra
+        # Frame.
+        tk.Frame(self.root, bg=C_PRIMARY, height=3).pack(fill=tk.X, side=tk.TOP)
 
     def _tick_clock(self):
         self._clock_var.set(datetime.now().strftime('%Y-%m-%d  %H:%M:%S'))
@@ -592,12 +623,20 @@ class App:
     #  STATUS BAR
     # ------------------------------------------------------------------
     def _create_statusbar(self):
-        sb = tk.Frame(self.root, bg='#E7E2D2', height=26)
+        # A hairline above the status bar separates it from tab content
+        # without needing a heavier background-colour contrast to do the
+        # same job. pack(side=BOTTOM) stacks in call order from the bottom
+        # edge upward, so the bar itself must be packed FIRST (bottom-most)
+        # and the separator packed second (sits just above it) -- reversed,
+        # the hairline would end up below the bar, at the window's true
+        # bottom edge, doing nothing.
+        sb = tk.Frame(self.root, bg=C_BORDER, height=28)
         sb.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
         sb.pack_propagate(False)
 
-        self._sb_left  = tk.Label(sb, text="Ready", bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
-        self._sb_right = tk.Label(sb, text="",      bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
+        self._sb_left  = tk.Label(sb, text="Ready", bg=C_BORDER, fg=C_MUTED, font=FONT_UI_SM)
+        self._sb_right = tk.Label(sb, text="",      bg=C_BORDER, fg=C_MUTED, font=FONT_UI_SM)
         self._sb_left.pack(side=tk.LEFT,  padx=10)
         self._sb_right.pack(side=tk.RIGHT, padx=10)
 
@@ -618,52 +657,82 @@ class App:
         s.configure('TLabel',       background=C_PANEL, foreground=C_TEXT,   font=FONT_UI)
         s.configure('Muted.TLabel', background=C_PANEL, foreground=C_MUTED,  font=FONT_UI)
         s.configure('H1.TLabel',    background=C_PANEL, foreground=C_ACCENT, font=FONT_H1)
-        s.configure('Sum.TLabel',   background='#D7E4D2', foreground='#163C2C',
+        # Small, weighted "eyebrow" label -- used above a field/section to
+        # caption it without the visual weight of a full H1, so a screen
+        # isn't just one uniform grey of 9pt labels throughout.
+        s.configure('Eyebrow.TLabel', background=C_PANEL, foreground=C_MUTED,
+                    font=FONT_LABEL)
+        s.configure('Sum.TLabel',   background='#D7E4D2', foreground=C_ACCENT,
                     font=FONT_BOLD, padding=(10, 5), relief='flat')
 
+        # Cards read as grouped content through a single light hairline, not
+        # a heavy drawn box -- borderwidth stays at the ttk/clam minimum of 1
+        # (0 renders no separator at all in this theme) with the lightest
+        # tone in the palette, so the eye picks up structure without every
+        # panel looking like a bordered rectangle.
         s.configure('TLabelframe',       background=C_PANEL, relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
-        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT, font=FONT_BOLD)
+                    bordercolor=C_BORDER_LO, borderwidth=1)
+        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT,
+                    font=FONT_H2)
 
-        s.configure('TButton', background=C_PANEL, foreground=C_TEXT,
-                    font=FONT_UI, padding=(10, 5), relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
+        # Default buttons: no drawn border, a quiet tinted fill instead of a
+        # bordered box -- the "everything is a bordered rectangle" look is
+        # the single biggest tell of an unstyled/template UI. Hover deepens
+        # to the gold-soft tint; pressed goes one step further.
+        s.configure('TButton', background=C_SURFACE, foreground=C_TEXT,
+                    font=FONT_UI, padding=(12, 6), relief='flat', borderwidth=0)
         s.map('TButton',
-              background=[('active', '#EFE1AE'), ('disabled', '#F5F1E4')],
+              background=[('pressed', '#E9D9A0'), ('active', C_GOLD_SOFT),
+                          ('disabled', C_BORDER_LO)],
               foreground=[('disabled', C_MUTED)])
 
-        s.configure('Accent.TButton', background=C_PRIMARY, foreground='white',
-                    font=FONT_BOLD, padding=(12, 6), relief='flat', borderwidth=0)
+        # Primary action: solid gold fill with dark-green text (not white) --
+        # a much higher-contrast, more deliberate pairing that also ties the
+        # button back to the header's own green/gold identity instead of
+        # reading as a generic "blue button, but gold" template swap.
+        s.configure('Accent.TButton', background=C_PRIMARY, foreground=C_ACCENT,
+                    font=FONT_BOLD, padding=(14, 7), relief='flat', borderwidth=0)
         s.map('Accent.TButton',
-              background=[('active', '#A5811A'), ('disabled', '#EFE1AE')],
-              foreground=[('disabled', 'white')])
+              background=[('pressed', '#8F6E16'), ('active', '#A5811A'),
+                          ('disabled', C_GOLD_SOFT)],
+              foreground=[('disabled', C_MUTED)])
 
         s.configure('TEntry',    fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI, padding=(4, 3))
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TEntry', bordercolor=[('focus', C_PRIMARY)],
+              lightcolor=[('focus', C_PRIMARY)])
         s.configure('TCombobox', fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI)
-        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)])
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)],
+              bordercolor=[('focus', C_PRIMARY)])
 
         s.configure('TRadiobutton', background=C_PANEL, foreground=C_TEXT, font=FONT_UI)
 
-        s.configure('App.TNotebook', background=C_BG, bordercolor=C_BORDER, borderwidth=1)
-        s.configure('App.TNotebook.Tab', padding=(14, 7), font=FONT_UI,
-                    background='#E7E2D2', foreground=C_MUTED)
+        # Tabs blend into the surrounding background when unselected (no
+        # boxed-in look) and step up to the panel colour + bold accent text
+        # when active, rather than every tab being an equally loud filled
+        # rectangle regardless of state.
+        s.configure('App.TNotebook', background=C_BG, borderwidth=0)
+        s.configure('App.TNotebook.Tab', padding=(16, 9), font=FONT_UI,
+                    background=C_BG, foreground=C_MUTED, borderwidth=0)
         s.map('App.TNotebook.Tab',
               background=[('selected', C_PANEL)],
               foreground=[('selected', C_ACCENT)],
               font=[('selected', FONT_BOLD)])
 
         s.configure('Treeview', background=C_PANEL, foreground=C_TEXT,
-                    fieldbackground=C_PANEL, rowheight=24, font=FONT_UI, borderwidth=0)
+                    fieldbackground=C_PANEL, rowheight=27, font=FONT_UI, borderwidth=0)
         s.configure('Treeview.Heading', background=C_ACCENT, foreground='white',
-                    font=FONT_BOLD, relief='flat', padding=(6, 4))
+                    font=FONT_H2, relief='flat', padding=(8, 6))
+        s.map('Treeview.Heading', background=[('active', C_ACCENT)])
         s.map('Treeview',
-              background=[('selected', '#EFE1AE')],
+              background=[('selected', C_GOLD_SOFT)],
               foreground=[('selected', C_ACCENT)])
 
         s.configure('TScrollbar', background=C_BORDER, troughcolor=C_BG,
-                    bordercolor=C_BG, arrowcolor=C_MUTED)
+                    bordercolor=C_BG, arrowcolor=C_MUTED, relief='flat',
+                    borderwidth=0)
+        s.map('TScrollbar', background=[('active', C_PRIMARY)])
 
     # ------------------------------------------------------------------
     #  MATPLOTLIB HELPERS
@@ -672,7 +741,7 @@ class App:
         fig.patch.set_facecolor(C_PANEL)
 
     def _setup_ax(self, ax, labels):
-        ax.set_facecolor('#FAF7ED')
+        ax.set_facecolor(C_SURFACE)
         for sp in ['top', 'right']:
             ax.spines[sp].set_visible(False)
         for sp in ['left', 'bottom']:
@@ -686,7 +755,7 @@ class App:
         ax.title.set_color(C_ACCENT)
         ax.title.set_fontsize(9.5)
         ax.title.set_fontweight('bold')
-        ax.grid(True, color='#E7E2D2', linewidth=0.7, linestyle='-', alpha=0.8)
+        ax.grid(True, color=C_BORDER_LO, linewidth=0.7, linestyle='-', alpha=0.7)
         ax.set_axisbelow(True)
 
     def _style_twin(self, ax, color):
@@ -872,11 +941,11 @@ class App:
 
         # ── Status log ───────────────────────────────────────────────
         ttk.Label(main, text="Status Log", style='H1.TLabel').pack(anchor='w', pady=(4, 2))
-        log_frame = tk.Frame(main, bg='#14201A', padx=2, pady=2)
+        log_frame = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.status_text = tk.Text(
             log_frame, font=FONT_MONO,
-            background='#14201A', foreground='#EFE1AE',
+            background=C_INK, foreground=C_GOLD_SOFT,
             insertbackground='white', relief='flat',
             borderwidth=0, padx=10, pady=8
         )
@@ -2016,11 +2085,11 @@ class App:
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
-        diag_f = tk.Frame(main, bg='#14201A', padx=2, pady=2)
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         diag_f.pack(fill=tk.X, pady=(4, 0))
         self._t8_diag = tk.Text(
             diag_f, font=('Consolas', 8),
-            background='#14201A', foreground='#EFE1AE',
+            background=C_INK, foreground=C_GOLD_SOFT,
             height=5, relief='flat', borderwidth=0, padx=8, pady=4,
             state='disabled'
         )
@@ -3146,10 +3215,10 @@ class App:
         self._ma_progress = ttk.Progressbar(f, mode='indeterminate', length=400)
         self._ma_progress.pack(anchor='w', pady=(8,0))
 
-        log_frame = tk.Frame(f, bg='#14201A', padx=2, pady=2)
+        log_frame = tk.Frame(f, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(8,0))
-        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background='#14201A',
-                               foreground='#EFE1AE', insertbackground='white',
+        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background=C_INK,
+                               foreground=C_GOLD_SOFT, insertbackground='white',
                                relief='flat', borderwidth=0, padx=10, pady=8)
         sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#16140F')
         self._ma_log.config(yscrollcommand=sb.set)
@@ -3330,10 +3399,10 @@ class App:
 
         # Regression detail text
         ttk.Label(f, text="Regression Detail", style='H1.TLabel').pack(anchor='w', pady=(10,4))
-        det_f = tk.Frame(f, bg='#14201A')
+        det_f = tk.Frame(f, bg=C_INK)
         det_f.pack(fill=tk.BOTH, expand=True)
-        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background='#14201A',
-                                       foreground='#EFE1AE', relief='flat',
+        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background=C_INK,
+                                       foreground=C_GOLD_SOFT, relief='flat',
                                        borderwidth=0, padx=10, pady=8, height=10)
         sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#16140F')
         self._ma_res_detail.config(yscrollcommand=sb2.set)
