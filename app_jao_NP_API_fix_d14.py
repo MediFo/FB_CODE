@@ -88,24 +88,24 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # ----------------------------------------------------------------------
 #  DESIGN TOKENS
 # ----------------------------------------------------------------------
-C_BG      = '#f0f4f8'
+C_BG      = '#FDFCF6'
 C_PANEL   = '#ffffff'
-C_ACCENT  = '#1e3a5f'
-C_PRIMARY = '#2563eb'
-C_BORDER  = '#d1d9e6'
-C_TEXT    = '#1e293b'
-C_MUTED   = '#64748b'
-C_GREEN   = '#059669'
-C_RED     = '#dc2626'
-C_PURPLE  = '#7c3aed'
-C_AMBER   = '#d97706'
+C_ACCENT  = '#163C2C'
+C_PRIMARY = '#C9A227'
+C_BORDER  = '#E7E2D2'
+C_TEXT    = '#16140F'
+C_MUTED   = '#6B6656'
+C_GREEN   = '#1F5138'
+C_RED     = '#8C3B2E'
+C_PURPLE  = '#7A5C2E'
+C_AMBER   = '#B7791F'
 
 FONT_UI   = ('Segoe UI', 9)
 FONT_BOLD = ('Segoe UI', 9,  'bold')
 FONT_H1   = ('Segoe UI', 11, 'bold')
 FONT_MONO = ('Consolas',  10)
 
-CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#0891b2', '#be185d']
+CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#4C7A5E', '#9C6B3C']
 
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
@@ -567,20 +567,20 @@ class App:
                  ).pack(side=tk.LEFT, padx=20)
 
         tk.Label(hdr, text="Energy Market Intelligence Platform",
-                 bg=C_ACCENT, fg='#93c5fd', font=('Segoe UI', 9)
+                 bg=C_ACCENT, fg='#EFE1AE', font=('Segoe UI', 9)
                  ).pack(side=tk.LEFT, padx=(0, 20))
 
         # Data status badge (right-aligned)
         self.data_badge_var = tk.StringVar(value="No data loaded")
         badge = tk.Label(hdr, textvariable=self.data_badge_var,
-                         bg='#162d4a', fg='#93c5fd',
+                         bg='#1F5138', fg='#EFE1AE',
                          font=('Segoe UI', 8), padx=12, pady=4)
         badge.pack(side=tk.RIGHT, padx=16, pady=10)
 
         # Clock
         self._clock_var = tk.StringVar()
         tk.Label(hdr, textvariable=self._clock_var,
-                 bg=C_ACCENT, fg='#64748b', font=('Segoe UI', 8)
+                 bg=C_ACCENT, fg='#6B6656', font=('Segoe UI', 8)
                  ).pack(side=tk.RIGHT, padx=4)
         self._tick_clock()
 
@@ -592,12 +592,12 @@ class App:
     #  STATUS BAR
     # ------------------------------------------------------------------
     def _create_statusbar(self):
-        sb = tk.Frame(self.root, bg='#e2e8f0', height=26)
+        sb = tk.Frame(self.root, bg='#E7E2D2', height=26)
         sb.pack(fill=tk.X, side=tk.BOTTOM)
         sb.pack_propagate(False)
 
-        self._sb_left  = tk.Label(sb, text="Ready", bg='#e2e8f0', fg=C_MUTED, font=('Segoe UI', 8))
-        self._sb_right = tk.Label(sb, text="",      bg='#e2e8f0', fg=C_MUTED, font=('Segoe UI', 8))
+        self._sb_left  = tk.Label(sb, text="Ready", bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
+        self._sb_right = tk.Label(sb, text="",      bg='#E7E2D2', fg=C_MUTED, font=('Segoe UI', 8))
         self._sb_left.pack(side=tk.LEFT,  padx=10)
         self._sb_right.pack(side=tk.RIGHT, padx=10)
 
@@ -618,7 +618,7 @@ class App:
         s.configure('TLabel',       background=C_PANEL, foreground=C_TEXT,   font=FONT_UI)
         s.configure('Muted.TLabel', background=C_PANEL, foreground=C_MUTED,  font=FONT_UI)
         s.configure('H1.TLabel',    background=C_PANEL, foreground=C_ACCENT, font=FONT_H1)
-        s.configure('Sum.TLabel',   background='#dcfce7', foreground='#166534',
+        s.configure('Sum.TLabel',   background='#D7E4D2', foreground='#163C2C',
                     font=FONT_BOLD, padding=(10, 5), relief='flat')
 
         s.configure('TLabelframe',       background=C_PANEL, relief='solid',
@@ -629,13 +629,13 @@ class App:
                     font=FONT_UI, padding=(10, 5), relief='solid',
                     bordercolor=C_BORDER, borderwidth=1)
         s.map('TButton',
-              background=[('active', '#e8edf5'), ('disabled', '#f1f5f9')],
+              background=[('active', '#EFE1AE'), ('disabled', '#F5F1E4')],
               foreground=[('disabled', C_MUTED)])
 
         s.configure('Accent.TButton', background=C_PRIMARY, foreground='white',
                     font=FONT_BOLD, padding=(12, 6), relief='flat', borderwidth=0)
         s.map('Accent.TButton',
-              background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')],
+              background=[('active', '#A5811A'), ('disabled', '#EFE1AE')],
               foreground=[('disabled', 'white')])
 
         s.configure('TEntry',    fieldbackground=C_PANEL, foreground=C_TEXT,
@@ -648,7 +648,7 @@ class App:
 
         s.configure('App.TNotebook', background=C_BG, bordercolor=C_BORDER, borderwidth=1)
         s.configure('App.TNotebook.Tab', padding=(14, 7), font=FONT_UI,
-                    background='#e2e8f0', foreground=C_MUTED)
+                    background='#E7E2D2', foreground=C_MUTED)
         s.map('App.TNotebook.Tab',
               background=[('selected', C_PANEL)],
               foreground=[('selected', C_ACCENT)],
@@ -659,7 +659,7 @@ class App:
         s.configure('Treeview.Heading', background=C_ACCENT, foreground='white',
                     font=FONT_BOLD, relief='flat', padding=(6, 4))
         s.map('Treeview',
-              background=[('selected', '#dbeafe')],
+              background=[('selected', '#EFE1AE')],
               foreground=[('selected', C_ACCENT)])
 
         s.configure('TScrollbar', background=C_BORDER, troughcolor=C_BG,
@@ -672,7 +672,7 @@ class App:
         fig.patch.set_facecolor(C_PANEL)
 
     def _setup_ax(self, ax, labels):
-        ax.set_facecolor('#f8fafc')
+        ax.set_facecolor('#FAF7ED')
         for sp in ['top', 'right']:
             ax.spines[sp].set_visible(False)
         for sp in ['left', 'bottom']:
@@ -686,7 +686,7 @@ class App:
         ax.title.set_color(C_ACCENT)
         ax.title.set_fontsize(9.5)
         ax.title.set_fontweight('bold')
-        ax.grid(True, color='#e2e8f0', linewidth=0.7, linestyle='-', alpha=0.8)
+        ax.grid(True, color='#E7E2D2', linewidth=0.7, linestyle='-', alpha=0.8)
         ax.set_axisbelow(True)
 
     def _style_twin(self, ax, color):
@@ -872,15 +872,15 @@ class App:
 
         # ── Status log ───────────────────────────────────────────────
         ttk.Label(main, text="Status Log", style='H1.TLabel').pack(anchor='w', pady=(4, 2))
-        log_frame = tk.Frame(main, bg='#0f172a', padx=2, pady=2)
+        log_frame = tk.Frame(main, bg='#14201A', padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.status_text = tk.Text(
             log_frame, font=FONT_MONO,
-            background='#0f172a', foreground='#94e2d5',
+            background='#14201A', foreground='#EFE1AE',
             insertbackground='white', relief='flat',
             borderwidth=0, padx=10, pady=8
         )
-        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#1e293b')
+        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#16140F')
         self.status_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.status_text.pack(fill=tk.BOTH, expand=True)
@@ -979,7 +979,7 @@ class App:
             self.analysis_tree.heading(col, text=lbl)
             self.analysis_tree.column(col, width=120, anchor='center')
         self.analysis_tree.tag_configure('oddrow',  background=C_PANEL)
-        self.analysis_tree.tag_configure('evenrow', background='#f1f5f9')
+        self.analysis_tree.tag_configure('evenrow', background='#F5F1E4')
         self.analysis_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
@@ -991,9 +991,9 @@ class App:
     #  TAB 2b – Strategic Briefing (UI shell; not yet implemented)
     # ------------------------------------------------------------------
     def _create_tab2_briefing(self, parent):
-        toolbar = tk.Frame(parent, bg='#0f2340', height=46)
+        toolbar = tk.Frame(parent, bg='#163C2C', height=46)
         toolbar.pack(fill=tk.X, side=tk.TOP)
-        btn_frame = tk.Frame(toolbar, bg='#0f2340')
+        btn_frame = tk.Frame(toolbar, bg='#163C2C')
         btn_frame.pack(side=tk.RIGHT, padx=14, pady=8)
         self._brfg_refresh_btn = tk.Button(btn_frame, text="Refresh",
                                            command=self._refresh_briefing)
@@ -1001,7 +1001,7 @@ class App:
         self._brfg_export_btn = tk.Button(btn_frame, text="Export PDF",
                                           command=self._export_briefing_pdf)
         self._brfg_export_btn.pack(side=tk.LEFT, padx=(8, 0))
-        body = tk.Frame(parent, bg='#f1f5f9')
+        body = tk.Frame(parent, bg='#F5F1E4')
         body.pack(fill=tk.BOTH, expand=True)
         self._brfg_text = tk.Text(body, font=('Segoe UI', 9), state='disabled',
                                   wrap='word', padx=16, pady=16)
@@ -2016,15 +2016,15 @@ class App:
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
-        diag_f = tk.Frame(main, bg='#0f172a', padx=2, pady=2)
+        diag_f = tk.Frame(main, bg='#14201A', padx=2, pady=2)
         diag_f.pack(fill=tk.X, pady=(4, 0))
         self._t8_diag = tk.Text(
             diag_f, font=('Consolas', 8),
-            background='#0f172a', foreground='#94e2d5',
+            background='#14201A', foreground='#EFE1AE',
             height=5, relief='flat', borderwidth=0, padx=8, pady=4,
             state='disabled'
         )
-        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#1e293b')
+        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#16140F')
         self._t8_diag.config(yscrollcommand=sb8.set)
         sb8.pack(side=tk.RIGHT, fill=tk.Y)
         self._t8_diag.pack(fill=tk.X)
@@ -2366,7 +2366,7 @@ class App:
                 ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
         else:
             ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-            ax.set_facecolor('#d0e8f0')
+            ax.set_facecolor('#C9D9CE')
 
         # ── Price colour scale ────────────────────────────────────────
         valid_prices = [v for v in prices.values() if v is not None]
@@ -3140,12 +3140,12 @@ class App:
         self._ma_progress = ttk.Progressbar(f, mode='indeterminate', length=400)
         self._ma_progress.pack(anchor='w', pady=(8,0))
 
-        log_frame = tk.Frame(f, bg='#0f172a', padx=2, pady=2)
+        log_frame = tk.Frame(f, bg='#14201A', padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(8,0))
-        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background='#0f172a',
-                               foreground='#94e2d5', insertbackground='white',
+        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background='#14201A',
+                               foreground='#EFE1AE', insertbackground='white',
                                relief='flat', borderwidth=0, padx=10, pady=8)
-        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#1e293b')
+        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#16140F')
         self._ma_log.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_log.pack(fill=tk.BOTH, expand=True)
@@ -3316,20 +3316,20 @@ class App:
         for col, w in zip(cols, widths):
             self._ma_res_tree.heading(col, text=col.replace('_',' ').title())
             self._ma_res_tree.column(col, width=w, anchor='center')
-        self._ma_res_tree.tag_configure('support',  background='#dcfce7')
-        self._ma_res_tree.tag_configure('reject',   background='#fee2e2')
-        self._ma_res_tree.tag_configure('inconc',   background='#fef9c3')
+        self._ma_res_tree.tag_configure('support',  background='#D7E4D2')
+        self._ma_res_tree.tag_configure('reject',   background='#EAD9D2')
+        self._ma_res_tree.tag_configure('inconc',   background='#F5EBC0')
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_tree.pack(fill=tk.BOTH, expand=True)
 
         # Regression detail text
         ttk.Label(f, text="Regression Detail", style='H1.TLabel').pack(anchor='w', pady=(10,4))
-        det_f = tk.Frame(f, bg='#0f172a')
+        det_f = tk.Frame(f, bg='#14201A')
         det_f.pack(fill=tk.BOTH, expand=True)
-        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background='#0f172a',
-                                       foreground='#94e2d5', relief='flat',
+        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background='#14201A',
+                                       foreground='#EFE1AE', relief='flat',
                                        borderwidth=0, padx=10, pady=8, height=10)
-        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#1e293b')
+        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#16140F')
         self._ma_res_detail.config(yscrollcommand=sb2.set)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_detail.pack(fill=tk.BOTH, expand=True)
@@ -4247,12 +4247,12 @@ class App:
 <meta charset="utf-8">
 <title>Maintenance Analysis Report</title>
 <style>
-body{{font-family:Segoe UI,sans-serif;margin:40px;color:#1e293b;}}
-h1{{color:#1e3a5f;}} h2{{color:#2563eb;border-bottom:1px solid #d1d9e6;padding-bottom:4px;}}
+body{{font-family:Segoe UI,sans-serif;margin:40px;color:#16140F;}}
+h1{{color:#163C2C;}} h2{{color:#C9A227;border-bottom:1px solid #E7E2D2;padding-bottom:4px;}}
 table{{border-collapse:collapse;width:100%;margin-bottom:24px;}}
-th{{background:#1e3a5f;color:white;padding:8px;text-align:left;}}
-td{{padding:6px 8px;border-bottom:1px solid #e2e8f0;}}
-pre{{background:#f1f5f9;padding:16px;border-radius:4px;overflow:auto;}}
+th{{background:#163C2C;color:white;padding:8px;text-align:left;}}
+td{{padding:6px 8px;border-bottom:1px solid #E7E2D2;}}
+pre{{background:#F5F1E4;padding:16px;border-radius:4px;overflow:auto;}}
 </style></head><body>
 <h1>Maintenance Analysis Report</h1>
 <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
