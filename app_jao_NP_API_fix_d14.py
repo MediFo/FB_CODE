@@ -1954,6 +1954,8 @@ class App:
     # ------------------------------------------------------------------
     #  TAB 8 – Nordic Map (Prices + Flows)
     # ------------------------------------------------------------------
+    _T8_SPEED_MS = {"Slow": 1200, "Medium": 600, "Fast": 250}
+
     def _create_tab8_widgets(self):
         main = ttk.Frame(self.tab8, style='Card.TFrame', padding=12)
         main.pack(fill=tk.BOTH, expand=True)
@@ -1975,8 +1977,36 @@ class App:
         self._t8_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
                                   command=self._plot_tab8)
         self._t8_btn.pack(side=tk.LEFT)
+
+        # ── Slow-motion playback: steps through the day's MTU slots,
+        # redrawing price + flow on each one, so a flow reversal or price
+        # spike is watched happening rather than read off a static snapshot.
+        # Reuses the SAME fetch+parse as "Fetch & Plot" (see
+        # _fetch_tab8_day_thread) bucketed per MTU instead of narrowed to
+        # one, cached in self._t8_day_cache so switching between a single
+        # snapshot and playback for the same date never re-fetches.
+        self._t8_play_btn = ttk.Button(ctrl, text="▶ Play", command=self._t8_play)
+        self._t8_play_btn.pack(side=tk.LEFT, padx=(12, 4))
+        self._t8_stop_btn = ttk.Button(ctrl, text="⏹ Stop",
+                                       command=self._t8_stop_play, state=tk.DISABLED)
+        self._t8_stop_btn.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctrl, text="Speed:").pack(side=tk.LEFT)
+        self._t8_speed = ttk.Combobox(ctrl, values=list(self._T8_SPEED_MS),
+                                      width=8, state='readonly')
+        self._t8_speed.set("Slow")
+        self._t8_speed.pack(side=tk.LEFT, padx=(4, 0))
+
         self._t8_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
         self._t8_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Playback state
+        self._t8_day_cache      = None   # {"date","prices":{mtu:{zone:px}},"flows":{mtu:{(A,B):mw}}}
+        self._t8_fetch_mode     = "single"   # "single" | "play" -- which action the in-flight fetch is for
+        self._t8_fetch_target_mtu = None
+        self._t8_play_mtus      = []
+        self._t8_play_idx       = 0
+        self._t8_playing        = False
+        self._t8_play_after_id  = None
 
         self.toolbar_f8 = ttk.Frame(main, style='Card.TFrame')
         self.toolbar_f8.pack(fill=tk.X)
@@ -2000,6 +2030,7 @@ class App:
         self._t8_diag.pack(fill=tk.X)
 
     def _plot_tab8(self):
+        self._t8_stop_play()   # a running animation shouldn't fight a fresh single-shot fetch
         date_str = self._t8_date.get().strip()
         mtu_str  = self._t8_mtu.get().strip()   # "HH:MM"
         try:
@@ -2007,8 +2038,22 @@ class App:
         except Exception:
             messagebox.showinfo("Info", "Select a valid MTU slot.")
             return
+        mtu_label = f"{mtu_h:02d}:{mtu_m:02d}"
 
+        if self._t8_day_cache and self._t8_day_cache["date"] == date_str:
+            # Already fetched this day (e.g. from a previous Play) -- redraw
+            # immediately instead of re-querying Nord Pool for the same data.
+            prices = self._t8_day_cache["prices"].get(mtu_label, {})
+            flows  = self._t8_day_cache["flows"].get(mtu_label, {})
+            self._draw_tab8_map(prices, flows, date_str, mtu_label)
+            self._add_toolbar(self.canvas8, self.toolbar_f8)
+            self._t8_status.config(text="(from cache)", foreground=C_MUTED)
+            return
+
+        self._t8_fetch_mode = "single"
+        self._t8_fetch_target_mtu = mtu_label
         self._t8_btn.config(state=tk.DISABLED, text="Loading...")
+        self._t8_play_btn.config(state=tk.DISABLED)
         self._t8_status.config(text="Fetching prices & flows...", foreground=C_MUTED)
         # Clear diagnostic pane while loading
         self._t8_diag.config(state='normal')
@@ -2023,12 +2068,93 @@ class App:
         self.canvas8.draw()
         self.root.update_idletasks()
 
-        threading.Thread(target=self._plot_tab8_thread,
-                         args=(date_str, mtu_h, mtu_m), daemon=True).start()
+        threading.Thread(target=self._fetch_tab8_day_thread,
+                         args=(date_str,), daemon=True).start()
 
-    def _plot_tab8_thread(self, date_str, mtu_h, mtu_m):
-        """Fetch NordPool DA prices + scheduled physical flows, pass results to the UI thread."""
-        mtu_label  = f"{mtu_h:02d}:{mtu_m:02d}"
+    def _t8_play(self):
+        """Start slow-motion playback: fetch (or reuse cached) prices/flows
+        for every MTU in the day, then step through them on a timer."""
+        if self._t8_playing:
+            return
+        date_str = self._t8_date.get().strip()
+        if self._t8_day_cache and self._t8_day_cache["date"] == date_str:
+            self._t8_start_playback(date_str)
+            return
+
+        self._t8_fetch_mode = "play"
+        self._t8_btn.config(state=tk.DISABLED)
+        self._t8_play_btn.config(state=tk.DISABLED, text="Loading...")
+        self._t8_status.config(text="Fetching full day for playback...", foreground=C_MUTED)
+        self._t8_diag.config(state='normal')
+        self._t8_diag.delete('1.0', tk.END)
+        self._t8_diag.config(state='disabled')
+
+        threading.Thread(target=self._fetch_tab8_day_thread,
+                         args=(date_str,), daemon=True).start()
+
+    def _t8_start_playback(self, date_str):
+        all_prices = self._t8_day_cache["prices"]
+        all_flows  = self._t8_day_cache["flows"]
+        mtus = sorted(set(all_prices) | set(all_flows))
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
+        if not mtus:
+            messagebox.showinfo("Play", "No price/flow data available for this date.")
+            return
+
+        # Start from the currently-selected MTU if it's in range, else 00:00
+        start_label = self._t8_mtu.get().strip()
+        self._t8_play_mtus = mtus
+        self._t8_play_idx  = mtus.index(start_label) if start_label in mtus else 0
+        self._t8_playing = True
+        self._t8_btn.config(state=tk.DISABLED)
+        self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
+        self._t8_stop_btn.config(state=tk.NORMAL)
+        self._t8_play_step()
+
+    def _t8_play_step(self):
+        if not self._t8_playing or self._t8_play_idx >= len(self._t8_play_mtus):
+            self._t8_stop_play()
+            return
+        date_str  = self._t8_day_cache["date"]
+        mtu_label = self._t8_play_mtus[self._t8_play_idx]
+        prices = self._t8_day_cache["prices"].get(mtu_label, {})
+        flows  = self._t8_day_cache["flows"].get(mtu_label, {})
+        self._draw_tab8_map(prices, flows, date_str, mtu_label)
+        # draw_idle() (not the toolbar-rebuilding _add_toolbar) -- cheap
+        # enough to call every frame without visible lag or flicker.
+        self.canvas8.draw_idle()
+        self._t8_mtu.set(mtu_label)
+        self._t8_status.config(
+            text=f"Playing {self._t8_play_idx + 1}/{len(self._t8_play_mtus)}: {mtu_label} CET",
+            foreground=C_PRIMARY)
+        self._t8_play_idx += 1
+        interval_ms = self._T8_SPEED_MS.get(self._t8_speed.get(), 1200)
+        self._t8_play_after_id = self.root.after(interval_ms, self._t8_play_step)
+
+    def _t8_stop_play(self):
+        was_playing = self._t8_playing
+        self._t8_playing = False
+        if self._t8_play_after_id is not None:
+            try:
+                self.root.after_cancel(self._t8_play_after_id)
+            except Exception:
+                pass
+            self._t8_play_after_id = None
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
+        self._t8_stop_btn.config(state=tk.DISABLED)
+        if was_playing:
+            self._t8_status.config(text="Stopped.", foreground=C_MUTED)
+            self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _fetch_tab8_day_thread(self, date_str):
+        """Fetch NordPool DA prices + scheduled physical flows for the WHOLE
+        day, bucketed per MTU slot ("HH:MM" -> {...}). Both the single-
+        snapshot "Fetch & Plot" and the "Play" animation call this same
+        fetch+parse (picking one slot out afterward for the single-shot
+        case) so there is one place that understands the Nord Pool response
+        shape, instead of two copies that could silently drift apart."""
         diag_lines = []
 
         def _diag(msg):
@@ -2036,7 +2162,7 @@ class App:
 
         token = get_np_access_token()
         if not token:
-            self.root.after(0, self._tab8_done, None, None, date_str, mtu_label,
+            self.root.after(0, self._tab8_day_fetch_done, {}, {}, date_str,
                             "AUTH FAILED: could not obtain NordPool access token.",
                             diag_lines)
             return
@@ -2044,8 +2170,8 @@ class App:
         hdrs         = self._np_headers(token)
         areas_params = [('areas', z) for z in NORDIC_ZONES]
 
-        # Prices
-        prices      = {}
+        # Prices, per MTU: {"HH:MM": {zone: price}}
+        all_prices  = {}
         price_error = ""
         try:
             price_params = [('date', date_str), ('currency', 'EUR'),
@@ -2073,22 +2199,20 @@ class App:
                             continue
                         try:
                             cet_dt = _utc_to_cet(ts)
-                            if (cet_dt.strftime('%Y-%m-%d') == date_str
-                                    and cet_dt.hour   == mtu_h
-                                    and cet_dt.minute == mtu_m):
-                                prices[zone] = p.get('price')
-                                break
+                            if cet_dt.strftime('%Y-%m-%d') != date_str:
+                                continue
+                            mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
+                            all_prices.setdefault(mtu_label, {})[zone] = p.get('price')
                         except Exception as e:
                             _diag(f"[PRICE] ts-parse error zone={zone} ts={ts!r}: {e}")
-                _diag(f"[PRICE] matched zones: {sorted(prices.keys())} "
-                      f"(target {mtu_h:02d}:{mtu_m:02d} CET)")
+                _diag(f"[PRICE] MTU slots with data: {len(all_prices)}")
         except Exception as e:
             price_error = f"Price API exception: {e}"
             _diag(f"[PRICE] EXCEPTION: {e}")
 
-        # Scheduled Physical Flows
-        flows_raw  = {}
-        flow_error = ""
+        # Scheduled Physical Flows, per MTU: {"HH:MM": {(area,other): MW}}
+        all_flows_raw = {}
+        flow_error    = ""
         try:
             flow_params = [('date', date_str), ('market', 'DayAhead')] + areas_params
             rf = requests.get(NP_FLOW_URL, headers=hdrs,
@@ -2121,83 +2245,77 @@ class App:
                         _diag(f"[FLOW] flow-list key: '{fl_key}'. "
                               f"Sample slot keys: {list(flow_list[0].keys())}")
 
-                    matched = None
                     for fl in flow_list:
                         ts = fl.get('deliveryStart', '')
                         if not ts:
                             continue
                         try:
                             cet_dt = _utc_to_cet(ts)
-                            if (cet_dt.strftime('%Y-%m-%d') == date_str
-                                    and cet_dt.hour   == mtu_h
-                                    and cet_dt.minute == mtu_m):
-                                matched = fl
-                                break
                         except Exception as e:
                             _diag(f"[FLOW] ts-parse error area={area} ts={ts!r}: {e}")
-
-                    if matched is None:
-                        continue
-
-                    connections = None
-                    for ck in ('byConnections', 'connections',
-                               'counterpartAreas', 'scheduledExchanges'):
-                        connections = matched.get(ck)
-                        if isinstance(connections, list) and connections:
-                            if conn_key_resolved != ck:
-                                conn_key_resolved = ck
-                                _diag(f"[FLOW] connection-list key: '{ck}'. "
-                                      f"Sample: {list(connections[0].keys())}")
-                            break
-                    if not connections:
-                        _diag(f"[FLOW] WARNING: no connection list in slot "
-                              f"area={area}. Slot keys: {list(matched.keys())}")
-                        continue
-
-                    for conn in connections:
-                        other = (conn.get('area')
-                                 or conn.get('deliveryArea')
-                                 or conn.get('counterpart')
-                                 or conn.get('toArea')
-                                 or conn.get('deliveryAreaCode'))
-                        exp_raw = (conn.get('export')
-                                   or conn.get('exportFlow')
-                                   or conn.get('scheduledExport')
-                                   or conn.get('value')
-                                   or 0)
-                        if not other:
                             continue
-                        try:
-                            exp = float(exp_raw or 0)
-                        except (TypeError, ValueError):
-                            exp = 0.0
-                        flows_raw[(area, other)] = flows_raw.get((area, other), 0) + exp
+                        if cet_dt.strftime('%Y-%m-%d') != date_str:
+                            continue
+                        mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
 
-                _diag(f"[FLOW] raw pairs: {len(flows_raw)}  "
-                      f"e.g. {list(flows_raw.items())[:4]}")
+                        connections = None
+                        for ck in ('byConnections', 'connections',
+                                   'counterpartAreas', 'scheduledExchanges'):
+                            connections = fl.get(ck)
+                            if isinstance(connections, list) and connections:
+                                if conn_key_resolved != ck:
+                                    conn_key_resolved = ck
+                                    _diag(f"[FLOW] connection-list key: '{ck}'. "
+                                          f"Sample: {list(connections[0].keys())}")
+                                break
+                        if not connections:
+                            continue
+
+                        bucket = all_flows_raw.setdefault(mtu_label, {})
+                        for conn in connections:
+                            other = (conn.get('area')
+                                     or conn.get('deliveryArea')
+                                     or conn.get('counterpart')
+                                     or conn.get('toArea')
+                                     or conn.get('deliveryAreaCode'))
+                            exp_raw = (conn.get('export')
+                                       or conn.get('exportFlow')
+                                       or conn.get('scheduledExport')
+                                       or conn.get('value')
+                                       or 0)
+                            if not other:
+                                continue
+                            try:
+                                exp = float(exp_raw or 0)
+                            except (TypeError, ValueError):
+                                exp = 0.0
+                            bucket[(area, other)] = bucket.get((area, other), 0) + exp
+
+                _diag(f"[FLOW] MTU slots with data: {len(all_flows_raw)}")
         except Exception as e:
             flow_error = f"Flow API exception: {e}"
             _diag(f"[FLOW] EXCEPTION: {e}")
 
-        # Net flow per canonical border pair (positive = A→B)
-        net_flows = {}
-        for A, B in ZONE_CONNECTIONS:
-            net = flows_raw.get((A, B), 0) - flows_raw.get((B, A), 0)
-            if abs(net) >= 1:
-                net_flows[(A, B)] = net
+        # Net flow per canonical border pair (positive = A→B), per MTU
+        all_net_flows = {}
+        for mtu_label, flows_raw in all_flows_raw.items():
+            net_flows = {}
+            for A, B in ZONE_CONNECTIONS:
+                net = flows_raw.get((A, B), 0) - flows_raw.get((B, A), 0)
+                if abs(net) >= 1:
+                    net_flows[(A, B)] = net
+            if net_flows:
+                all_net_flows[mtu_label] = net_flows
 
-        _diag(f"[RESULT] prices={len(prices)} zones  net_flows={len(net_flows)} borders")
+        _diag(f"[RESULT] {len(all_prices)} MTU slot(s) with prices, "
+              f"{len(all_net_flows)} MTU slot(s) with flows")
 
         combined_error = "  |  ".join(filter(None, [price_error, flow_error]))
-        self.root.after(0, self._tab8_done, prices, net_flows,
-                        date_str, mtu_label,
-                        combined_error or None, diag_lines)
+        self.root.after(0, self._tab8_day_fetch_done, all_prices, all_net_flows,
+                        date_str, combined_error or None, diag_lines)
 
-    def _tab8_done(self, prices, net_flows, date_str, mtu_label,
-                   error=None, diag_lines=None):
-        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
-        self._t8_status.config(text="")
-
+    def _tab8_day_fetch_done(self, all_prices, all_net_flows, date_str,
+                             error=None, diag_lines=None):
         # ── Write diagnostic lines to the log pane ────────────────────
         if diag_lines:
             self._t8_diag.config(state='normal')
@@ -2206,13 +2324,34 @@ class App:
             self._t8_diag.see(tk.END)
             self._t8_diag.config(state='disabled')
 
-        if error:
+        if error and not all_prices and not all_net_flows:
+            self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+            self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
             self._t8_status.config(text=f"⚠ {error}", foreground=C_RED)
-            # Still render the map with whatever partial data we have
-            if prices is None and net_flows is None:
-                messagebox.showerror("Tab 8 Error", error)
-                return
+            messagebox.showerror("Tab 8 Error", error)
+            return
 
+        self._t8_day_cache = {"date": date_str, "prices": all_prices, "flows": all_net_flows}
+        self._t8_status.config(
+            text=f"⚠ {error}" if error else "", foreground=C_RED if error else C_MUTED)
+
+        if self._t8_fetch_mode == "play":
+            self._t8_start_playback(date_str)
+            return
+
+        # single-shot
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL)
+        mtu_label = self._t8_fetch_target_mtu
+        prices = all_prices.get(mtu_label, {})
+        flows  = all_net_flows.get(mtu_label, {})
+        self._draw_tab8_map(prices, flows, date_str, mtu_label)
+        self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _draw_tab8_map(self, prices, net_flows, date_str, mtu_label):
+        """Render one frame (one MTU's prices + net flows) onto fig8. Called
+        both for a single "Fetch & Plot" snapshot and once per frame during
+        "Play" animation."""
         self.fig8.clear()
         ax = self.fig8.add_subplot(111)
 
@@ -2325,7 +2464,6 @@ class App:
             f"Price (DayAhead, EUR/MWh) + Flow (MW)",
             fontsize=9.5, fontweight='bold', color=C_ACCENT, pad=8)
         self.fig8.tight_layout(pad=1.5)
-        self._add_toolbar(self.canvas8, self.toolbar_f8)
 
     # ------------------------------------------------------------------
     #  TAB 9 – Maintenance Analysis  (FB_CODE integration)
