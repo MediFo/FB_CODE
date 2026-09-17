@@ -2102,10 +2102,16 @@ class App:
             messagebox.showinfo("Play", "No price/flow data available for this date.")
             return
 
-        # Start from the currently-selected MTU if it's in range, else 00:00
-        start_label = self._t8_mtu.get().strip()
+        # Always start from the beginning of the day. (Previously this
+        # started from whatever MTU was showing in the combobox -- but
+        # _t8_play_step() itself updates that combobox to the currently-
+        # playing MTU every frame, so after a full playback it's left on
+        # the LAST slot of the day; a second "Play" click would then
+        # "resume" one frame from the end and stop immediately, looking
+        # broken. Ignoring it and always starting at index 0 removes that
+        # accidental coupling between the display field and playback state.)
         self._t8_play_mtus = mtus
-        self._t8_play_idx  = mtus.index(start_label) if start_label in mtus else 0
+        self._t8_play_idx  = 0
         self._t8_playing = True
         self._t8_btn.config(state=tk.DISABLED)
         self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
