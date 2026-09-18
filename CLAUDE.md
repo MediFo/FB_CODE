@@ -231,10 +231,13 @@ pytest test_pipeline.py -v
   UI shell only — its generate/export handlers show an honest "not
   implemented" message rather than silently doing nothing or fabricating
   output. Use the Analysis sub-tab or Tab 9 (Maintenance Analysis) instead.
-- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 9
+- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 13
   entries — the original seasonal_naive/fourier_trend/stl/arima/sarima plus
   "lightgbm"/"catboost" (gradient-boosted trees), "ridge" (closed-form
-  linear), and "ensemble" (adaptive blend of all the others). The three
+  linear), "structural" (state-space Kalman filter), "tbats", "theta",
+  "hurdle" (zero-inflated, for shadow price), and "ensemble" (adaptive
+  blend of all the others) — see the three entries below this one for the
+  latter five. The three
   lag-feature methods (lightgbm, catboost, ridge) share one
   `_its_lag_model()` implementation for feature engineering + the
   leak-avoidance recursive during/post projection — `_its_gbm(...,
@@ -331,6 +334,64 @@ pytest test_pipeline.py -v
   case anywhere else in the class. `TestLagFeatureItsMethods
   ::test_ridge_handles_all_nan_feature_column` guards against this
   regressing again.
+- Three more ITS methods target a gap none of the first nine cover:
+  SARIMA above only models ONE seasonal period (m=24, hourly) and bolts
+  the weekly pattern on afterward via a separate within-hour-deviation
+  lookup — it never lets the weekly cycle inform the trend/level estimate
+  itself. "structural" (statsmodels `UnobservedComponents`, state-space/
+  Kalman filter) and "tbats" (the `tbats` package) both instead model
+  daily AND weekly seasonality JOINTLY in one coherent model — structural
+  via harmonics inside a general state-space model (no new dependency,
+  statsmodels already required), tbats via a model purpose-built for
+  exactly this multi-seasonal-period shape (Box-Cox + trend + ARMA errors
+  + multiple seasonal components; optional dependency, falls back to
+  "structural" if not installed — pure numpy/scipy, no compiled toolchain,
+  unlike Prophet, which was considered and rejected earlier in this same
+  session for exactly that reason). Both fit on hourly-aggregated data and
+  expand back to MTU resolution via a shared `_expand_hourly_forecast_to_mtu()`
+  helper — the same within-hour-deviation technique `_its_sarima()` already
+  used, factored out so "structural"/"tbats" don't duplicate it, though
+  `_its_sarima()` itself was left with its own original inline copy
+  untouched to avoid any regression risk to that already-shipped, tested
+  method. The weekly seasonal component/period is only added once there's
+  ≥336h (2 full weekly cycles) of pre-period; shorter pre-periods get
+  daily seasonality only. TBATS' own automatic Box-Cox/damped-trend/ARMA
+  model-selection search is deliberately disabled (all fixed explicitly)
+  since that search is expensive and SARIMA's AIC grid search here is
+  already the slowest single method — letting TBATS run its full default
+  search on top would make it slower still for a GUI a person is waiting
+  on. Fallback chain: tbats → structural → sarima → arima → fourier_trend
+  → seasonal_naive. "theta" (statsmodels `ThetaModel`, a top performer in
+  the M3/M4 forecasting competitions) instead targets the opposite
+  problem — mirrors `_its_arima()`'s own "deseasonalize via seasonal_naive,
+  then model the residual" structure exactly, swapping in the Theta method
+  for ARIMA, specifically because Theta is known for punching above its
+  weight on SHORT series, the regime where ARIMA/SARIMA's order search and
+  the lag-feature methods' need for weeks of lag7d examples both struggle
+  (see "Backtested accuracy" below) — `min_days` is 7, the lowest of any
+  non-seasonal_naive method. All three were requested together in response
+  to "what more time series models [could we add]" after the lag-feature
+  methods above, and their leak-safety is verified the same way as every
+  other method here — see `TestTimeSeriesItsMethods` in test_pipeline.py.
+- "hurdle" is a two-part zero-inflated model, added specifically because
+  shadow price is NOT a continuous quantity the way fall/PTDF/RAM are: it
+  is exactly 0 on a non-binding CNEC and only positive when binding, so
+  every other ITS method here — all of which implicitly fit something
+  continuous and roughly Gaussian-shaped — risks projecting a smooth
+  trend/seasonal value onto a small positive baseline the real quantity
+  structurally cannot take except when actually binding. `_its_hurdle()`
+  instead estimates two (hour, weekday) tables from the pre-period —
+  P(binding) and E[value | binding] — and projects their product; same
+  zero-estimation-variance philosophy and leak-safety story as
+  seasonal_naive (a deterministic pre-period-only lookup, no lag features,
+  no recursion). Works on any column with a real point mass at zero, and
+  degrades harmlessly to plain seasonal_naive on a genuinely continuous
+  column (P(binding) saturates near 1) — verified by
+  `TestHurdleItsMethod::test_degrades_to_seasonal_mean_on_non_zero_inflated_column`.
+  This is a per-outage counterfactual choice a user makes by picking
+  "hurdle" in the ITS-method dropdown for a shadow-price single-event
+  analysis — nothing auto-detects zero-inflation and switches methods for
+  you.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by

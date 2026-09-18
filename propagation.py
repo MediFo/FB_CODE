@@ -3205,6 +3205,338 @@ def _its_sarima(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
     return pd.Series(projected, index=all_agg.index)
 
 
+def _hourly_pre_series(pre_agg: pd.DataFrame, col: str) -> pd.Series:
+    """Resample a pre-period DataFrame to hourly, interpolating gaps.
+    Shared by every ITS method that fits on hourly-aggregated data
+    (_its_structural, _its_tbats — _its_sarima keeps its own copy of this
+    step, written before this helper existed) before expanding back to
+    MTU resolution via _expand_hourly_forecast_to_mtu()."""
+    return (pre_agg.set_index("dateTimeUtc")[col]
+            .resample("1h").mean()
+            .interpolate("time"))
+
+
+def _expand_hourly_forecast_to_mtu(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                                   col: str, mtu_minutes: int,
+                                   pre_end_h: pd.Timestamp,
+                                   hourly_fc_series: pd.Series) -> pd.Series:
+    """
+    Reconstruct an MTU-level counterfactual from an hourly forecast:
+    pre-period rows use the in-sample (hour, dow) seasonal mean; during/
+    post rows use the nearest hourly forecast value plus the average
+    within-hour deviation pattern observed in the pre-period for that
+    (hour, dow, mtu-within-hour) triple — MTU-level detail an hourly model
+    can't itself provide, since it never saw sub-hourly variation. Shared
+    by _its_structural and _its_tbats (mirrors _its_sarima's own inline
+    Step 5/6, which predates this helper and is left untouched to avoid
+    any regression risk to that already-shipped, well-tested method).
+    """
+    pre_detailed = pre_agg.copy()
+    pre_detailed["hour"] = pre_detailed["dateTimeUtc"].dt.hour
+    pre_detailed["dow"]  = pre_detailed["dateTimeUtc"].dt.dayofweek
+    pre_detailed["mtu_in_hour"] = pre_detailed["dateTimeUtc"].dt.minute // mtu_minutes
+    pre_hrly = (pre_detailed.set_index("dateTimeUtc")[col]
+                .resample("1h").transform("mean"))
+    pre_detailed["hourly_mean"] = pre_hrly.values
+    pre_detailed["within_hour_dev"] = pre_detailed[col] - pre_detailed["hourly_mean"]
+    sub_hour_mean = (pre_detailed.groupby(["hour", "dow", "mtu_in_hour"])
+                     ["within_hour_dev"].mean())
+
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+
+    projected = []
+    for _, row in all_agg.iterrows():
+        ts = row["dateTimeUtc"]
+        if ts <= pre_end_h:
+            seas = float(seas_mean.get((int(row["hour"]), int(row["dow"])), fallback))
+            projected.append(seas)
+        else:
+            hour_ts = ts.floor("1h")
+            if hour_ts in hourly_fc_series.index:
+                h_fc = float(hourly_fc_series[hour_ts])
+            else:
+                nearest = hourly_fc_series.index.get_indexer([hour_ts], method="nearest")[0]
+                h_fc = float(hourly_fc_series.iloc[nearest]) if nearest >= 0 else float(hourly_fc_series.iloc[-1])
+            mtu_in_h = int(ts.minute // mtu_minutes)
+            dev_key  = (int(row["hour"]), int(row["dow"]), mtu_in_h)
+            dev      = float(sub_hour_mean.get(dev_key, 0.0))
+            projected.append(h_fc + dev)
+
+    return pd.Series(projected, index=all_agg.index)
+
+
+def _its_structural(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                    col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    Structural time series / Kalman filter (statsmodels
+    UnobservedComponents) with local linear trend plus daily AND weekly
+    seasonality in a SINGLE state-space model, on hourly-aggregated data,
+    expanded back to MTU resolution. See _ITS_METHODS["structural"]
+    ["description"] for full docs.
+
+    This exists specifically because SARIMA above only models one seasonal
+    period (m=24, hourly) and bolts the weekly pattern on afterward via a
+    separate within-hour-deviation lookup (Step 5 in _its_sarima) — it
+    never lets the weekly cycle inform the trend/level estimate itself.
+    UnobservedComponents' `freq_seasonal` accepts multiple periods (here
+    24 AND 168, trigonometric/harmonic seasonal components) in one
+    coherent model, so daily and weekly structure are estimated jointly
+    with the trend via the Kalman filter, rather than layered on
+    afterward. Also yields proper forecast confidence intervals (not
+    currently surfaced by this pipeline, but available on the fitted
+    result if a future caller wants them).
+
+    Falls back to SARIMA if UnobservedComponents can't be imported (not
+    expected — it's part of the already-required statsmodels — this
+    mirrors the same defensive pattern as every other statsmodels-backed
+    method here), if there's under 48 hours of pre-period, or if fitting
+    fails. The weekly seasonal component itself is only added once there
+    are ≥336 hours (2 full weekly cycles) of pre-period; below that it
+    fits daily seasonality only rather than an unidentified weekly one.
+    """
+    try:
+        from statsmodels.tsa.statespace.structural import UnobservedComponents as _UC
+    except ImportError:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_ts = _hourly_pre_series(pre_agg, col)
+    if len(pre_ts) < 48:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    endog = pre_ts.values.astype(float)
+    freq_seasonal = [{"period": 24, "harmonics": 4}]
+    if len(endog) >= 336:
+        freq_seasonal.append({"period": 168, "harmonics": 2})
+
+    try:
+        # No explicit irregular=True: the "local linear trend" preset
+        # already implies its own observation-noise term, and passing
+        # irregular explicitly on top just triggers a SpecificationWarning
+        # about it being overridden -- noise, not a real config choice.
+        model = _UC(endog, level="local linear trend",
+                   freq_seasonal=freq_seasonal).fit(disp=False)
+    except Exception:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_end_h  = pre_ts.index[-1]
+    all_end    = all_agg["dateTimeUtc"].max()
+    n_hours_fc = int(np.ceil((all_end - pre_end_h).total_seconds() / 3600)) + 1
+    if n_hours_fc <= 0:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        fc_hourly = model.forecast(steps=n_hours_fc)
+    except Exception:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    hourly_fc_idx = pd.date_range(start=pre_end_h + pd.Timedelta(hours=1),
+                                  periods=n_hours_fc, freq="1h", tz="UTC")
+    hourly_fc_series = pd.Series(np.asarray(fc_hourly), index=hourly_fc_idx)
+
+    return _expand_hourly_forecast_to_mtu(pre_agg, all_agg, col, mtu_minutes,
+                                          pre_end_h, hourly_fc_series)
+
+
+def _its_tbats(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+               col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    TBATS (Box-Cox transform, ARMA errors, Trend, multiple Seasonal
+    components) with daily AND weekly seasonal periods, on
+    hourly-aggregated data, expanded back to MTU resolution. See
+    _ITS_METHODS["tbats"]["description"] for full docs.
+
+    Like _its_structural(), this targets the same gap (SARIMA only models
+    one seasonal period) with a model purpose-built for exactly this
+    "multiple seasonal periods on one series" shape, rather than
+    approximating it with harmonics inside a general state-space model.
+
+    Box-Cox, damped trend, and ARMA-error model selection are all fixed
+    explicitly (use_box_cox=False, use_damped_trend=False,
+    use_arma_errors=True) rather than left to TBATS' own automatic search
+    over combinations of those — that search is expensive (many candidate
+    fits), and SARIMA's own AIC grid search here is already flagged as the
+    slowest of the non-ensemble methods; letting TBATS run its full
+    default search on top would make it slower still for a GUI a person
+    is waiting on.
+
+    Falls back to _its_structural() (the other dual-seasonality method) if
+    the `tbats` package isn't installed (optional — see requirements.txt/
+    pyproject.toml), if there's under 48 hours of pre-period, or if
+    fitting fails. The weekly seasonal period is only included once there
+    are ≥336 hours (2 full weekly cycles) of pre-period, same threshold
+    and reasoning as _its_structural().
+    """
+    try:
+        from tbats import TBATS
+    except ImportError:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_ts = _hourly_pre_series(pre_agg, col)
+    if len(pre_ts) < 48:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    endog = pre_ts.values.astype(float)
+    seasonal_periods = [24]
+    if len(endog) >= 336:
+        seasonal_periods.append(168)
+
+    try:
+        estimator = TBATS(seasonal_periods=seasonal_periods, use_box_cox=False,
+                          use_trend=True, use_damped_trend=False,
+                          use_arma_errors=True, n_jobs=1)
+        model = estimator.fit(endog)
+    except Exception:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_end_h  = pre_ts.index[-1]
+    all_end    = all_agg["dateTimeUtc"].max()
+    n_hours_fc = int(np.ceil((all_end - pre_end_h).total_seconds() / 3600)) + 1
+    if n_hours_fc <= 0:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        fc_hourly = model.forecast(steps=n_hours_fc)
+    except Exception:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    hourly_fc_idx = pd.date_range(start=pre_end_h + pd.Timedelta(hours=1),
+                                  periods=n_hours_fc, freq="1h", tz="UTC")
+    hourly_fc_series = pd.Series(np.asarray(fc_hourly), index=hourly_fc_idx)
+
+    return _expand_hourly_forecast_to_mtu(pre_agg, all_agg, col, mtu_minutes,
+                                          pre_end_h, hourly_fc_series)
+
+
+def _its_theta(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+               col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    Theta method on deseasonalized residuals — mirrors _its_arima()'s own
+    "deseasonalize via seasonal_naive, then model the residual" structure
+    exactly, swapping ARIMA-on-residuals for the Theta method. See
+    _ITS_METHODS["theta"]["description"] for full docs.
+
+    The Theta method (Assimakopoulos & Nikolopoulos, top-tier in the M3/M4
+    forecasting competitions) decomposes a series into "theta lines" —
+    here just a trend/level extrapolation on the deseasonalized residual,
+    since seasonality is already stripped out before it sees the data —
+    and is known for punching above its weight specifically on SHORT
+    series, where ARIMA/SARIMA's own order-search and the lag-feature
+    methods' need for several weeks of lag7d examples both struggle (see
+    CLAUDE.md's "Backtested accuracy" note). No AIC-style grid search, so
+    it's also one of the cheapest methods to fit here.
+
+    Falls back to seasonal_naive if statsmodels (already required) is
+    unavailable, or below the same length/deseasonalization guards
+    _its_arima() uses (len(pre_agg) < 32, or < 20 valid deseasonalized
+    points) — Theta's short-series strength still needs a floor of usable
+    data, it isn't magic.
+    """
+    if sm is None:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+    try:
+        from statsmodels.tsa.forecasting.theta import ThetaModel
+    except ImportError:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    if len(pre_agg) < 32:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+
+    def _seas(h, d):
+        return float(seas_mean.get((int(h), int(d)), fallback))
+
+    deseas = np.array([pre_agg[col].values[i] - _seas(pre_agg["hour"].values[i],
+                                                        pre_agg["dow"].values[i])
+                       for i in range(len(pre_agg))], dtype=float)
+    deseas = deseas[np.isfinite(deseas)]
+    if len(deseas) < 20:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        theta_res = ThetaModel(deseas, deseasonalize=False).fit()
+    except Exception:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    pre_end  = pre_agg["dateTimeUtc"].max()
+    n_future = int((all_agg["dateTimeUtc"] > pre_end).sum())
+
+    try:
+        fc = np.asarray(theta_res.forecast(steps=n_future)) if n_future > 0 else np.array([])
+    except Exception:
+        fc = np.zeros(n_future)
+
+    projected = []
+    fc_iter   = iter(fc)
+    for _, row in all_agg.iterrows():
+        seas  = _seas(row["hour"], row["dow"])
+        resid = float(next(fc_iter, 0.0)) if row["dateTimeUtc"] > pre_end else 0.0
+        projected.append(seas + resid)
+
+    return pd.Series(projected, index=all_agg.index)
+
+
+def _its_hurdle(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                mtu_minutes: int = 15, zero_tol: float = 1e-9) -> pd.Series:
+    """
+    Two-part 'hurdle' counterfactual for zero-inflated series — built for
+    shadow price specifically (exactly 0 on a non-binding CNEC, positive
+    only when binding), but works on any column with a real point mass at
+    zero. See _ITS_METHODS["hurdle"]["description"] for the full
+    rationale.
+
+    Every OTHER method in this section implicitly fits a continuous,
+    roughly-Gaussian-shaped model to whatever column it's given — a poor
+    match for a series that is genuinely a point mass at zero PLUS a
+    separate positive-value distribution when binding, not just
+    "occasionally small". Projecting one of those methods directly onto
+    shadow price risks a smooth trend/seasonal projection landing on some
+    small positive baseline the real quantity structurally cannot take
+    except when the CNEC is actually binding.
+
+    This instead estimates two (hour, weekday) tables from the pre-period
+    — same zero-estimation-variance philosophy as seasonal_naive:
+      1. P(binding) = fraction of pre-period rows with a nonzero value,
+         grouped by (hour, dow).
+      2. E[value | binding] = mean of the NONZERO pre-period rows, grouped
+         by (hour, dow) — falling back to the overall nonzero mean for a
+         (hour, dow) cell that saw no binding examples in the pre-period.
+    The projected value at every during/post timestamp is
+    P(binding) x E[value | binding] — the expected value under this
+    two-part model, giving the same "single continuous Series" contract
+    every other ITS method returns, while respecting that most hours'
+    expectation is genuinely dominated by the zero mass rather than a
+    smeared-out small positive value.
+
+    No lag features, no recursion, no extra leak-avoidance machinery
+    needed — like seasonal_naive, every projected value is a
+    deterministic (hour, dow) lookup from pre-period-only statistics, so
+    it can't read a during/post observation by construction.
+    """
+    is_nonzero = (pre_agg[col].abs() > zero_tol).astype(float)
+    p_bind = (pre_agg.assign(_is_nonzero=is_nonzero)
+              .groupby(["hour", "dow"])["_is_nonzero"].mean())
+    p_bind_fallback = float(is_nonzero.mean())
+
+    nonzero_rows = pre_agg[pre_agg[col].abs() > zero_tol]
+    if not nonzero_rows.empty:
+        mag_mean = nonzero_rows.groupby(["hour", "dow"])[col].mean()
+        mag_fallback = float(nonzero_rows[col].mean())
+    else:
+        mag_mean = pd.Series(dtype=float)
+        mag_fallback = 0.0
+
+    def _project(row) -> float:
+        key = (int(row["hour"]), int(row["dow"]))
+        p = float(p_bind.get(key, p_bind_fallback))
+        m = float(mag_mean.get(key, mag_fallback))
+        return p * m
+
+    return all_agg.apply(_project, axis=1)
+
+
 def _clamp_recovery_frac(impact: float, recovery_residual: float) -> float:
     """Compute recovery fraction clamped to [-1.0, 1.0].
 
@@ -3790,6 +4122,100 @@ _ITS_METHODS = {
             "to ever be non-imputed). Cheapest lag-feature method to fit."),
         "fn": _its_ridge,
     },
+    "structural": {
+        "label":       "Structural TS / Kalman filter (daily+weekly)",
+        "min_days":    14,
+        "description": (
+            "State-space structural time series (statsmodels "
+            "UnobservedComponents): local linear trend plus DAILY AND "
+            "WEEKLY seasonality estimated jointly via the Kalman filter, on "
+            "hourly-aggregated data, expanded back to MTU resolution using "
+            "the within-hour deviation pattern (same technique as SARIMA's "
+            "own Step 5/6). Exists because SARIMA above only models ONE "
+            "seasonal period (m=24) and bolts the weekly pattern on "
+            "afterward as a separate lookup -- this instead lets daily and "
+            "weekly structure inform the trend/level estimate together, in "
+            "one coherent model. The weekly component only activates with "
+            "≥336h (2 full weekly cycles) of pre-period; shorter pre-periods "
+            "get daily seasonality only rather than an unidentified weekly "
+            "one. Falls back to SARIMA if UnobservedComponents can't be "
+            "imported (not expected -- statsmodels is already required), if "
+            "there's under 48h of pre-period, or if fitting fails. "
+            "Minimum baseline: 14 days. Recommended: 30-90 days, and ≥14 "
+            "days (336h) specifically to get the weekly component."),
+        "fn": _its_structural,
+    },
+    "tbats": {
+        "label":       "TBATS (daily+weekly, Box-Cox+trend+ARMA)",
+        "min_days":    14,
+        "description": (
+            "TBATS (Box-Cox transform, ARMA errors, Trend, multiple "
+            "Seasonal components) with daily AND weekly seasonal periods, "
+            "on hourly-aggregated data, expanded back to MTU resolution -- "
+            "purpose-built for exactly this 'more than one seasonal period "
+            "on one series' shape, the same gap 'structural' above targets "
+            "but with a model designed around it rather than approximating "
+            "it with harmonics inside a general state-space model. Box-Cox/ "
+            "damped-trend/ARMA-error model selection are all fixed "
+            "explicitly rather than left to TBATS' own automatic search "
+            "over those combinations, since that search is expensive and "
+            "SARIMA's own AIC grid search here is already the slowest "
+            "single method -- letting TBATS run its full default search on "
+            "top would make it slower still for a GUI a person is waiting "
+            "on. Optional dependency (`tbats`, pure numpy/scipy, no "
+            "compiled toolchain -- unlike Prophet, which was considered and "
+            "rejected for exactly that reason). Falls back to 'structural' "
+            "(the other dual-seasonality method) if tbats isn't installed, "
+            "if there's under 48h of pre-period, or if fitting fails. The "
+            "weekly period is only included with ≥336h of pre-period, same "
+            "threshold as 'structural'. "
+            "Minimum baseline: 14 days. Recommended: 30-90 days."),
+        "fn": _its_tbats,
+    },
+    "theta": {
+        "label":       "Theta method (deseasonalized residuals)",
+        "min_days":    7,
+        "description": (
+            "Theta method (Assimakopoulos & Nikolopoulos -- a top performer "
+            "in the M3/M4 forecasting competitions) on deseasonalized "
+            "residuals, mirroring ARIMA's own 'deseasonalize via "
+            "seasonal_naive, then model the residual' structure exactly, "
+            "with Theta swapped in for ARIMA. No AIC-style order search, so "
+            "it's also one of the cheapest methods here to fit. Known "
+            "specifically for punching above its weight on SHORT series -- "
+            "the regime where ARIMA/SARIMA's own order search and the "
+            "lag-feature methods' need for several weeks of lag7d examples "
+            "both struggle (see CLAUDE.md's 'Backtested accuracy' note). "
+            "Falls back to seasonal naive if statsmodels (already required) "
+            "is unavailable, or below the same length/deseasonalization "
+            "guards ARIMA uses -- Theta's short-series strength still needs "
+            "a floor of usable data. "
+            "Minimum baseline: 7 days -- the lowest of any non-seasonal_naive "
+            "method here, matching its short-series reputation."),
+        "fn": _its_theta,
+    },
+    "hurdle": {
+        "label":       "Hurdle (zero-inflated — for shadow price)",
+        "min_days":    2,
+        "description": (
+            "Two-part 'hurdle' model for zero-inflated series -- built for "
+            "shadow price specifically (exactly 0 on a non-binding CNEC, "
+            "positive only when binding), a poor match for every other "
+            "method here, which implicitly fits a continuous, "
+            "roughly-Gaussian-shaped model to whatever column it's given. "
+            "Estimates P(binding) and E[value | binding] as separate "
+            "(hour, weekday) tables from the pre-period -- same "
+            "zero-estimation-variance philosophy as seasonal_naive -- and "
+            "projects their product. No lag features, no recursion: every "
+            "projected value is a deterministic pre-period-only lookup, "
+            "same leak-safety story as seasonal_naive. Works on any column "
+            "with a real point mass at zero, not only shadow price, but "
+            "adds nothing over seasonal_naive on a genuinely continuous "
+            "column (P(binding) saturates near 1 and the product collapses "
+            "back to a plain seasonal mean). "
+            "Minimum baseline: 2 days, same as seasonal_naive."),
+        "fn": _its_hurdle,
+    },
     "ensemble": {
         "label":       "Ensemble (adaptive, backtest-weighted)",
         "min_days":    2,
@@ -3876,6 +4302,10 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
         "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
         "ridge"          — Ridge (closed-form) on the same lag + calendar features
+        "structural"     — state-space structural TS with daily+weekly seasonality
+        "tbats"          — TBATS with daily+weekly seasonality
+        "theta"          — Theta method on deseasonalized residuals
+        "hurdle"         — two-part zero-inflated model (for shadow price)
         "ensemble"       — adaptive, backtest-weighted blend of every method above
         "all"            — run every registered method; dashboard can compare them
 
@@ -4073,6 +4503,10 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     #   "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
     #   "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
     #   "ridge"          — Ridge (closed-form) on the same lag + calendar features
+    #   "structural"     — state-space structural TS with daily+weekly seasonality
+    #   "tbats"          — TBATS with daily+weekly seasonality
+    #   "theta"          — Theta method on deseasonalized residuals
+    #   "hurdle"         — two-part zero-inflated model (for shadow price)
     #   "ensemble"       — adaptive, backtest-weighted blend of every method above
     #   "all"            — run every registered method, return its_all dict
     #

@@ -26,8 +26,11 @@ entsoe     = ["entsoe-py>=0.6"]
 # scikit-learn is required by lightgbm's LGBMRegressor (the sklearn wrapper
 # used here) even though `import lightgbm` alone succeeds without it.
 gbm        = ["lightgbm>=4.0", "catboost>=1.2", "scikit-learn>=1.3"]
+# "tbats" ITS counterfactual method -- optional, falls back to "structural"
+# (statsmodels UnobservedComponents, already in the regression stack).
+tbats      = ["tbats>=1.1"]
 dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-py>=0.6", "scipy>=1.10",
-              "lightgbm>=4.0", "catboost>=1.2", "scikit-learn>=1.3"]
+              "lightgbm>=4.0", "catboost>=1.2", "scikit-learn>=1.3", "tbats>=1.1"]
 
 [project.scripts]
 fi-no3-analyse = "fi_no3.propagation:main_cli"

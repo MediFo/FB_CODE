@@ -3579,8 +3579,12 @@ class App:
             "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
             "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
             "ridge":          "Ridge (lag + calendar)   [min 7 days]",
+            "structural":     "Structural TS / Kalman (daily+weekly) [min 14 days]",
+            "tbats":          "TBATS (daily+weekly)     [min 14 days]",
+            "theta":          "Theta method              [min 7 days]",
+            "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
             "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
-            "all":            "All nine  [run & compare side-by-side]",
+            "all":            "All thirteen  [run & compare side-by-side]",
         }
         _prop = getattr(self, '_prop', None)
         _method_keys = (list(_prop.ITS_METHOD_NAMES) + ["all"]) if _prop else list(_method_labels)
@@ -3905,6 +3909,10 @@ class App:
             "lightgbm":       ("#8C6A4A", "--"),
             "catboost":       ("#5C8A8A", "-."),
             "ridge":          ("#B08968", ":"),
+            "structural":     ("#6B8E9E", "-."),
+            "tbats":          ("#9E6B8E", ":"),
+            "theta":          ("#8EA05A", "--"),
+            "hurdle":         ("#C97B4A", "-."),
             "ensemble":       ("#2E2E2E", "-"),
         }
         # Clear and rebuild the tkinter legend bar above the canvas

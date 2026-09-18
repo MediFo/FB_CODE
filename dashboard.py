@@ -1256,8 +1256,12 @@ class App:
             "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
             "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
             "ridge":          "Ridge (lag + calendar)   [min 7 days]",
+            "structural":     "Structural TS / Kalman (daily+weekly) [min 14 days]",
+            "tbats":          "TBATS (daily+weekly)     [min 14 days]",
+            "theta":          "Theta method              [min 7 days]",
+            "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
             "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
-            "all":            "All nine  [run & compare side-by-side]",
+            "all":            "All thirteen  [run & compare side-by-side]",
         }
         _method_cb = ttk.Combobox(
             ctrl,
@@ -1589,6 +1593,10 @@ class App:
             "lightgbm":       ("#d35400", "--"),
             "catboost":       ("#34495e", "-."),
             "ridge":          ("#7f8c8d", ":"),
+            "structural":     ("#5b7fa6", "-."),
+            "tbats":          ("#a65b8e", ":"),
+            "theta":          ("#7fa65b", "--"),
+            "hurdle":         ("#c97b3c", "-."),
             "ensemble":       ("#1a1a1a", "-"),
         }
 

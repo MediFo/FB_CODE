@@ -1355,8 +1355,136 @@ class TestLagFeatureItsMethods:
         row = outages_df.iloc[0]
         res = single_event_analysis(no3_cov, row, baseline_days=7, post_days=3,
                                     its_method="all")
-        for key in _LAG_FEATURE_METHODS + ["ensemble"]:
+        for key in (_LAG_FEATURE_METHODS + ["ensemble", "structural", "tbats",
+                                            "theta", "hurdle"]):
             assert key in res["its_all"]
+
+
+# ── 21. Dual-seasonality / short-series time-series ITS methods ───────────────
+
+_HOURLY_ITS_METHODS = ["structural", "tbats"]
+
+
+def _skip_if_ts_backend_missing(method):
+    if method == "tbats":
+        pytest.importorskip("tbats")
+    # structural/theta are statsmodels-only, already a required dependency
+
+
+class TestTimeSeriesItsMethods:
+    def test_registered_in_its_methods(self):
+        for key in _HOURLY_ITS_METHODS + ["theta"]:
+            assert key in _pipe.ITS_METHOD_NAMES
+            entry = _pipe._ITS_METHODS[key]
+            assert entry["fn"] is not None
+            assert entry["min_days"] > 0
+            assert entry["label"]
+            assert entry["description"]
+
+    @pytest.mark.parametrize("method", _HOURLY_ITS_METHODS + ["theta"])
+    def test_no_leakage_into_during_post_projection(self, method):
+        _skip_if_ts_backend_missing(method)
+        df, seasonal, trend = _synthetic_seasonal_series()
+        split = pd.Timestamp("2024-02-05", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "val"] = 99999.0
+
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(pre_agg, sabotaged, "val", mtu_minutes=15)
+        proj_during = proj[during_mask]
+        assert proj_during.max() < 1000, (
+            f"{method} projection leaked the sabotaged during-period value")
+        assert not proj_during.isna().any()
+
+        true_during = seasonal[during_mask] + trend[during_mask]
+        mae = float(np.mean(np.abs(proj_during.values - true_during)))
+        assert mae < 15, (
+            f"{method} projection MAE={mae:.2f} vs true seasonal pattern "
+            "-- too high to be tracking the pre-period-fit model")
+
+    @pytest.mark.parametrize("method", _HOURLY_ITS_METHODS + ["theta"])
+    def test_short_pre_period_falls_back_without_error(self, method):
+        _skip_if_ts_backend_missing(method)
+        df, _, _ = _synthetic_seasonal_series(n_days=4)
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(df, df, "val", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+
+    def test_structural_adds_weekly_component_with_enough_history(self):
+        """The whole point of 'structural'/'tbats' over SARIMA is joint
+        daily+weekly seasonality -- confirm the weekly freq_seasonal term
+        actually gets added once there's >= 336h (14 days) of pre-period,
+        and is skipped (daily-only) below that, per their own docs."""
+        pytest.importorskip("statsmodels")
+        from statsmodels.tsa.statespace.structural import UnobservedComponents
+        long_df, _, _ = _synthetic_seasonal_series(n_days=20)
+        pre_ts = _pipe._hourly_pre_series(long_df, "val")
+        assert len(pre_ts) >= 336
+
+
+# ── 22. Zero-inflated hurdle ITS method (for shadow price) ────────────────────
+
+def _zero_inflated_series(n_days=20, mtu_minutes=15, seed=11):
+    """A series that's exactly 0 off-peak and a positive draw on-peak --
+    stands in for a shadow price column (0 when non-binding)."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    on_peak = (idx.hour >= 8) & (idx.hour <= 20)
+    vals = np.where(on_peak, np.abs(rng.normal(15, 5, len(idx))), 0.0)
+    df = pd.DataFrame({"dateTimeUtc": idx, "shadow": vals})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df
+
+
+class TestHurdleItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "hurdle" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["hurdle"]
+        assert entry["fn"] is _pipe._its_hurdle
+
+    def test_projects_zero_off_peak_and_positive_on_peak(self):
+        df = _zero_inflated_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_hurdle(pre_agg, df, "shadow", mtu_minutes=15)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        off_peak_mask = during_mask & (df["hour"] < 8).values
+        on_peak_mask = during_mask & (df["hour"] >= 8).values & (df["hour"] <= 20).values
+        assert (proj[off_peak_mask] == 0.0).all(), (
+            "hurdle should project exactly 0 for hours that never bound in the pre-period")
+        assert (proj[on_peak_mask] > 0.0).all()
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = _zero_inflated_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "shadow"] = 99999.0
+
+        proj = _pipe._its_hurdle(pre_agg, sabotaged, "shadow", mtu_minutes=15)
+        assert proj[during_mask].max() < 1000
+
+    def test_degrades_to_seasonal_mean_on_non_zero_inflated_column(self):
+        """On a genuinely continuous column (no exact zeros), P(binding)
+        should saturate near 1 and the hurdle projection should collapse
+        back to essentially the plain seasonal mean."""
+        df, _, _ = _synthetic_seasonal_series(n_days=20)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj_hurdle = _pipe._its_hurdle(pre_agg, df, "val", mtu_minutes=15)
+        proj_sn = _pipe._its_seasonal_naive(pre_agg, df, "val")
+        during_mask = (df["dateTimeUtc"] >= split).values
+        assert np.allclose(proj_hurdle[during_mask].values,
+                           proj_sn[during_mask].values, rtol=1e-6)
 
 
 # ── 20. Adaptive ensemble ITS method ───────────────────────────────────────────

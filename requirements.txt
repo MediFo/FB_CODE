@@ -40,5 +40,13 @@ lightgbm>=4.0
 catboost>=1.2
 scikit-learn>=1.3
 
+# ── TBATS ITS counterfactual method ("tbats" in _ITS_METHODS,
+#    propagation.py) -- optional: falls back to "structural" (statsmodels
+#    UnobservedComponents, already covered by the regression stack above,
+#    no extra dependency of its own) if not installed. Pure numpy/scipy,
+#    no compiled toolchain -- unlike Prophet, considered and rejected for
+#    exactly that reason (see CLAUDE.md). ──────────────────────────────────
+tbats>=1.1
+
 # ── Test suite ────────────────────────────────────────────────────────────
 pytest>=7.0
