@@ -94,7 +94,7 @@ C_SURFACE   = '#F6F6F7'   # subtle neutral surface -- ghost-button fill, hover
 C_ACCENT    = '#111113'   # near-black, used for emphasis text (no colored
                           # header block in this design -- restraint over
                           # brand-color repetition is the point)
-C_PRIMARY   = '#2F3B52'   # the single accent color: primary actions, focus,
+C_PRIMARY   = '#163C2C'   # the single accent color: primary actions, focus,
                           # selection. Everything else in this design stays
                           # neutral grayscale so this one color still reads
                           # as a deliberate signal, not just "the palette"
@@ -688,7 +688,7 @@ class App:
         s.configure('Accent.TButton', background=C_PRIMARY, foreground='white',
                     font=FONT_BOLD, padding=(14, 7), relief='flat', borderwidth=0)
         s.map('Accent.TButton',
-              background=[('pressed', '#161D29'), ('active', '#20293B'),
+              background=[('pressed', '#0F2A1E'), ('active', '#1F5138'),
                           ('disabled', C_BORDER)],
               foreground=[('disabled', C_MUTED)])
 
@@ -4322,7 +4322,7 @@ class App:
 <title>Maintenance Analysis Report</title>
 <style>
 body{{font-family:Segoe UI,sans-serif;margin:40px;color:#18181B;}}
-h1{{color:#111113;}} h2{{color:#2F3B52;border-bottom:1px solid #E6E6E9;padding-bottom:4px;}}
+h1{{color:#111113;}} h2{{color:#163C2C;border-bottom:1px solid #E6E6E9;padding-bottom:4px;}}
 table{{border-collapse:collapse;width:100%;margin-bottom:24px;}}
 th{{background:#111113;color:white;padding:8px;text-align:left;}}
 td{{padding:6px 8px;border-bottom:1px solid #E6E6E9;}}
