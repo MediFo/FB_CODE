@@ -231,63 +231,106 @@ pytest test_pipeline.py -v
   UI shell only — its generate/export handlers show an honest "not
   implemented" message rather than silently doing nothing or fabricating
   output. Use the Analysis sub-tab or Tab 9 (Maintenance Analysis) instead.
-- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 7
+- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 9
   entries — the original seasonal_naive/fourier_trend/stl/arima/sarima plus
-  "lightgbm" and "catboost", both gradient-boosted trees on lag1d/lag2d/
-  lag7d + their mean (a simplified Neighborhood Days Approach / NDA) plus
-  cyclical hour/weekday features, sharing one `_its_gbm(..., backend=...)`
-  implementation. Rationale: lag features are reported to consistently
-  improve forecast accuracy across model families (Ridge, XGBoost, CatBoost,
-  LightGBM alike) more than model choice does — it's the input
-  representation, not model sophistication, doing most of the work; NDA
-  extends the classic lag24 feature to a small neighborhood of nearby days,
-  distinct from DSTA (day-of-same-type, e.g. previous Mondays), which the
-  existing seasonal_naive/Fourier/STL methods already capture via
-  (hour, weekday) grouping. Both new methods handle the resulting NaN-heavy
-  lag columns (start of pre-period, gaps) natively — no imputation step.
-  Leak-avoidance: a naive lag feature (e.g. "value 24h ago") would read real,
-  potentially outage-contaminated data for any during/post timestamp whose
-  lag source falls inside the during/post window itself — exactly what the
-  "fit on pre-period only" rule at the top of propagation.py's ITS section
-  exists to prevent. `_its_gbm()` avoids this by projecting the during/post
-  window RECURSIVELY: predictions are made in chronological order and each
-  one is immediately fed back in as the lag source for later steps, the same
-  discipline `_its_arima`/`_its_sarima` already follow via `.forecast()`
-  never touching real future data. Pre-period rows are still batch-predicted
-  from real pre-period lags (no recursion needed there). Verified with a
-  synthetic-data test that sabotages the actual during/post values to an
-  outlier and confirms the projection neither reproduces it nor tracks it —
-  see `TestGbmItsMethods` in test_pipeline.py. Both fall back to ARIMA if
-  their library (`lightgbm`/`catboost`, both optional — see requirements.txt/
-  pyproject.toml's new `gbm` extra) isn't installed, and to seasonal_naive if
-  the pre-period is too short to fit (same `< 2*T_day` guard as STL).
-  `ITS_METHOD_NAMES`/`_ITS_METHODS` being a plain dict/list is why both
-  dashboard.py's and app_jao_NP_API_fix_d14.py's Single Event ITS-method
-  dropdowns picked these up with zero GUI code changes — only their
+  "lightgbm"/"catboost" (gradient-boosted trees), "ridge" (closed-form
+  linear), and "ensemble" (adaptive blend of all the others). The three
+  lag-feature methods (lightgbm, catboost, ridge) share one
+  `_its_lag_model()` implementation for feature engineering + the
+  leak-avoidance recursive during/post projection — `_its_gbm(...,
+  backend=...)` and `_its_ridge()` each just supply a
+  `fit_predict(X_train, y_train) -> predict` closure to it. Features:
+  lag1d/lag2d/lag7d + their mean (a simplified Neighborhood Days Approach /
+  NDA) plus cyclical hour/weekday features. Rationale: lag features are
+  reported to consistently improve forecast accuracy across model families
+  (Ridge, XGBoost, CatBoost, LightGBM alike) more than model choice does —
+  it's the input representation, not model sophistication, doing most of
+  the work; NDA extends the classic lag24 feature to a small neighborhood
+  of nearby days, distinct from DSTA (day-of-same-type, e.g. previous
+  Mondays), which seasonal_naive/Fourier/STL already capture via
+  (hour, weekday) grouping. LightGBM/CatBoost handle the resulting
+  NaN-heavy lag columns (start of pre-period, gaps) natively; ridge instead
+  mean-imputes from TRAINING-set-only column statistics inside
+  `_ClosedFormRidge` (see the next entry for a bug this needed fixing).
+  Leak-avoidance: a naive lag feature (e.g. "value 24h ago") would read
+  real, potentially outage-contaminated data for any during/post timestamp
+  whose lag source falls inside the during/post window itself — exactly
+  what the "fit on pre-period only" rule at the top of propagation.py's ITS
+  section exists to prevent. `_its_lag_model()` avoids this by projecting
+  the during/post window RECURSIVELY: predictions are made in chronological
+  order and each one is immediately fed back in as the lag source for later
+  steps, the same discipline `_its_arima`/`_its_sarima` already follow via
+  `.forecast()` never touching real future data. Pre-period rows are still
+  batch-predicted from real pre-period lags (no recursion needed there).
+  Verified with a synthetic-data test that sabotages the actual during/post
+  values to an outlier and confirms the projection neither reproduces it
+  nor tracks it — see `TestLagFeatureItsMethods`/`TestEnsembleItsMethod` in
+  test_pipeline.py. LightGBM/CatBoost fall back to ARIMA if their library
+  isn't installed (`lightgbm`/`catboost`/`scikit-learn`, all optional — see
+  requirements.txt/pyproject.toml's `gbm` extra); all three lag-feature
+  methods fall back to seasonal_naive if the pre-period is too short to fit
+  (same `< 2*T_day` guard as STL). `ITS_METHOD_NAMES`/`_ITS_METHODS` being a
+  plain dict/list is why both dashboard.py's and
+  app_jao_NP_API_fix_d14.py's Single Event ITS-method dropdowns picked
+  these up with zero other GUI code changes — only their
   `_method_labels`/`_method_colors` dicts (cosmetic: friendly display name,
   distinct plot color for "all" mode's overlay) needed new entries.
+  "ensemble" (`_its_ensemble()`) backtests every OTHER method on a held-out
+  slice of the pre-period ITSELF (`_ensemble_backtest_weights()` — never
+  during/post data, so this can't introduce a leak either), drops any that
+  backtest more than 2x worse than the best one, and blends the survivors'
+  real full-pre-period projections weighted ∝ 1/backtest-MAE — "adaptive"
+  and "exclude bad models" per the user request this was built for. Below
+  14 days of pre-period (too short for a reliable backtest split) it falls
+  back to an unweighted per-timestamp MEDIAN of every member instead of a
+  MEAN: a mean was tried first and measured far worse in development (MAE
+  ~14.8 vs the best individual member's ~1.7) because a single badly-wrong
+  member (fourier_trend/STL both derail on a pre-period level shift) drags
+  a mean toward it; the median can't be moved past the next-most-central
+  projection by one outlier. By far the slowest method (most members,
+  SARIMA included, get fit roughly twice — once for backtest weighting,
+  once for the real projection).
 - `scikit-learn` is a REQUIRED companion package for the "lightgbm" ITS
   method, not merely a nice-to-have: `import lightgbm` succeeds without it,
   but `LGBMRegressor(...)` (the sklearn wrapper `_its_gbm()` uses) raises a
   non-`ImportError` `LightGBMError` — "scikit-learn is required for
   lightgbm.sklearn..." — the first time it's constructed. That exception
   type slipped past `_its_gbm()`'s original `except ImportError` guard
-  and was only caught by the broader `except Exception` around
-  `model.fit()`, which silently fell back all the way to seasonal_naive
-  (discarding the lag-feature engineering entirely) instead of the
-  documented ARIMA fallback — the same failure mode this file's SE-fallback
-  entry above warns about in the regression code, just for a dependency
-  instead of a clustering mode. Fixed by constructing (not fitting) the
-  regressor immediately after import, inside the same `except Exception`
-  (not `except ImportError`) block, so a missing scikit-learn now fails
-  fast into the intended ARIMA fallback. `TestGbmItsMethods
+  and was only caught by a broader `except Exception` guard downstream,
+  which silently fell back all the way to seasonal_naive (discarding the
+  lag-feature engineering entirely) instead of the documented ARIMA
+  fallback — the same failure mode this file's SE-fallback entry above
+  warns about in the regression code, just for a dependency instead of a
+  clustering mode. Fixed by constructing (not fitting) the regressor
+  immediately after import, inside the same `except Exception` (not
+  `except ImportError`) block, so a missing scikit-learn now fails fast
+  into the intended ARIMA fallback. `TestLagFeatureItsMethods
   ::test_lightgbm_regressor_actually_constructs` in test_pipeline.py
   guards against this regressing again, and the leak test now also asserts
-  the GBM projection isn't bit-identical to seasonal_naive's (a silent
-  fallback would otherwise still pass every other check in that test,
-  since seasonal_naive is trivially leak-proof and could look like a
-  "working, non-leaking" GBM result). `catboost` never needed sklearn, so
-  it was unaffected — this only ever silently degraded "lightgbm".
+  each lag-feature method's projection isn't bit-identical to
+  seasonal_naive's (a silent fallback would otherwise still pass every
+  other check in that test, since seasonal_naive is trivially leak-proof
+  and could look like a "working, non-leaking" result). `catboost` never
+  needed sklearn, so it was unaffected — this only ever silently degraded
+  "lightgbm".
+- `_ClosedFormRidge` (propagation.py, backs the "ridge" ITS method) must
+  guard against a feature column that is NaN in EVERY training row — lag7d
+  whenever the pre-period is under 7 days, since it can then never have a
+  single real value. `np.nanmean` on an all-NaN column returns NaN (plus a
+  "Mean of empty slice" RuntimeWarning), and using that NaN as the
+  imputation fill value silently NaN-poisons every prediction from that
+  point on, with nothing raising to catch it — found live while backtesting
+  the "ensemble" method on a 6-day pre-period: ridge's all-NaN lag7d column
+  poisoned its own projection with NaN, which then NaN-poisoned
+  `_its_ensemble()`'s per-timestamp median for EVERY method, not just
+  ridge, since `np.median` propagates a single NaN through the whole
+  timestamp. Fixed by replacing any NaN entries in the computed column-mean
+  vector with 0.0 before imputing — an all-NaN column becomes a constant-0
+  column, which the ridge normal equations then always fit a coefficient of
+  exactly 0 for (equivalent to dropping the feature), rather than a special
+  case anywhere else in the class. `TestLagFeatureItsMethods
+  ::test_ridge_handles_all_nan_feature_column` guards against this
+  regressing again.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by
@@ -297,19 +340,27 @@ pytest test_pipeline.py -v
   specific day it is) — a pre-period-only backtest (fit on N pre-days,
   project into a held-out continuation, compare against its known true
   values) across pre-period lengths {14, 30} × holdout lengths {3, 7} days
-  × 5 seeds ranked: SARIMA best (lowest MAE) but ~10-20x slower than the
-  others (~10-25s per fit vs <2s); CatBoost and LightGBM next, beating
-  plain ARIMA/seasonal_naive by roughly a third at 30 days pre-period but
-  giving little-to-no improvement at only 14 days (lag7d only sees ~1-2
-  weeks of examples then — too little for the tree ensemble to separate
-  real day-to-day persistence from noise); Fourier+trend and STL were
-  clearly worst on this generative process (STL's linear trend
-  extrapolation and Fourier's global trend term both got misled by the
-  day-level regime shocks). Rank is data-generating-process-dependent, not
-  a universal verdict — the qualitative takeaway that matters here is
-  "GBM needs ≥~30 days of pre-period to earn its keep over seasonal_naive"
-  is a good sanity check to apply to new results, but don't treat the
-  specific MAE numbers as calibrated against real Nordic flow data.
+  ranked (after fixing the two bugs above — an earlier run of this same
+  backtest, before those fixes, had silently graded "lightgbm" as
+  identical to seasonal_naive/ARIMA the whole time): SARIMA best (lowest
+  MAE) but ~10-20x slower than the others (~10-25s per fit vs <2s);
+  CatBoost, LightGBM and ridge next, beating plain ARIMA/seasonal_naive by
+  roughly a third at 30 days pre-period but giving little-to-no
+  improvement at only 14 days (lag7d only sees ~1-2 weeks of examples then
+  — too little to separate real day-to-day persistence from noise, tree
+  ensembles or ridge alike); the "ensemble" method's adaptive backtest
+  weighting reliably excluded fourier_trend/STL and matched or slightly
+  beat the single best member across every configuration tested, at
+  roughly double the runtime cost. Fourier+trend and STL were clearly
+  worst on this generative process (STL's linear trend extrapolation and
+  Fourier's global trend term both got misled by the day-level regime
+  shocks) — exactly the failure mode "ensemble" was built to route around.
+  Rank is data-generating-process-dependent, not a universal verdict — the
+  qualitative takeaway that matters here is "GBM/ridge need ≥~30 days of
+  pre-period to earn their keep over seasonal_naive, ensemble adapts to
+  whichever wins without needing that judgment call made in advance" is a
+  good sanity check to apply to new results, but don't treat the specific
+  MAE numbers as calibrated against real Nordic flow data.
 
 ## Known limitations
 - ENTSO-E API returning 403 from cloud/server IPs is environment-dependent,

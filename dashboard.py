@@ -1255,7 +1255,9 @@ class App:
             "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
             "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
             "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
-            "all":            "All seven  [run & compare side-by-side]",
+            "ridge":          "Ridge (lag + calendar)   [min 7 days]",
+            "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
+            "all":            "All nine  [run & compare side-by-side]",
         }
         _method_cb = ttk.Combobox(
             ctrl,
@@ -1280,7 +1282,7 @@ class App:
             cur_bl = int(self.baseline_days.get())
             if key == "all":
                 hint = (
-                    "Runs all seven models and overlays their projected counterfactuals "
+                    "Runs every registered model and overlays their projected counterfactuals "
                     "on the ITS plot so you can compare them directly. "
                     "Summary metrics use Seasonal Naive as primary. "
                     "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
@@ -1586,6 +1588,8 @@ class App:
             "sarima":         ("#16a085", ":"),
             "lightgbm":       ("#d35400", "--"),
             "catboost":       ("#34495e", "-."),
+            "ridge":          ("#7f8c8d", ":"),
+            "ensemble":       ("#1a1a1a", "-"),
         }
 
         if not its.empty:

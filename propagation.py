@@ -3248,22 +3248,23 @@ def _recovery_direction(impact: float, recovery_residual: float,
     return "persists" if ratio > 0 else "reversed"
 
 
-def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
-             mtu_minutes: int = 15, backend: str = "lightgbm") -> pd.Series:
+def _its_lag_model(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                   mtu_minutes: int, fit_predict) -> Optional[pd.Series]:
     """
-    Gradient-boosted trees (LightGBM/CatBoost) on lag + calendar features.
-    See _ITS_METHODS["lightgbm"/"catboost"]["description"] for full docs.
+    Shared feature engineering + leak-avoidance recursive projection for
+    every lag/calendar-feature ITS model (_its_gbm's LightGBM/CatBoost
+    backends, _its_ridge). Lag features are lag1d/lag2d/lag7d (same MTU 1,
+    2 and 7 days ago) plus their mean — a simplified Neighborhood Days
+    Approach / NDA — alongside cyclical hour/weekday features. See
+    _ITS_METHODS["lightgbm"/"catboost"/"ridge"]["description"] for the
+    per-method rationale; this function only owns the machinery all three
+    share.
 
-    Lag features (same MTU 1, 2 and 7 days ago, plus their mean — a
-    simplified Neighborhood Days Approach / NDA) are the dominant predictor
-    for this kind of series: recent history captures autocorrelation and
-    weekly structure that calendar features alone cannot reconstruct. This
-    is not specific to gradient boosting — lag24-style features improve
-    Ridge/XGBoost/CatBoost/LightGBM alike — so the feature set, not the
-    model family, is what's expected to move accuracy here; LightGBM and
-    CatBoost are offered because they handle the resulting NaN-heavy lag
-    columns (early pre-period rows, missing days) natively, with no
-    imputation step needed.
+    `fit_predict(X_train, y_train)` receives ONLY pre-period-derived
+    training rows (every X_train row's lags point at-or-before the
+    pre-period end) and must return a `predict(X) -> np.ndarray` callable.
+    Returns None if there isn't enough pre-period history to fit anything
+    — the caller decides its own fallback for that case.
 
     CRITICAL (data-leakage guard): a lag feature for a during/post
     timestamp t must NEVER read the actual observed value at t-lag if
@@ -3278,36 +3279,11 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     needed there, since a pre-period lag always points at-or-before the
     pre-period itself.
     """
-    try:
-        if backend == "lightgbm":
-            from lightgbm import LGBMRegressor as _Regressor
-            _kwargs = dict(n_estimators=200, max_depth=5, num_leaves=31,
-                           learning_rate=0.05, min_child_samples=10,
-                           verbosity=-1)
-        else:
-            from catboost import CatBoostRegressor as _Regressor
-            _kwargs = dict(iterations=300, depth=5, learning_rate=0.05,
-                           verbose=False, allow_writing_files=False)
-        # Fail fast here, not at .fit() time: lightgbm's sklearn wrapper
-        # imports cleanly even without scikit-learn installed, then raises
-        # a non-ImportError LightGBMError the first time it's constructed
-        # ("scikit-learn is required for lightgbm.sklearn ..."). Catching
-        # only ImportError above let that slip through to the broader
-        # except Exception around model.fit() below, which falls back to
-        # seasonal_naive instead of the documented ARIMA fallback -- same
-        # end result either way in isolation, but it skipped ARIMA's
-        # deseasonalized-residual attempt and silently discarded all the
-        # feature engineering. Constructing (not fitting) the regressor
-        # here surfaces that failure at the right fallback point.
-        _Regressor(**_kwargs)
-    except Exception:
-        return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
-
     T_day = int(24 * 60 / mtu_minutes)
     LAGS_DAYS = (1, 2, 7)
 
     if len(pre_agg) < 2 * T_day:
-        return _its_seasonal_naive(pre_agg, all_agg, col)
+        return None
 
     freq = f"{mtu_minutes}min"
     pre_ts = (pre_agg.set_index("dateTimeUtc")[col]
@@ -3360,16 +3336,15 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
         train_y.append(y)
 
     if len(train_rows) < 20:
-        return _its_seasonal_naive(pre_agg, all_agg, col)
+        return None
 
     X_train = np.array(train_rows, dtype=float)
     y_train = np.array(train_y, dtype=float)
 
     try:
-        model = _Regressor(**_kwargs)
-        model.fit(X_train, y_train)
+        predict = fit_predict(X_train, y_train)
     except Exception:
-        return _its_seasonal_naive(pre_agg, all_agg, col)
+        return None
 
     # ── Batch-predict the pre-period (real lags throughout — no recursion
     # needed since nothing here can read a during/post value) ──────────────
@@ -3381,13 +3356,13 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
         if pd.isna(feat["lag1d"]):
             predictions[ts] = float(seas_mean.get((ts.hour, ts.dayofweek), fallback))
         else:
-            predictions[ts] = float(model.predict(_as_row(feat))[0])
+            predictions[ts] = float(predict(_as_row(feat))[0])
 
     # ── Recursive during/post projection: chronological order, each
     # prediction immediately becomes the lag source for later steps ────────
     for ts in grid[grid > pre_end]:
         feat = _features_at(ts, value_source)
-        pred = float(model.predict(_as_row(feat))[0])
+        pred = float(predict(_as_row(feat))[0])
         predictions[ts] = pred
         value_source.loc[ts] = pred
 
@@ -3398,6 +3373,59 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
         return float(predictions.get(grid[pos], fallback)) if pos >= 0 else fallback
 
     return all_agg["dateTimeUtc"].apply(_lookup)
+
+
+def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+             mtu_minutes: int = 15, backend: str = "lightgbm") -> pd.Series:
+    """
+    Gradient-boosted trees (LightGBM/CatBoost) on lag + calendar features.
+    See _ITS_METHODS["lightgbm"/"catboost"]["description"] for full docs,
+    and _its_lag_model() for the shared feature engineering and
+    leak-avoidance recursive projection this delegates to.
+
+    Lag features (same MTU 1, 2 and 7 days ago, plus their mean — a
+    simplified Neighborhood Days Approach / NDA) are the dominant predictor
+    for this kind of series: recent history captures autocorrelation and
+    weekly structure that calendar features alone cannot reconstruct. This
+    is not specific to gradient boosting — lag24-style features improve
+    Ridge/XGBoost/CatBoost/LightGBM alike — so the feature set, not the
+    model family, is what's expected to move accuracy here; LightGBM and
+    CatBoost are offered because they handle the resulting NaN-heavy lag
+    columns (early pre-period rows, missing days) natively, with no
+    imputation step needed.
+    """
+    try:
+        if backend == "lightgbm":
+            from lightgbm import LGBMRegressor as _Regressor
+            _kwargs = dict(n_estimators=200, max_depth=5, num_leaves=31,
+                           learning_rate=0.05, min_child_samples=10,
+                           verbosity=-1)
+        else:
+            from catboost import CatBoostRegressor as _Regressor
+            _kwargs = dict(iterations=300, depth=5, learning_rate=0.05,
+                           verbose=False, allow_writing_files=False)
+        # Fail fast here, not at .fit() time: lightgbm's sklearn wrapper
+        # imports cleanly even without scikit-learn installed, then raises
+        # a non-ImportError LightGBMError the first time it's constructed
+        # ("scikit-learn is required for lightgbm.sklearn ..."). Catching
+        # only ImportError above let that slip through to a downstream
+        # except-Exception guard, which falls back to seasonal_naive
+        # instead of the documented ARIMA fallback -- same end result
+        # either way in isolation, but it skipped ARIMA's deseasonalized-
+        # residual attempt and silently discarded all the feature
+        # engineering. Constructing (not fitting) the regressor here
+        # surfaces that failure at the right fallback point.
+        _Regressor(**_kwargs)
+    except Exception:
+        return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    def _fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+        model = _Regressor(**_kwargs)
+        model.fit(X_train, y_train)
+        return model.predict
+
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes, _fit_predict)
+    return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
 
 
 def _its_lightgbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
@@ -3412,6 +3440,240 @@ def _its_catboost(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
     """CatBoost on lag + calendar features. See _its_gbm() for the shared
     implementation and _ITS_METHODS["catboost"]["description"] for docs."""
     return _its_gbm(pre_agg, all_agg, col, mtu_minutes=mtu_minutes, backend="catboost")
+
+
+class _ClosedFormRidge:
+    """
+    Ridge regression fit via closed-form linear algebra (numpy only — no
+    scikit-learn/statsmodels dependency): standardize features (mean-
+    impute any NaN lag column first, using TRAINING-set-only column means,
+    since unlike the tree backends a linear model needs finite inputs),
+    center the target, solve beta = (XᵀX + αI)⁻¹Xᵀy on the centered/
+    standardized design, and add the target mean back at predict time.
+    Imputation/standardization statistics are captured once in .fit() from
+    training rows only and reused unchanged in .predict() — this is what
+    keeps _its_ridge() leak-free through _its_lag_model()'s recursive
+    during/post loop, exactly like a fitted LGBMRegressor/CatBoostRegressor
+    never re-fitting itself on a later .predict() call.
+
+    A column that is NaN in EVERY training row (e.g. lag7d whenever the
+    pre-period is under 7 days — it can never have a real value then) has
+    no mean to impute with: naively using np.nanmean's NaN result as the
+    fill value would silently poison every prediction with NaN, with
+    nothing raising to catch it (found via a real backtest run where a
+    6-day pre-period produced an all-NaN "ridge" projection that then
+    NaN-poisoned _its_ensemble()'s per-timestamp median for every method,
+    not just ridge). Such a column is instead treated as entirely
+    uninformative: imputed to 0 and left at 0 after centering, which (via
+    the alpha-regularized normal equations below) always fits that
+    feature's own coefficient to exactly 0 — equivalent to dropping it,
+    with no special-casing needed anywhere else in this class.
+    """
+    def __init__(self, alpha: float = 5.0):
+        self.alpha = alpha
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "_ClosedFormRidge":
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            # An all-NaN column (see class docstring) makes np.nanmean warn
+            # "Mean of empty slice" -- expected here, handled on the next
+            # line, not a sign of a real problem worth surfacing.
+            _warnings.filterwarnings("ignore", message="Mean of empty slice")
+            self._col_mean = np.nanmean(X, axis=0)
+        self._col_mean = np.where(np.isnan(self._col_mean), 0.0, self._col_mean)
+        Xf = np.where(np.isnan(X), self._col_mean, X)
+        self._x_mean = Xf.mean(axis=0)
+        self._x_std  = Xf.std(axis=0)
+        self._x_std[self._x_std < 1e-8] = 1.0
+        Xs = (Xf - self._x_mean) / self._x_std
+        self._y_mean = float(np.mean(y))
+        yc = y - self._y_mean
+        n_features = Xs.shape[1]
+        A = Xs.T @ Xs + self.alpha * np.eye(n_features)
+        b = Xs.T @ yc
+        self._beta = np.linalg.solve(A, b)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        Xf = np.where(np.isnan(X), self._col_mean, X)
+        Xs = (Xf - self._x_mean) / self._x_std
+        return Xs @ self._beta + self._y_mean
+
+
+def _its_ridge(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+               mtu_minutes: int = 15, alpha: float = 5.0) -> pd.Series:
+    """
+    Ridge regression on the same lag1d/lag2d/lag7d + NDA-mean + calendar
+    feature set as _its_gbm() (see _its_lag_model() for the shared
+    machinery and leak-avoidance discipline), fit with closed-form numpy
+    linear algebra — no extra dependency beyond what this module already
+    requires.
+
+    A linear model with L2 regularization is a much lower-variance fit
+    than gradient-boosted trees, which matters most exactly where the GBM
+    methods are weakest in practice: short pre-periods, where there is too
+    little data for a tree ensemble to reliably separate real lag-day
+    signal from noise (see the "Backtested accuracy" note in CLAUDE.md),
+    but a simple, well-regularized linear combination of the same features
+    can still pick up the dominant lag1d/lag24-style signal. It is also
+    the cheapest of the lag-feature methods to fit (closed-form solve, no
+    iterative boosting), and the article this whole feature set was added
+    for (see CLAUDE.md's ITS domain-facts entry) explicitly reports Ridge
+    benefiting from lag features alongside XGBoost/CatBoost/LightGBM — the
+    improvement isn't specific to tree models.
+
+    Unlike the tree backends, ridge needs finite inputs (no native NaN
+    handling): _ClosedFormRidge mean-imputes missing lag columns (lag7d
+    during the first week of a pre-period, lag2d on day 1) from the
+    training set's own column means, computed once and reused unchanged
+    at prediction time — never recomputed from during/post data.
+    """
+    def _fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+        model = _ClosedFormRidge(alpha=alpha).fit(X_train, y_train)
+        return model.predict
+
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes, _fit_predict)
+    return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
+
+
+def _call_its_method(fn, pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                     method: str, mtu_minutes: int) -> pd.Series:
+    """Call an _ITS_METHODS[...]["fn"] with the right signature — every
+    method except seasonal_naive accepts mtu_minutes (see
+    _build_its_for_col(), the single-pair dispatcher this mirrors)."""
+    return fn(pre_agg, all_agg, col) if method == "seasonal_naive" \
+           else fn(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+
+def _ensemble_backtest_weights(pre_agg: pd.DataFrame, col: str, mtu_minutes: int,
+                               members: list, quality_ratio: float = 2.0,
+                               min_survivors: int = 3) -> Optional[dict]:
+    """
+    Backtest every candidate member ENTIRELY WITHIN the pre-period: hold
+    out its most recent slice (up to 7 days, capped at 25% of the
+    pre-period so enough is left to train on), fit each member on the
+    earlier remainder only, project onto the held-out slice, and grade
+    against its already-known true values — the same "fit on earlier
+    data, project into a later window, compare to known truth" backtest
+    used to produce CLAUDE.md's "Backtested accuracy" numbers, just run
+    automatically per-outage instead of once offline on synthetic data.
+    This split lives entirely inside the real pre-period, so — like every
+    other method in this section — it can never see a real during/post
+    observation.
+
+    Returns None if the pre-period is too short (<14 days) to hold out a
+    meaningful backtest slice without starving the training side; the
+    caller falls back to an unweighted median of all members in that case.
+
+    Otherwise returns {member: weight} for the SURVIVING members only:
+    any member whose backtest MAE exceeds `quality_ratio`x the best
+    member's MAE is excluded outright ("exclude bad models"), unless
+    doing so would leave fewer than `min_survivors` — in that case the
+    `min_survivors` members with the lowest backtest MAE are kept instead,
+    so a single unlucky backtest window can't collapse the ensemble down
+    to one member and lose the robustness an ensemble is for. Surviving
+    members are weighted ∝ 1/MAE (normalized to sum to 1), so a member
+    that backtested twice as accurately as another gets roughly twice the
+    say in the final blend — this is the "adaptive" part: the weighting
+    is recomputed per-outage from that outage's own pre-period, not fixed
+    in advance.
+    """
+    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
+    if total_days < 14:
+        return None
+
+    bt_days = min(7, max(2, total_days // 4))
+    bt_split = pre_agg["dateTimeUtc"].max() - pd.Timedelta(days=bt_days)
+    inner_pre_agg = pre_agg[pre_agg["dateTimeUtc"] < bt_split].reset_index(drop=True)
+    holdout_mask = (pre_agg["dateTimeUtc"] >= bt_split).values
+    if inner_pre_agg.empty or not holdout_mask.any():
+        return None
+    true_vals = pre_agg[col].values[holdout_mask]
+
+    mae_by_member = {}
+    for m in members:
+        fn = _ITS_METHODS[m]["fn"]
+        try:
+            proj = _call_its_method(fn, inner_pre_agg, pre_agg, col, m, mtu_minutes)
+            pred = proj.values[holdout_mask]
+            mae = float(np.mean(np.abs(pred - true_vals)))
+            mae_by_member[m] = mae if np.isfinite(mae) else float("inf")
+        except Exception:
+            mae_by_member[m] = float("inf")
+
+    finite_maes = [v for v in mae_by_member.values() if np.isfinite(v)]
+    if not finite_maes:
+        return None
+    best_mae = min(finite_maes)
+
+    ranked = sorted(mae_by_member.items(), key=lambda kv: kv[1])
+    survivors = [m for m, mae in ranked if mae <= quality_ratio * best_mae]
+    if len(survivors) < min(min_survivors, len(ranked)):
+        survivors = [m for m, _ in ranked[:min_survivors]]
+
+    eps = 1e-6
+    raw_weights = {m: 1.0 / (mae_by_member[m] + eps) for m in survivors}
+    total_weight = sum(raw_weights.values())
+    return {m: w / total_weight for m, w in raw_weights.items()}
+
+
+def _its_ensemble(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                  mtu_minutes: int = 15) -> pd.Series:
+    """
+    Adaptive ensemble across every OTHER registered ITS method
+    (seasonal_naive, fourier_trend, stl, arima, sarima, lightgbm,
+    catboost, ridge — "ensemble" itself and the UI-only "all"
+    pseudo-method are excluded to avoid recursion).
+
+    "Adaptive" + "exclude bad models": _ensemble_backtest_weights() grades
+    every member on a held-out slice of the pre-period ITSELF (never
+    during/post data — see its own docstring), drops members that
+    backtested far worse than the best one, and weights the survivors
+    ∝ 1/backtest-MAE. The final projection is those survivors' REAL
+    full-pre-period projections into the real during/post window,
+    combined with those weights. This adapts per-outage: which methods
+    get excluded and how the rest are weighted depends on that outage's
+    own pre-period, not a fixed roster decided in advance.
+
+    Falls back to an unweighted per-timestamp MEDIAN of every member's
+    full-pre-period projection when the pre-period is too short (<14
+    days) for a meaningful backtest split. Median, not mean, for the same
+    reason the backtest step excludes bad members: an equal-weight MEAN
+    was tried first and measured substantially worse in development (MAE
+    ~14.8 vs the best individual member's ~1.7) because a single
+    badly-wrong member (fourier_trend/STL both derail on a pre-period
+    level shift — see their own "Weaknesses" docs) drags a mean toward
+    it; the median can't be moved past the next-most-central projection
+    by one outlier and needs no backtest to be robust, which is why it's
+    the fallback for pre-periods too short to backtest reliably.
+
+    Leak-safety: every member already independently guarantees it never
+    reads a during/post observation (this section's top-level "fit on
+    pre-period only" rule; _its_lag_model()'s recursive projection for the
+    lag-feature methods). A weighted combination of several leak-free
+    projections is leak-free too, and the backtest weights themselves are
+    computed entirely from pre-period data (see
+    _ensemble_backtest_weights()), so nothing added here can introduce a
+    leak. Slowest method to run — backtesting adds roughly another full
+    fit per member (SARIMA's ~10-25s AIC grid search twice) on top of the
+    final projection fits, so budget roughly double a plain "all" mode
+    run.
+    """
+    members = [m for m in _ITS_METHODS if m != "ensemble"]
+
+    weights = _ensemble_backtest_weights(pre_agg, col, mtu_minutes, members)
+    if weights is None:
+        projections = [_call_its_method(_ITS_METHODS[m]["fn"], pre_agg, all_agg, col,
+                                        m, mtu_minutes).values
+                       for m in members]
+        return pd.Series(np.median(np.vstack(projections), axis=0), index=all_agg.index)
+
+    blended = np.zeros(len(all_agg))
+    for m, w in weights.items():
+        proj = _call_its_method(_ITS_METHODS[m]["fn"], pre_agg, all_agg, col,
+                                m, mtu_minutes)
+        blended += w * proj.values
+    return pd.Series(blended, index=all_agg.index)
 
 
 _ITS_METHODS = {
@@ -3507,6 +3769,61 @@ _ITS_METHODS = {
             "Minimum baseline: 14 days. Recommended: ≥30 days."),
         "fn": _its_catboost,
     },
+    "ridge": {
+        "label":       "Ridge (lag + calendar features)",
+        "min_days":    7,
+        "description": (
+            "Same lag1d/lag2d/lag7d + NDA-mean + calendar feature set as "
+            "LightGBM/CatBoost above, fit with closed-form ridge regression "
+            "(numpy only -- no extra library, unlike the two GBM methods). "
+            "A regularized linear model is much lower-variance than a tree "
+            "ensemble, which is exactly where the GBM methods are weakest in "
+            "practice here: short pre-periods, where there's too little data "
+            "for trees to reliably separate real lag-day signal from noise. "
+            "The lag-feature article this whole family was added for "
+            "explicitly reports Ridge improving alongside XGBoost/CatBoost/ "
+            "LightGBM -- the benefit isn't tree-specific. Missing lag values "
+            "(no native NaN handling in a linear model) are mean-imputed "
+            "from pre-period-only training statistics. Falls back to "
+            "seasonal naive if the pre-period is too short to fit. "
+            "Minimum baseline: 7 days (lag7d needs at least one full week "
+            "to ever be non-imputed). Cheapest lag-feature method to fit."),
+        "fn": _its_ridge,
+    },
+    "ensemble": {
+        "label":       "Ensemble (adaptive, backtest-weighted)",
+        "min_days":    2,
+        "description": (
+            "Adaptive blend of every other registered method: backtests "
+            "each candidate on a held-out slice of the pre-period ITSELF "
+            "(never during/post data), drops any that backtested far worse "
+            "than the best one, and weights the survivors' real "
+            "full-pre-period projections proportional to 1/backtest-MAE. "
+            "Which methods get excluded and how the rest are weighted is "
+            "recomputed per-outage from that outage's own pre-period -- "
+            "not a fixed roster decided in advance. Falls back to an "
+            "unweighted per-timestamp MEDIAN of all members when the "
+            "pre-period is under 14 days (too short for a reliable "
+            "backtest split); median rather than mean there too, since a "
+            "mean lets a single badly-wrong member (fourier_trend/STL both "
+            "derail on a pre-period level shift -- see their own "
+            "descriptions) drag the whole blend toward it, while the "
+            "median can't be moved past the next-most-central projection "
+            "by one outlier. No single method dominated across the "
+            "pre-period/holdout-length combinations tested during "
+            "development (see CLAUDE.md's 'Backtested accuracy' note); "
+            "this is meant to track whichever method actually suits a "
+            "given outage's own history, without the user having to guess "
+            "in advance. Not guaranteed best on every outage. By far the "
+            "slowest method to run -- the backtest step means most members "
+            "(SARIMA's ~10-25s AIC grid search included) get fit roughly "
+            "twice, on top of the survivors' final-projection fit -- budget "
+            "at least double a plain 'all' mode run. "
+            "Minimum baseline: 2 days (members below that threshold "
+            "individually fall back further, same as running them alone; "
+            "backtest weighting itself only activates at 14+ days)."),
+        "fn": _its_ensemble,
+    },
 }
 
 ITS_METHOD_NAMES = list(_ITS_METHODS.keys())
@@ -3558,6 +3875,8 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
         "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
         "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+        "ridge"          — Ridge (closed-form) on the same lag + calendar features
+        "ensemble"       — adaptive, backtest-weighted blend of every method above
         "all"            — run every registered method; dashboard can compare them
 
     Returns:
@@ -3753,6 +4072,8 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     #   "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
     #   "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
     #   "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+    #   "ridge"          — Ridge (closed-form) on the same lag + calendar features
+    #   "ensemble"       — adaptive, backtest-weighted blend of every method above
     #   "all"            — run every registered method, return its_all dict
     #
     # Use fall_signed (verified RAM formula input) as primary dep var.
