@@ -266,6 +266,50 @@ pytest test_pipeline.py -v
   dropdowns picked these up with zero GUI code changes — only their
   `_method_labels`/`_method_colors` dicts (cosmetic: friendly display name,
   distinct plot color for "all" mode's overlay) needed new entries.
+- `scikit-learn` is a REQUIRED companion package for the "lightgbm" ITS
+  method, not merely a nice-to-have: `import lightgbm` succeeds without it,
+  but `LGBMRegressor(...)` (the sklearn wrapper `_its_gbm()` uses) raises a
+  non-`ImportError` `LightGBMError` — "scikit-learn is required for
+  lightgbm.sklearn..." — the first time it's constructed. That exception
+  type slipped past `_its_gbm()`'s original `except ImportError` guard
+  and was only caught by the broader `except Exception` around
+  `model.fit()`, which silently fell back all the way to seasonal_naive
+  (discarding the lag-feature engineering entirely) instead of the
+  documented ARIMA fallback — the same failure mode this file's SE-fallback
+  entry above warns about in the regression code, just for a dependency
+  instead of a clustering mode. Fixed by constructing (not fitting) the
+  regressor immediately after import, inside the same `except Exception`
+  (not `except ImportError`) block, so a missing scikit-learn now fails
+  fast into the intended ARIMA fallback. `TestGbmItsMethods
+  ::test_lightgbm_regressor_actually_constructs` in test_pipeline.py
+  guards against this regressing again, and the leak test now also asserts
+  the GBM projection isn't bit-identical to seasonal_naive's (a silent
+  fallback would otherwise still pass every other check in that test,
+  since seasonal_naive is trivially leak-proof and could look like a
+  "working, non-leaking" GBM result). `catboost` never needed sklearn, so
+  it was unaffected — this only ever silently degraded "lightgbm".
+- Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
+  available in this repo): with a two-timescale synthetic series — MTU-to-
+  MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by
+  every MTU within a day (the kind of day-to-day persistence lag1d/lag7d
+  are meant to exploit, and that seasonal_naive/Fourier/STL structurally
+  cannot see since they only know hour-of-day/day-of-week, not which
+  specific day it is) — a pre-period-only backtest (fit on N pre-days,
+  project into a held-out continuation, compare against its known true
+  values) across pre-period lengths {14, 30} × holdout lengths {3, 7} days
+  × 5 seeds ranked: SARIMA best (lowest MAE) but ~10-20x slower than the
+  others (~10-25s per fit vs <2s); CatBoost and LightGBM next, beating
+  plain ARIMA/seasonal_naive by roughly a third at 30 days pre-period but
+  giving little-to-no improvement at only 14 days (lag7d only sees ~1-2
+  weeks of examples then — too little for the tree ensemble to separate
+  real day-to-day persistence from noise); Fourier+trend and STL were
+  clearly worst on this generative process (STL's linear trend
+  extrapolation and Fourier's global trend term both got misled by the
+  day-level regime shocks). Rank is data-generating-process-dependent, not
+  a universal verdict — the qualitative takeaway that matters here is
+  "GBM needs ≥~30 days of pre-period to earn its keep over seasonal_naive"
+  is a good sanity check to apply to new results, but don't treat the
+  specific MAE numbers as calibrated against real Nordic flow data.
 
 ## Known limitations
 - ENTSO-E API returning 403 from cloud/server IPs is environment-dependent,

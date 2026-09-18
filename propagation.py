@@ -3288,7 +3288,19 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
             from catboost import CatBoostRegressor as _Regressor
             _kwargs = dict(iterations=300, depth=5, learning_rate=0.05,
                            verbose=False, allow_writing_files=False)
-    except ImportError:
+        # Fail fast here, not at .fit() time: lightgbm's sklearn wrapper
+        # imports cleanly even without scikit-learn installed, then raises
+        # a non-ImportError LightGBMError the first time it's constructed
+        # ("scikit-learn is required for lightgbm.sklearn ..."). Catching
+        # only ImportError above let that slip through to the broader
+        # except Exception around model.fit() below, which falls back to
+        # seasonal_naive instead of the documented ARIMA fallback -- same
+        # end result either way in isolation, but it skipped ARIMA's
+        # deseasonalized-residual attempt and silently discarded all the
+        # feature engineering. Constructing (not fitting) the regressor
+        # here surfaces that failure at the right fallback point.
+        _Regressor(**_kwargs)
+    except Exception:
         return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
 
     T_day = int(24 * 60 / mtu_minutes)

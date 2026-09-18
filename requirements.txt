@@ -31,9 +31,14 @@ entsoe-py>=0.6
 # ── Gradient-boosted ITS counterfactual models ("lightgbm"/"catboost" in
 #    _ITS_METHODS, propagation.py) -- optional: each falls back to ARIMA
 #    if its own library isn't installed, so the rest of the app works fine
-#    without these two. ────────────────────────────────────────────────
+#    without these two. scikit-learn is listed explicitly because
+#    lightgbm's LGBMRegressor (the sklearn wrapper _its_gbm() uses) imports
+#    fine without it but raises a non-ImportError LightGBMError the first
+#    time it's constructed -- easy to install lightgbm alone and still hit
+#    a broken "lightgbm" ITS method. ──────────────────────────────────────
 lightgbm>=4.0
 catboost>=1.2
+scikit-learn>=1.3
 
 # ── Test suite ────────────────────────────────────────────────────────────
 pytest>=7.0

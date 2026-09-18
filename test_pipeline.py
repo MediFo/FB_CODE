@@ -1254,6 +1254,22 @@ class TestGbmItsMethods:
             assert entry["label"]
             assert entry["description"]
 
+    def test_lightgbm_regressor_actually_constructs(self):
+        """Regression guard: `import lightgbm` succeeds even without
+        scikit-learn installed, but LGBMRegressor(...) -- the sklearn
+        wrapper _its_gbm() uses -- then raises a non-ImportError
+        LightGBMError the first time it's constructed. That exception
+        type previously slipped past _its_gbm()'s `except ImportError`
+        import guard and was only caught by the broader `except Exception`
+        around model.fit(), which silently fell back to seasonal_naive
+        (discarding all the lag-feature engineering) instead of the
+        documented ARIMA fallback. This constructs it exactly as
+        _its_gbm() does, so a missing scikit-learn fails this test loudly
+        instead of silently degrading every "lightgbm" projection."""
+        from lightgbm import LGBMRegressor
+        LGBMRegressor(n_estimators=200, max_depth=5, num_leaves=31,
+                      learning_rate=0.05, min_child_samples=10, verbosity=-1)
+
     @pytest.mark.parametrize("method", ["lightgbm", "catboost"])
     def test_no_leakage_into_during_post_projection(self, method):
         """A during/post projection must never be able to see real
@@ -1271,6 +1287,19 @@ class TestGbmItsMethods:
 
         fn = _pipe._ITS_METHODS[method]["fn"]
         proj = fn(pre_agg, sabotaged, "val", mtu_minutes=15)
+
+        # Guard against a silent fallback that happens to produce a
+        # plausible-looking (and thus easy to miss) result: if the GBM
+        # path silently degraded to seasonal_naive, this test would still
+        # pass every check below despite never exercising the real
+        # recursive lag-feature logic at all. seasonal_naive is
+        # leak-proof by construction (it only ever reads hour/dow group
+        # means from pre_agg), so it can't be used to certify _its_gbm().
+        sn_proj = _pipe._its_seasonal_naive(pre_agg, sabotaged, "val")
+        assert not np.allclose(proj[during_mask].values, sn_proj[during_mask].values), (
+            f"{method} projection is identical to seasonal_naive's -- "
+            "it likely silently fell back instead of running its own "
+            "recursive lag-feature model")
 
         proj_during = proj[during_mask]
         assert proj_during.max() < 1000, (
