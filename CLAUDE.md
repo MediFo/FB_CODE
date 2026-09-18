@@ -231,6 +231,41 @@ pytest test_pipeline.py -v
   UI shell only — its generate/export handlers show an honest "not
   implemented" message rather than silently doing nothing or fabricating
   output. Use the Analysis sub-tab or Tab 9 (Maintenance Analysis) instead.
+- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 7
+  entries — the original seasonal_naive/fourier_trend/stl/arima/sarima plus
+  "lightgbm" and "catboost", both gradient-boosted trees on lag1d/lag2d/
+  lag7d + their mean (a simplified Neighborhood Days Approach / NDA) plus
+  cyclical hour/weekday features, sharing one `_its_gbm(..., backend=...)`
+  implementation. Rationale: lag features are reported to consistently
+  improve forecast accuracy across model families (Ridge, XGBoost, CatBoost,
+  LightGBM alike) more than model choice does — it's the input
+  representation, not model sophistication, doing most of the work; NDA
+  extends the classic lag24 feature to a small neighborhood of nearby days,
+  distinct from DSTA (day-of-same-type, e.g. previous Mondays), which the
+  existing seasonal_naive/Fourier/STL methods already capture via
+  (hour, weekday) grouping. Both new methods handle the resulting NaN-heavy
+  lag columns (start of pre-period, gaps) natively — no imputation step.
+  Leak-avoidance: a naive lag feature (e.g. "value 24h ago") would read real,
+  potentially outage-contaminated data for any during/post timestamp whose
+  lag source falls inside the during/post window itself — exactly what the
+  "fit on pre-period only" rule at the top of propagation.py's ITS section
+  exists to prevent. `_its_gbm()` avoids this by projecting the during/post
+  window RECURSIVELY: predictions are made in chronological order and each
+  one is immediately fed back in as the lag source for later steps, the same
+  discipline `_its_arima`/`_its_sarima` already follow via `.forecast()`
+  never touching real future data. Pre-period rows are still batch-predicted
+  from real pre-period lags (no recursion needed there). Verified with a
+  synthetic-data test that sabotages the actual during/post values to an
+  outlier and confirms the projection neither reproduces it nor tracks it —
+  see `TestGbmItsMethods` in test_pipeline.py. Both fall back to ARIMA if
+  their library (`lightgbm`/`catboost`, both optional — see requirements.txt/
+  pyproject.toml's new `gbm` extra) isn't installed, and to seasonal_naive if
+  the pre-period is too short to fit (same `< 2*T_day` guard as STL).
+  `ITS_METHOD_NAMES`/`_ITS_METHODS` being a plain dict/list is why both
+  dashboard.py's and app_jao_NP_API_fix_d14.py's Single Event ITS-method
+  dropdowns picked these up with zero GUI code changes — only their
+  `_method_labels`/`_method_colors` dicts (cosmetic: friendly display name,
+  distinct plot color for "all" mode's overlay) needed new entries.
 
 ## Known limitations
 - ENTSO-E API returning 403 from cloud/server IPs is environment-dependent,

@@ -28,5 +28,12 @@ scipy>=1.10
 #    fetch_entsoe_outages() in propagation.py) ──────────────────────────
 entsoe-py>=0.6
 
+# ── Gradient-boosted ITS counterfactual models ("lightgbm"/"catboost" in
+#    _ITS_METHODS, propagation.py) -- optional: each falls back to ARIMA
+#    if its own library isn't installed, so the rest of the app works fine
+#    without these two. ────────────────────────────────────────────────
+lightgbm>=4.0
+catboost>=1.2
+
 # ── Test suite ────────────────────────────────────────────────────────────
 pytest>=7.0

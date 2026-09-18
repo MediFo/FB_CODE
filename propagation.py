@@ -3248,6 +3248,160 @@ def _recovery_direction(impact: float, recovery_residual: float,
     return "persists" if ratio > 0 else "reversed"
 
 
+def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+             mtu_minutes: int = 15, backend: str = "lightgbm") -> pd.Series:
+    """
+    Gradient-boosted trees (LightGBM/CatBoost) on lag + calendar features.
+    See _ITS_METHODS["lightgbm"/"catboost"]["description"] for full docs.
+
+    Lag features (same MTU 1, 2 and 7 days ago, plus their mean — a
+    simplified Neighborhood Days Approach / NDA) are the dominant predictor
+    for this kind of series: recent history captures autocorrelation and
+    weekly structure that calendar features alone cannot reconstruct. This
+    is not specific to gradient boosting — lag24-style features improve
+    Ridge/XGBoost/CatBoost/LightGBM alike — so the feature set, not the
+    model family, is what's expected to move accuracy here; LightGBM and
+    CatBoost are offered because they handle the resulting NaN-heavy lag
+    columns (early pre-period rows, missing days) natively, with no
+    imputation step needed.
+
+    CRITICAL (data-leakage guard): a lag feature for a during/post
+    timestamp t must NEVER read the actual observed value at t-lag if
+    t-lag itself falls inside the during/post window — that value may
+    already be outage-affected, exactly what the "fit on pre-period only"
+    rule at the top of this section exists to prevent. Projection is
+    therefore RECURSIVE: during/post timestamps are predicted in
+    chronological order and each prediction is immediately fed back in as
+    the lag source for later steps, mirroring how _its_arima/_its_sarima's
+    own .forecast() never touches real future data. Pre-period rows are
+    predicted in one batch using only real pre-period lags — no recursion
+    needed there, since a pre-period lag always points at-or-before the
+    pre-period itself.
+    """
+    try:
+        if backend == "lightgbm":
+            from lightgbm import LGBMRegressor as _Regressor
+            _kwargs = dict(n_estimators=200, max_depth=5, num_leaves=31,
+                           learning_rate=0.05, min_child_samples=10,
+                           verbosity=-1)
+        else:
+            from catboost import CatBoostRegressor as _Regressor
+            _kwargs = dict(iterations=300, depth=5, learning_rate=0.05,
+                           verbose=False, allow_writing_files=False)
+    except ImportError:
+        return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    T_day = int(24 * 60 / mtu_minutes)
+    LAGS_DAYS = (1, 2, 7)
+
+    if len(pre_agg) < 2 * T_day:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    freq = f"{mtu_minutes}min"
+    pre_ts = (pre_agg.set_index("dateTimeUtc")[col]
+              .resample(freq).mean()
+              .interpolate("time"))
+
+    grid_start = pre_ts.index.min()
+    grid_end   = all_agg["dateTimeUtc"].max()
+    grid = pd.date_range(grid_start, grid_end, freq=freq, tz="UTC")
+    pre_end = pre_ts.index.max()
+
+    # value_source is "ground truth as known so far": real pre-period values
+    # now, overwritten with the model's own predictions as the recursive
+    # during/post loop below proceeds. It must never contain a real
+    # during/post observation.
+    value_source = pd.Series(np.nan, index=grid)
+    value_source.loc[pre_ts.index] = pre_ts.values
+
+    feature_cols = ["hour", "dow", "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+                    "lag1d", "lag2d", "lag7d", "lag_nda_mean"]
+
+    def _features_at(ts: pd.Timestamp, source: pd.Series) -> dict:
+        feat = {
+            "hour": ts.hour, "dow": ts.dayofweek,
+            "hour_sin": np.sin(2 * np.pi * ts.hour / 24),
+            "hour_cos": np.cos(2 * np.pi * ts.hour / 24),
+            "dow_sin": np.sin(2 * np.pi * ts.dayofweek / 7),
+            "dow_cos": np.cos(2 * np.pi * ts.dayofweek / 7),
+        }
+        lag_vals = []
+        for d in LAGS_DAYS:
+            v = source.get(ts - pd.Timedelta(days=d), np.nan)
+            feat[f"lag{d}d"] = v
+            if pd.notna(v):
+                lag_vals.append(v)
+        feat["lag_nda_mean"] = float(np.mean(lag_vals)) if lag_vals else np.nan
+        return feat
+
+    def _as_row(feat: dict) -> np.ndarray:
+        return np.array([[feat[c] for c in feature_cols]], dtype=float)
+
+    # ── Training set: pre-period rows with a real lag1d, so leak-free by
+    # construction (every lag used here points at-or-before pre_end too) ──
+    train_rows, train_y = [], []
+    for ts, y in pre_ts.items():
+        feat = _features_at(ts, value_source)
+        if pd.isna(feat["lag1d"]):
+            continue   # not enough history yet (start of pre-period)
+        train_rows.append([feat[c] for c in feature_cols])
+        train_y.append(y)
+
+    if len(train_rows) < 20:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    X_train = np.array(train_rows, dtype=float)
+    y_train = np.array(train_y, dtype=float)
+
+    try:
+        model = _Regressor(**_kwargs)
+        model.fit(X_train, y_train)
+    except Exception:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    # ── Batch-predict the pre-period (real lags throughout — no recursion
+    # needed since nothing here can read a during/post value) ──────────────
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+    predictions: dict = {}
+    for ts in pre_ts.index:
+        feat = _features_at(ts, value_source)
+        if pd.isna(feat["lag1d"]):
+            predictions[ts] = float(seas_mean.get((ts.hour, ts.dayofweek), fallback))
+        else:
+            predictions[ts] = float(model.predict(_as_row(feat))[0])
+
+    # ── Recursive during/post projection: chronological order, each
+    # prediction immediately becomes the lag source for later steps ────────
+    for ts in grid[grid > pre_end]:
+        feat = _features_at(ts, value_source)
+        pred = float(model.predict(_as_row(feat))[0])
+        predictions[ts] = pred
+        value_source.loc[ts] = pred
+
+    def _lookup(ts: pd.Timestamp) -> float:
+        if ts in predictions:
+            return predictions[ts]
+        pos = grid.get_indexer([ts], method="nearest")[0]
+        return float(predictions.get(grid[pos], fallback)) if pos >= 0 else fallback
+
+    return all_agg["dateTimeUtc"].apply(_lookup)
+
+
+def _its_lightgbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                  col: str, mtu_minutes: int = 15) -> pd.Series:
+    """LightGBM on lag + calendar features. See _its_gbm() for the shared
+    implementation and _ITS_METHODS["lightgbm"]["description"] for docs."""
+    return _its_gbm(pre_agg, all_agg, col, mtu_minutes=mtu_minutes, backend="lightgbm")
+
+
+def _its_catboost(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                  col: str, mtu_minutes: int = 15) -> pd.Series:
+    """CatBoost on lag + calendar features. See _its_gbm() for the shared
+    implementation and _ITS_METHODS["catboost"]["description"] for docs."""
+    return _its_gbm(pre_agg, all_agg, col, mtu_minutes=mtu_minutes, backend="catboost")
+
+
 _ITS_METHODS = {
     "seasonal_naive": {
         "label":       "Seasonal Naive",
@@ -3305,6 +3459,42 @@ _ITS_METHODS = {
             "Minimum baseline: 14 days. Recommended: 30–90 days."),
         "fn": _its_sarima,
     },
+    "lightgbm": {
+        "label":       "LightGBM (lag + calendar features)",
+        "min_days":    14,
+        "description": (
+            "Gradient-boosted trees (LightGBM) trained on lag1d/lag2d/lag7d "
+            "(same MTU 1, 2 and 7 days ago — a simplified Neighborhood Days "
+            "Approach / NDA) plus their mean and cyclical hour/weekday "
+            "features. Lag features are consistently the dominant predictor "
+            "for this kind of series across model families (Ridge, XGBoost, "
+            "CatBoost, LightGBM), not just for gradient boosting specifically "
+            "— it's the richer input representation, not model sophistication, "
+            "that does most of the work. LightGBM handles the NaN-heavy lag "
+            "columns natively (no imputation). Projection into during/post is "
+            "RECURSIVE — each prediction feeds back in as the lag source for "
+            "later steps — so a lag can never read a real during/post "
+            "observation. lag7d is only populated once ≥7 days of pre-period "
+            "history exist; shorter pre-periods still train on lag1d/lag2d. "
+            "Falls back to ARIMA if lightgbm isn't installed, seasonal naive "
+            "if the pre-period is too short to fit. "
+            "Minimum baseline: 14 days. Recommended: ≥30 days (so lag7d has "
+            "several weeks of examples, not just one)."),
+        "fn": _its_lightgbm,
+    },
+    "catboost": {
+        "label":       "CatBoost (lag + calendar features)",
+        "min_days":    14,
+        "description": (
+            "Same lag1d/lag2d/lag7d + NDA-mean + calendar feature set as the "
+            "LightGBM method above (see its description for the rationale "
+            "and the recursive leak-avoidance projection scheme), fit with "
+            "CatBoost instead. CatBoost also handles missing lag values "
+            "natively. Falls back to ARIMA if catboost isn't installed, "
+            "seasonal naive if the pre-period is too short to fit. "
+            "Minimum baseline: 14 days. Recommended: ≥30 days."),
+        "fn": _its_catboost,
+    },
 }
 
 ITS_METHOD_NAMES = list(_ITS_METHODS.keys())
@@ -3352,7 +3542,11 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "seasonal_naive" — mean by (hour, weekday) from pre-period [default]
         "fourier_trend"  — OLS with Fourier harmonics + linear trend
         "stl"            — STL decomposition (Loess), robust to outliers
-        "all"            — run all three; dashboard can compare them
+        "arima"          — ARIMA on deseasonalized residuals
+        "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
+        "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
+        "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+        "all"            — run every registered method; dashboard can compare them
 
     Returns:
       summary      : dict of scalar statistics
@@ -3539,11 +3733,15 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     #   The maintenance interval itself is NEVER used to build Y(0).
     #   Y(0) is then projected into both DURING and POST windows.
     #
-    # Three models available (see _ITS_METHODS and _build_its_for_col):
+    # Models available (see _ITS_METHODS and _build_its_for_col):
     #   "seasonal_naive" — mean by (hour, weekday) from pre-period [default]
     #   "fourier_trend"  — OLS with Fourier harmonics + linear trend
     #   "stl"            — STL decomposition (Loess), robust to outliers
-    #   "all"            — run all three, return its_all dict for comparison
+    #   "arima"          — ARIMA on deseasonalized residuals
+    #   "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
+    #   "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
+    #   "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+    #   "all"            — run every registered method, return its_all dict
     #
     # Use fall_signed (verified RAM formula input) as primary dep var.
     _its_cols = []

@@ -1218,3 +1218,85 @@ class TestSingleEventAnalysis:
         diag = no3_cov.attrs.get("planned_forced_confound")
         assert diag is not None
         assert "all_planned_transmission_is_manual" in diag
+
+
+# ── 19. Gradient-boosted ITS methods (lightgbm/catboost) ──────────────────────
+
+def _synthetic_seasonal_series(n_days=45, mtu_minutes=15, seed=42):
+    """A daily+weekly seasonal series with trend and noise, for ITS tests."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    hour = idx.hour + idx.minute / 60
+    dow = idx.dayofweek
+    seasonal = 100 + 20 * np.sin(2 * np.pi * hour / 24) + 10 * np.cos(2 * np.pi * dow / 7)
+    trend = np.linspace(0, 5, len(idx))
+    noise = rng.normal(0, 3, size=len(idx))
+    df = pd.DataFrame({"dateTimeUtc": idx, "val": seasonal + trend + noise})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df, seasonal, trend
+
+
+class TestGbmItsMethods:
+    @pytest.fixture(autouse=True)
+    def skip_without_libs(self):
+        pytest.importorskip("lightgbm")
+        pytest.importorskip("catboost")
+
+    def test_registered_in_its_methods(self):
+        assert "lightgbm" in _pipe.ITS_METHOD_NAMES
+        assert "catboost" in _pipe.ITS_METHOD_NAMES
+        for key in ("lightgbm", "catboost"):
+            entry = _pipe._ITS_METHODS[key]
+            assert entry["fn"] is not None
+            assert entry["min_days"] > 0
+            assert entry["label"]
+            assert entry["description"]
+
+    @pytest.mark.parametrize("method", ["lightgbm", "catboost"])
+    def test_no_leakage_into_during_post_projection(self, method):
+        """A during/post projection must never be able to see real
+        during/post observations -- verified by sabotaging the actual
+        values in that window to an outlier the model could not have
+        produced from pre-period-only training, then checking the
+        projection neither reproduces that outlier nor drifts wildly."""
+        df, seasonal, trend = _synthetic_seasonal_series()
+        split = pd.Timestamp("2024-02-05", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "val"] = 99999.0
+
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(pre_agg, sabotaged, "val", mtu_minutes=15)
+
+        proj_during = proj[during_mask]
+        assert proj_during.max() < 1000, (
+            f"{method} projection leaked the sabotaged during-period value")
+
+        true_during = seasonal[during_mask] + trend[during_mask]
+        mae = float(np.mean(np.abs(proj_during.values - true_during)))
+        assert mae < 15, (
+            f"{method} projection MAE={mae:.2f} vs true seasonal pattern "
+            "-- too high to be tracking the pre-period-fit model")
+
+    @pytest.mark.parametrize("method", ["lightgbm", "catboost"])
+    def test_short_pre_period_falls_back_without_error(self, method):
+        """Below the seasonal_naive/STL length guard, the GBM path must
+        degrade gracefully (no exception, no NaNs) rather than error out."""
+        df, _, _ = _synthetic_seasonal_series(n_days=4)
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(df, df, "val", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+
+    def test_all_mode_includes_gbm_methods(self, no3_cov, outages_df):
+        if _pipe.sm is None:
+            pytest.skip("statsmodels not installed")
+        row = outages_df.iloc[0]
+        res = single_event_analysis(no3_cov, row, baseline_days=7, post_days=3,
+                                    its_method="all")
+        assert "lightgbm" in res["its_all"]
+        assert "catboost" in res["its_all"]

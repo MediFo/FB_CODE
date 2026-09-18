@@ -1253,7 +1253,9 @@ class App:
             "stl":            "STL Decomposition        [min 7 days]",
             "arima":          "ARIMA on residuals       [min 14 days, rec. 30]",
             "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
-            "all":            "All five  [run & compare side-by-side]",
+            "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
+            "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
+            "all":            "All seven  [run & compare side-by-side]",
         }
         _method_cb = ttk.Combobox(
             ctrl,
@@ -1278,7 +1280,7 @@ class App:
             cur_bl = int(self.baseline_days.get())
             if key == "all":
                 hint = (
-                    "Runs all five models and overlays their projected counterfactuals "
+                    "Runs all seven models and overlays their projected counterfactuals "
                     "on the ITS plot so you can compare them directly. "
                     "Summary metrics use Seasonal Naive as primary. "
                     "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
@@ -1580,6 +1582,10 @@ class App:
             "seasonal_naive": ("#e74c3c", "--"),
             "fourier_trend":  ("#2980b9", "-."),
             "stl":            ("#27ae60", ":"),
+            "arima":          ("#8e44ad", "-."),
+            "sarima":         ("#16a085", ":"),
+            "lightgbm":       ("#d35400", "--"),
+            "catboost":       ("#34495e", "-."),
         }
 
         if not its.empty:
@@ -1600,7 +1606,7 @@ class App:
 
                 # Projected counterfactual(s)
                 if its_all and len(its_all) > 1:
-                    # "all" mode: overlay all three
+                    # "all" mode: overlay every registered ITS method
                     for mkey, mdf in its_all.items():
                         if mdf.empty: continue
                         msub = mdf[mdf.param == param].sort_values("dateTimeUtc")

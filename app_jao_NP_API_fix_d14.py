@@ -3576,7 +3576,9 @@ class App:
             "stl":            "STL Decomposition        [min 7 days]",
             "arima":          "ARIMA on residuals       [min 14 days, rec. 30]",
             "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
-            "all":            "All five  [run & compare side-by-side]",
+            "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
+            "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
+            "all":            "All seven  [run & compare side-by-side]",
         }
         _prop = getattr(self, '_prop', None)
         _method_keys = (list(_prop.ITS_METHOD_NAMES) + ["all"]) if _prop else list(_method_labels)
@@ -3602,7 +3604,7 @@ class App:
                 cur_bl = 14
             _p = getattr(self, '_prop', None)
             if key == "all":
-                hint = ("Runs all five models and overlays their projected counterfactuals "
+                hint = ("Runs all seven models and overlays their projected counterfactuals "
                         "on the ITS plot so you can compare them directly. "
                         "Summary metrics use Seasonal Naive as primary. "
                         "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
@@ -3896,6 +3898,10 @@ class App:
             "seasonal_naive": (C_RED,    "--"),
             "fourier_trend":  (C_PRIMARY, "-."),
             "stl":            (C_GREEN,   ":"),
+            "arima":          (C_PURPLE,  "-."),
+            "sarima":         ("#4A6FA5", ":"),
+            "lightgbm":       ("#8C6A4A", "--"),
+            "catboost":       ("#5C8A8A", "-."),
         }
         # Clear and rebuild the tkinter legend bar above the canvas
         for w in self._ma_its_legend_bar.winfo_children():

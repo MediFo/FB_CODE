@@ -21,7 +21,10 @@ dependencies = [
 # (event-study pre-trend joint Wald test).
 regression = ["statsmodels>=0.14", "linearmodels>=6.0", "scipy>=1.10"]
 entsoe     = ["entsoe-py>=0.6"]
-dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-py>=0.6", "scipy>=1.10"]
+# "lightgbm"/"catboost" ITS counterfactual methods in propagation.py -- both
+# optional, each falls back to ARIMA if its own library is missing.
+gbm        = ["lightgbm>=4.0", "catboost>=1.2"]
+dev        = ["pytest>=7.0", "statsmodels>=0.14", "linearmodels>=6.0", "entsoe-py>=0.6", "scipy>=1.10", "lightgbm>=4.0", "catboost>=1.2"]
 
 [project.scripts]
 fi-no3-analyse = "fi_no3.propagation:main_cli"
