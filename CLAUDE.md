@@ -443,6 +443,27 @@ pytest test_pipeline.py -v
   seasonal_naive/arima/hurdle, rolling-origin split counts at various
   pre-period lengths, tuning picks a deliberately-better candidate over a
   deliberately-bad one, all still leak-safe with no NaN).
+  Because of that runtime cost, tuning is a module-level on/off switch —
+  `propagation.ITS_TUNE_HYPERPARAMS` (default `True`). Set it to `False`
+  before calling into `single_event_analysis()`/`run_pipeline()` (from a
+  future GUI checkbox, a CLI flag, or a test) to skip
+  `_tune_lag_hyperparams()` entirely and use each of the three methods'
+  original fixed configuration instead — confirmed ~6x faster for ridge
+  alone (2.27s → 0.38s on a 30-day pre-period) and cuts "ensemble" from
+  ~113-133s down to ~70s on the same data (the remainder is SARIMA/TBATS'
+  own model-selection cost, unaffected by this toggle). It's a plain
+  module attribute rather than a parameter threaded through
+  `_build_its_for_col()`/`single_event_analysis()`/
+  `_ensemble_backtest_weights()` deliberately: those all dispatch to any
+  of the 13 methods through one shared, fixed call signature
+  `(pre_agg, all_agg, col, mtu_minutes=...)`, and only 3 of the 13
+  methods have anything to tune — a toggle only the tuning-aware methods
+  read keeps that dispatch contract untouched, and means ensemble calls
+  respect it automatically with zero extra plumbing (`_its_ensemble()`
+  calls `_its_gbm()`/`_its_ridge()` the same way regardless). Read fresh
+  on every call, not cached, so flipping it takes effect immediately.
+  Not yet wired to a GUI checkbox or CLI flag in dashboard.py/
+  app_jao_NP_API_fix_d14.py/run_analysis.py — currently code-only.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by

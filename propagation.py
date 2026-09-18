@@ -2855,6 +2855,38 @@ def run_event_study(df: pd.DataFrame, dep_var: str,
 # project into during and post without ever touching those observations.
 # ===========================================================================
 
+ITS_TUNE_HYPERPARAMS = True
+# Module-level on/off switch for the lightgbm/catboost/ridge internal
+# hyperparameter search (_tune_lag_hyperparams(), consumed inside
+# _its_gbm()/_its_ridge()). Default True: each of those three methods
+# grades a small candidate grid on a held-out slice of the pre-period
+# before fitting its real projection (see CLAUDE.md's tuning/ensemble
+# domain-facts entry for why this was added). Set to False -- e.g.
+# `propagation.ITS_TUNE_HYPERPARAMS = False` from a GUI checkbox, a CLI
+# flag, or a test, before calling into single_event_analysis()/
+# run_pipeline() -- to skip tuning and use each method's original fixed
+# configuration (candidates[0]) instead. Meaningfully faster, especially
+# for "ensemble"/"all" mode, which calls these three methods several
+# times each (once per rolling-origin backtest window, once for the real
+# projection) and multiplies the tuning cost accordingly on every one of
+# those calls. Read fresh on every _its_gbm()/_its_ridge() call, not
+# cached anywhere, so flipping it takes effect on the very next ITS call
+# -- no restart, no re-fit of anything already computed.
+#
+# A plain module attribute rather than a parameter threaded through
+# _build_its_for_col()/single_event_analysis()/_ensemble_backtest_weights()
+# deliberately: those all dispatch to any of the 13 methods through one
+# shared, fixed call signature (pre_agg, all_agg, col, mtu_minutes=...),
+# and only 3 of the 13 methods have anything to tune -- adding a
+# tuning-specific kwarg to that shared signature would mean every other
+# method's function silently ignoring an argument that means nothing to
+# it. A toggle only the tuning-aware methods read keeps that dispatch
+# contract untouched, matches this module's existing style for global
+# analysis constants (ENTSOE_TOKEN, ITS_DEFAULT_METHOD, etc.), and is
+# already how the ensemble reaches every member uniformly, so ensemble
+# calls respect this toggle automatically with no extra plumbing.
+
+
 def _its_seasonal_naive(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
                         col: str) -> pd.Series:
     """
@@ -3903,8 +3935,9 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
             return model.predict
         return fit_predict
 
-    best_kwargs = _tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
-                                        _make_fit_predict)
+    best_kwargs = (_tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                         _make_fit_predict)
+                   if ITS_TUNE_HYPERPARAMS else _candidates[0])
     result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
                             _make_fit_predict(best_kwargs))
     return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
@@ -4024,8 +4057,9 @@ def _its_ridge(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
             return model.predict
         return fit_predict
 
-    best_kwargs = _tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
-                                        _make_fit_predict)
+    best_kwargs = (_tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                         _make_fit_predict)
+                   if ITS_TUNE_HYPERPARAMS else _candidates[0])
     result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
                             _make_fit_predict(best_kwargs))
     return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
@@ -4293,7 +4327,10 @@ _ITS_METHODS = {
             "pre-period itself (see _tune_lag_hyperparams()), not fixed in "
             "advance -- below 14 days of pre-period this has no effect "
             "(too short to tune reliably) and the original fixed "
-            "configuration is used unchanged. "
+            "configuration is used unchanged. Set module-level "
+            "propagation.ITS_TUNE_HYPERPARAMS = False to skip tuning "
+            "entirely and always use that fixed configuration -- "
+            "meaningfully faster, especially inside 'ensemble'/'all' mode. "
             "Falls back to ARIMA if lightgbm isn't installed, seasonal naive "
             "if the pre-period is too short to fit. "
             "Minimum baseline: 14 days. Recommended: ≥30 days (so lag7d has "

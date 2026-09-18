@@ -1332,6 +1332,30 @@ class TestLagFeatureItsMethods:
         best = _pipe._tune_lag_hyperparams(df, "val", 15, candidates, _make_fit_predict)
         assert best == dict(alpha=5.0)
 
+    def test_its_tune_hyperparams_toggle_skips_tuning_when_false(self):
+        """ITS_TUNE_HYPERPARAMS=False must make _its_ridge() (and by the
+        same code path, _its_gbm()) noticeably faster by skipping
+        _tune_lag_hyperparams() entirely -- verified by monkeypatching it
+        to raise if called, then confirming the method still runs
+        cleanly (using candidates[0] unchanged) instead of erroring."""
+        df, _, _ = _synthetic_seasonal_series(n_days=30)
+        original_toggle = _pipe.ITS_TUNE_HYPERPARAMS
+        original_tune_fn = _pipe._tune_lag_hyperparams
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("_tune_lag_hyperparams should not be called "
+                                 "when ITS_TUNE_HYPERPARAMS is False")
+
+        try:
+            _pipe.ITS_TUNE_HYPERPARAMS = False
+            _pipe._tune_lag_hyperparams = _boom
+            proj = _pipe._its_ridge(df, df, "val", mtu_minutes=15)
+            assert len(proj) == len(df)
+            assert not proj.isna().any()
+        finally:
+            _pipe.ITS_TUNE_HYPERPARAMS = original_toggle
+            _pipe._tune_lag_hyperparams = original_tune_fn
+
     @pytest.mark.parametrize("method", _LAG_FEATURE_METHODS)
     def test_no_leakage_into_during_post_projection(self, method):
         """A during/post projection must never be able to see real
