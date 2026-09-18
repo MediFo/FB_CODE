@@ -1295,6 +1295,43 @@ class TestLagFeatureItsMethods:
         assert not np.isnan(pred).any()
         assert model._beta[2] == 0.0
 
+    def test_tune_lag_hyperparams_picks_better_candidate(self):
+        """Regression guard for the hyperparameter-tuning addition: given
+        a deliberately-bad candidate FIRST (huge ridge alpha, suppresses
+        every coefficient toward 0 and predicts close to a constant mean,
+        ignoring the calendar/lag features entirely) and a reasonable one
+        second, the tuner must still pick the good one by backtest MAE --
+        proving it actually evaluates candidates rather than just
+        returning candidates[0]."""
+        df, _, _ = _synthetic_seasonal_series(n_days=30)
+
+        def _make_fit_predict(kwargs):
+            def fit_predict(X_train, y_train):
+                model = _pipe._ClosedFormRidge(**kwargs).fit(X_train, y_train)
+                return model.predict
+            return fit_predict
+
+        candidates = [dict(alpha=1e8), dict(alpha=5.0)]
+        best = _pipe._tune_lag_hyperparams(df, "val", 15, candidates, _make_fit_predict)
+        assert best == dict(alpha=5.0), (
+            f"tuner should have picked the low-alpha candidate, got {best}")
+
+    def test_tune_lag_hyperparams_falls_back_to_default_on_short_pre_period(self):
+        """Below 14 days, tuning must be a no-op: candidates[0] returned
+        unchanged regardless of which candidate would actually backtest
+        better -- there's no reliable split to check it against."""
+        df, _, _ = _synthetic_seasonal_series(n_days=6)
+
+        def _make_fit_predict(kwargs):
+            def fit_predict(X_train, y_train):
+                model = _pipe._ClosedFormRidge(**kwargs).fit(X_train, y_train)
+                return model.predict
+            return fit_predict
+
+        candidates = [dict(alpha=5.0), dict(alpha=1e8)]
+        best = _pipe._tune_lag_hyperparams(df, "val", 15, candidates, _make_fit_predict)
+        assert best == dict(alpha=5.0)
+
     @pytest.mark.parametrize("method", _LAG_FEATURE_METHODS)
     def test_no_leakage_into_during_post_projection(self, method):
         """A during/post projection must never be able to see real
@@ -1541,3 +1578,30 @@ class TestEnsembleItsMethod:
         proj = _pipe._its_ensemble(df, df, "val", mtu_minutes=15)
         assert len(proj) == len(df)
         assert not proj.isna().any()
+
+    def test_deduplicates_members_with_identical_backtest_predictions(self):
+        """seasonal_naive/arima/hurdle can legitimately converge on
+        numerically identical predictions when there's no real residual
+        signal beyond the seasonal mean (see CLAUDE.md's ensemble
+        domain-facts entry on the hyperparameter-tuning/dedup addition) --
+        de-duplication should keep only one representative rather than
+        letting a coincidental multi-way tie dominate the weighted blend."""
+        df, _, _ = _synthetic_seasonal_series(n_days=45)
+        members = [m for m in _pipe._ITS_METHODS if m != "ensemble"]
+        weights = _pipe._ensemble_backtest_weights(df, "val", 15, members)
+        assert weights is not None
+        identical_trio = {"seasonal_naive", "arima", "hurdle"} & set(weights)
+        assert len(identical_trio) <= 1, (
+            f"expected at most one of seasonal_naive/arima/hurdle to survive "
+            f"de-duplication, got {identical_trio}")
+
+    def test_rolling_origin_split_count_scales_with_pre_period_length(self):
+        """0 splits under 14 days, 1 split from 14 up to ~28 days, 2
+        splits at ~28+ days -- the threshold _carve_rolling_origin_splits()
+        uses to decide it's safe to fit a second window without starving
+        the first one's own training side."""
+        for n_days, expected in [(10, 0), (20, 1), (30, 2), (60, 2)]:
+            df, _, _ = _synthetic_seasonal_series(n_days=n_days)
+            splits = _pipe._carve_rolling_origin_splits(df)
+            assert len(splits) == expected, (
+                f"{n_days} days -> expected {expected} splits, got {len(splits)}")

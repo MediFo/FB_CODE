@@ -392,6 +392,57 @@ pytest test_pipeline.py -v
   "hurdle" in the ITS-method dropdown for a shadow-price single-event
   analysis — nothing auto-detects zero-inflation and switches methods for
   you.
+- Hyperparameter tuning + a smarter adaptive ensemble (added after a user
+  reported the ensemble's edge over its own best single member was
+  smaller than expected): investigating WHY surfaced that `arima`,
+  `hurdle`, and `seasonal_naive` were producing bit-for-bit IDENTICAL
+  predictions on several backtest runs — all three legitimately collapse
+  to the same seasonal-mean answer when there's no extra signal to model
+  (ARIMA's residual order search picking (0,0,0); hurdle's P(binding)
+  saturating near 1). That meant the ensemble's "12 members" had real
+  diversity closer to 9-10 — a coincidental multi-way tie was getting
+  counted 3x, diluting genuinely different members rather than adding
+  robustness. Combined with lightgbm/catboost/ridge each using ONE fixed,
+  never-tuned hyperparameter configuration, there wasn't much room for
+  the "adaptive" part to do more than it was.
+  Fixed both:
+    1. LightGBM/CatBoost/ridge now each tune a small hyperparameter grid
+       (depth/learning_rate/n_estimators for the GBMs, L2 alpha for
+       ridge) via `_tune_lag_hyperparams()`, graded on a held-out slice of
+       the pre-period itself (`_carve_pre_period_holdout()`) — same
+       leak-safety story as fitting itself, since the split never touches
+       during/post data. Below 14 days of pre-period this is a no-op:
+       candidates[0] (the original fixed config) is used unchanged, so
+       tuning can only match or beat the pre-tuning baseline, never do
+       worse by picking something untested on too little data.
+    2. `_ensemble_backtest_weights()` now: (a) grades members on up to 2
+       ROLLING-ORIGIN backtest windows (`_carve_rolling_origin_splits()`,
+       activates once there's ~28+ days of pre-period) instead of one,
+       averaging each member's MAE across windows for a less noisy
+       estimate; (b) DE-DUPLICATES members whose backtest predictions
+       come out numerically identical (`np.allclose` on the holdout-slice
+       predictions, not just equal MAE — genuinely different methods can
+       tie on MAE by coincidence without producing the same predictions),
+       keeping only the lowest-MAE representative of each cluster before
+       the exclude/weight steps run; (c) weights survivors ∝
+       1/backtest-MAE² instead of 1/backtest-MAE — plain inverse-error
+       weighting measured too flat (a member that backtested twice as
+       accurately as another got only ~2x the say, not enough to move the
+       blend much away from a near-uniform average); squaring makes that
+       ratio ~4x, letting a clearly-better member actually dominate.
+       `quality_ratio` (the exclusion cutoff) was also tightened from 2.0x
+       to 1.5x the best member's MAE, and `min_survivors` lowered from 3
+       to 2, since de-duplication already shrinks the candidate pool to
+       genuinely distinct members.
+  Runtime cost compounds: rolling-origin backtesting fits most members up
+  to 2 extra times each, and lightgbm/catboost/ridge now tune internally
+  on every one of those fits too — the ensemble method went from "budget
+  double an 'all' mode run" to "budget noticeably more than that." See
+  `TestEnsembleItsMethod`/`TestLagFeatureItsMethods` in test_pipeline.py
+  for the regression tests (dedup keeps at most one of
+  seasonal_naive/arima/hurdle, rolling-origin split counts at various
+  pre-period lengths, tuning picks a deliberately-better candidate over a
+  deliberately-bad one, all still leak-safe with no NaN).
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by

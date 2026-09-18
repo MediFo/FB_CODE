@@ -3707,6 +3707,127 @@ def _its_lag_model(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     return all_agg["dateTimeUtc"].apply(_lookup)
 
 
+def _carve_pre_period_holdout(pre_agg: pd.DataFrame, min_total_days: int = 14,
+                              holdout_days: Optional[int] = None):
+    """
+    Carve the most recent slice off a pre-period as an internal
+    validation window: hold out `holdout_days` (default: up to 7, capped
+    at 25% of the pre-period, so most of it is still left to train on),
+    fit on the earlier remainder only. Returns (inner_pre_agg,
+    holdout_mask) — holdout_mask indexed against the ORIGINAL pre_agg —
+    or None if the pre-period is under `min_total_days` (too short for a
+    meaningful split).
+
+    Shared by _ensemble_backtest_weights() (grading candidate METHODS)
+    and _tune_lag_hyperparams() (grading candidate HYPERPARAMETER SETS
+    for a single method) — both need the identical "fit on earlier
+    pre-period data, evaluate on a later pre-period slice whose truth is
+    already known" split. That split lives entirely inside the real
+    pre-period, so anything built on it — method choice, hyperparameter
+    choice, ensemble weights — can never be influenced by a real
+    during/post observation.
+    """
+    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
+    if total_days < min_total_days:
+        return None
+    if holdout_days is None:
+        holdout_days = min(7, max(2, total_days // 4))
+    split = pre_agg["dateTimeUtc"].max() - pd.Timedelta(days=holdout_days)
+    inner_pre_agg = pre_agg[pre_agg["dateTimeUtc"] < split].reset_index(drop=True)
+    holdout_mask = (pre_agg["dateTimeUtc"] >= split).values
+    if inner_pre_agg.empty or not holdout_mask.any():
+        return None
+    return inner_pre_agg, holdout_mask
+
+
+def _carve_rolling_origin_splits(pre_agg: pd.DataFrame, min_total_days: int = 14,
+                                 max_splits: int = 2) -> list:
+    """
+    Like _carve_pre_period_holdout(), but returns UP TO `max_splits`
+    non-overlapping holdout windows walking backward from the end of the
+    pre-period, each with its own earlier-only training slice — a
+    lightweight rolling-origin backtest. A single holdout window's MAE
+    estimate for a candidate is noisy (it's one window of at most a
+    handful of days); averaging a candidate's MAE across 2 independent
+    windows is a materially more stable estimate of how well it actually
+    generalizes, at roughly double the backtest cost — used by
+    _ensemble_backtest_weights() specifically because a noisy weight
+    estimate was diluting how decisively the ensemble could favor a
+    genuinely better member.
+
+    A second split only activates once there's enough pre-period to fit
+    both windows without starving the earliest one's own training side —
+    `total_days >= 2 * holdout_days + min_total_days` (typically ~28 days
+    at the default 7-day holdout); shorter pre-periods still get exactly
+    one split, same behavior as before this existed. Returns an empty
+    list (not None) if even one split isn't possible, so callers can
+    `for inner_pre_agg, holdout_mask in splits:` without a None check.
+    """
+    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
+    if total_days < min_total_days:
+        return []
+    holdout_days = min(7, max(2, total_days // 4))
+    n_splits = 2 if (max_splits >= 2 and total_days >= 2 * holdout_days + min_total_days) else 1
+
+    splits = []
+    end = pre_agg["dateTimeUtc"].max()
+    for _ in range(n_splits):
+        split_ts = end - pd.Timedelta(days=holdout_days)
+        inner = pre_agg[pre_agg["dateTimeUtc"] < split_ts].reset_index(drop=True)
+        mask = ((pre_agg["dateTimeUtc"] >= split_ts) & (pre_agg["dateTimeUtc"] < end)).values
+        if inner.empty or not mask.any():
+            break
+        splits.append((inner, mask))
+        end = split_ts
+    return splits
+
+
+def _tune_lag_hyperparams(pre_agg: pd.DataFrame, col: str, mtu_minutes: int,
+                          candidates: list, make_fit_predict) -> dict:
+    """
+    Pick the best of a small hyperparameter grid for a lag-feature ITS
+    method (LightGBM/CatBoost/Ridge), using the SAME pre-period-only
+    holdout split _ensemble_backtest_weights() uses to grade candidate
+    METHODS — here grading candidate HYPERPARAMETER SETS for a single
+    method instead, requested specifically because none of the
+    lag-feature methods were ever tuned; they all just used one arbitrary
+    fixed configuration.
+
+    `candidates` is a list of kwargs dicts — candidates[0] must be a
+    safe, already-proven default, since it's what gets used if tuning
+    can't run at all. `make_fit_predict(kwargs)` returns a
+    `fit_predict(X_train, y_train) -> predict` closure, exactly the shape
+    _its_gbm()/_its_ridge() already build for _its_lag_model().
+
+    Returns candidates[0] unchanged if the pre-period is under 14 days
+    (too short for a reliable split) or if every candidate errors out —
+    "no tuning happened" is a safe, already-well-tested fallback, never a
+    crash. This split lives entirely inside the pre-period (see
+    _carve_pre_period_holdout()), so tuning can't leak during/post data
+    into the hyperparameter choice any more than fitting itself can.
+    """
+    split = _carve_pre_period_holdout(pre_agg, min_total_days=14)
+    if split is None:
+        return candidates[0]
+    inner_pre_agg, holdout_mask = split
+    true_vals = pre_agg[col].values[holdout_mask]
+
+    best_kwargs, best_mae = candidates[0], float("inf")
+    for kwargs in candidates:
+        try:
+            proj = _its_lag_model(inner_pre_agg, pre_agg, col, mtu_minutes,
+                                  make_fit_predict(kwargs))
+            if proj is None:
+                continue
+            pred = proj.values[holdout_mask]
+            mae = float(np.mean(np.abs(pred - true_vals)))
+            if np.isfinite(mae) and mae < best_mae:
+                best_kwargs, best_mae = kwargs, mae
+        except Exception:
+            continue
+    return best_kwargs
+
+
 def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
              mtu_minutes: int = 15, backend: str = "lightgbm") -> pd.Series:
     """
@@ -3725,17 +3846,41 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     CatBoost are offered because they handle the resulting NaN-heavy lag
     columns (early pre-period rows, missing days) natively, with no
     imputation step needed.
+
+    HYPERPARAMETER TUNING: rather than one fixed, arbitrary configuration,
+    a small grid of candidates (varying depth/learning_rate/n_estimators)
+    is graded via _tune_lag_hyperparams() on a held-out slice of the
+    pre-period itself, and the winner is what actually fits the real
+    projection. candidates[0] is the original fixed configuration this
+    method shipped with — the safe fallback when the pre-period is too
+    short to tune reliably (<14 days) — so tuning can only match or beat
+    that baseline, never do worse by picking something untested.
     """
     try:
         if backend == "lightgbm":
             from lightgbm import LGBMRegressor as _Regressor
-            _kwargs = dict(n_estimators=200, max_depth=5, num_leaves=31,
-                           learning_rate=0.05, min_child_samples=10,
-                           verbosity=-1)
+            _candidates = [
+                dict(n_estimators=200, max_depth=5, num_leaves=31,
+                    learning_rate=0.05, min_child_samples=10, verbosity=-1),
+                dict(n_estimators=100, max_depth=3, num_leaves=15,
+                    learning_rate=0.10, min_child_samples=10, verbosity=-1),
+                dict(n_estimators=300, max_depth=6, num_leaves=63,
+                    learning_rate=0.03, min_child_samples=5, verbosity=-1),
+                dict(n_estimators=150, max_depth=4, num_leaves=20,
+                    learning_rate=0.08, min_child_samples=15, verbosity=-1),
+            ]
         else:
             from catboost import CatBoostRegressor as _Regressor
-            _kwargs = dict(iterations=300, depth=5, learning_rate=0.05,
-                           verbose=False, allow_writing_files=False)
+            _candidates = [
+                dict(iterations=300, depth=5, learning_rate=0.05,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=150, depth=3, learning_rate=0.10,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=500, depth=6, learning_rate=0.03,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=200, depth=4, learning_rate=0.08,
+                    verbose=False, allow_writing_files=False),
+            ]
         # Fail fast here, not at .fit() time: lightgbm's sklearn wrapper
         # imports cleanly even without scikit-learn installed, then raises
         # a non-ImportError LightGBMError the first time it's constructed
@@ -3747,16 +3892,21 @@ def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
         # residual attempt and silently discarded all the feature
         # engineering. Constructing (not fitting) the regressor here
         # surfaces that failure at the right fallback point.
-        _Regressor(**_kwargs)
+        _Regressor(**_candidates[0])
     except Exception:
         return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
 
-    def _fit_predict(X_train: np.ndarray, y_train: np.ndarray):
-        model = _Regressor(**_kwargs)
-        model.fit(X_train, y_train)
-        return model.predict
+    def _make_fit_predict(kwargs: dict):
+        def fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+            model = _Regressor(**kwargs)
+            model.fit(X_train, y_train)
+            return model.predict
+        return fit_predict
 
-    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes, _fit_predict)
+    best_kwargs = _tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                        _make_fit_predict)
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
+                            _make_fit_predict(best_kwargs))
     return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
 
 
@@ -3833,7 +3983,7 @@ class _ClosedFormRidge:
 
 
 def _its_ridge(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
-               mtu_minutes: int = 15, alpha: float = 5.0) -> pd.Series:
+               mtu_minutes: int = 15) -> pd.Series:
     """
     Ridge regression on the same lag1d/lag2d/lag7d + NDA-mean + calendar
     feature set as _its_gbm() (see _its_lag_model() for the shared
@@ -3859,12 +4009,25 @@ def _its_ridge(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     during the first week of a pre-period, lag2d on day 1) from the
     training set's own column means, computed once and reused unchanged
     at prediction time — never recomputed from during/post data.
-    """
-    def _fit_predict(X_train: np.ndarray, y_train: np.ndarray):
-        model = _ClosedFormRidge(alpha=alpha).fit(X_train, y_train)
-        return model.predict
 
-    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes, _fit_predict)
+    HYPERPARAMETER TUNING: the regularization strength `alpha` was
+    previously a fixed 5.0. It's now chosen from a small grid via
+    _tune_lag_hyperparams() on a held-out slice of the pre-period itself
+    — 5.0 stays candidate zero (the safe fallback below 14 days of
+    pre-period), so tuning can only match or beat the original behavior.
+    """
+    _candidates = [dict(alpha=a) for a in (5.0, 0.5, 2.0, 20.0, 80.0)]
+
+    def _make_fit_predict(kwargs: dict):
+        def fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+            model = _ClosedFormRidge(**kwargs).fit(X_train, y_train)
+            return model.predict
+        return fit_predict
+
+    best_kwargs = _tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                        _make_fit_predict)
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
+                            _make_fit_predict(best_kwargs))
     return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
 
 
@@ -3878,73 +4041,105 @@ def _call_its_method(fn, pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
 
 
 def _ensemble_backtest_weights(pre_agg: pd.DataFrame, col: str, mtu_minutes: int,
-                               members: list, quality_ratio: float = 2.0,
-                               min_survivors: int = 3) -> Optional[dict]:
+                               members: list, quality_ratio: float = 1.5,
+                               min_survivors: int = 2,
+                               dedupe_tol: float = 1e-6) -> Optional[dict]:
     """
-    Backtest every candidate member ENTIRELY WITHIN the pre-period: hold
-    out its most recent slice (up to 7 days, capped at 25% of the
-    pre-period so enough is left to train on), fit each member on the
-    earlier remainder only, project onto the held-out slice, and grade
-    against its already-known true values — the same "fit on earlier
-    data, project into a later window, compare to known truth" backtest
-    used to produce CLAUDE.md's "Backtested accuracy" numbers, just run
-    automatically per-outage instead of once offline on synthetic data.
-    This split lives entirely inside the real pre-period, so — like every
-    other method in this section — it can never see a real during/post
-    observation.
+    Backtest every candidate member ENTIRELY WITHIN the pre-period, using
+    _carve_rolling_origin_splits() — up to 2 non-overlapping holdout
+    windows once there's enough pre-period, 1 otherwise — fit each member
+    on the earlier remainder of each window only, project onto that
+    window's held-out slice, and grade against its already-known true
+    values, averaging across windows when there's more than one for a
+    less noisy estimate. Same "fit on earlier data, project into a later
+    window, compare to known truth" backtest used to produce CLAUDE.md's
+    "Backtested accuracy" numbers, just run automatically per-outage
+    instead of once offline on synthetic data. Every split lives entirely
+    inside the real pre-period, so — like every other method in this
+    section — nothing here can see a real during/post observation.
 
-    Returns None if the pre-period is too short (<14 days) to hold out a
-    meaningful backtest slice without starving the training side; the
-    caller falls back to an unweighted median of all members in that case.
+    Returns None if the pre-period is too short (<14 days) for even one
+    split; the caller falls back to an unweighted median of all members
+    in that case.
 
-    Otherwise returns {member: weight} for the SURVIVING members only:
-    any member whose backtest MAE exceeds `quality_ratio`x the best
-    member's MAE is excluded outright ("exclude bad models"), unless
-    doing so would leave fewer than `min_survivors` — in that case the
-    `min_survivors` members with the lowest backtest MAE are kept instead,
-    so a single unlucky backtest window can't collapse the ensemble down
-    to one member and lose the robustness an ensemble is for. Surviving
-    members are weighted ∝ 1/MAE (normalized to sum to 1), so a member
-    that backtested twice as accurately as another gets roughly twice the
-    say in the final blend — this is the "adaptive" part: the weighting
-    is recomputed per-outage from that outage's own pre-period, not fixed
-    in advance.
+    Otherwise returns {member: weight} for the SURVIVING, DE-DUPLICATED
+    members:
+      1. De-duplication FIRST: several members can legitimately converge
+         on numerically identical backtest predictions on a given
+         pre-period (e.g. arima's residual-ARIMA order search selecting
+         (0,0,0) and hurdle's P(binding) saturating near 1 both reduce to
+         plain seasonal_naive) — keeping every one of them as a separate
+         "vote" doesn't add diversity, it just gives that one answer
+         disproportionate weight relative to genuinely different members.
+         Only the lowest-MAE representative of each cluster of
+         near-identical backtest predictions (within `dedupe_tol`) is
+         kept as a candidate for the steps below.
+      2. Exclusion: any surviving-dedup member whose backtest MAE exceeds
+         `quality_ratio`x the best one's is dropped outright ("exclude
+         bad models"), unless doing so would leave fewer than
+         `min_survivors` — in that case the `min_survivors` lowest-MAE
+         members are kept instead, so one unlucky backtest window can't
+         collapse the ensemble down below what's still meant to be a
+         blend.
+      3. Weighting: survivors are weighted ∝ 1/MAE² (inverse-SQUARED
+         error, not plain inverse) — a member that backtested twice as
+         accurately as another now gets roughly 4x the say, not 2x. Plain
+         inverse-error weighting measured too flat in practice (the
+         ensemble's edge over its own best single member was much smaller
+         than expected); squaring makes the "adaptive" part of this
+         method actually decisive about a clearly-better member instead
+         of averaging it down toward the pack.
     """
-    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
-    if total_days < 14:
+    splits = _carve_rolling_origin_splits(pre_agg, min_total_days=14, max_splits=2)
+    if not splits:
         return None
 
-    bt_days = min(7, max(2, total_days // 4))
-    bt_split = pre_agg["dateTimeUtc"].max() - pd.Timedelta(days=bt_days)
-    inner_pre_agg = pre_agg[pre_agg["dateTimeUtc"] < bt_split].reset_index(drop=True)
-    holdout_mask = (pre_agg["dateTimeUtc"] >= bt_split).values
-    if inner_pre_agg.empty or not holdout_mask.any():
-        return None
-    true_vals = pre_agg[col].values[holdout_mask]
-
-    mae_by_member = {}
+    mae_by_member: dict = {}
+    pred_by_member: dict = {}
     for m in members:
         fn = _ITS_METHODS[m]["fn"]
-        try:
-            proj = _call_its_method(fn, inner_pre_agg, pre_agg, col, m, mtu_minutes)
-            pred = proj.values[holdout_mask]
-            mae = float(np.mean(np.abs(pred - true_vals)))
-            mae_by_member[m] = mae if np.isfinite(mae) else float("inf")
-        except Exception:
-            mae_by_member[m] = float("inf")
+        split_maes, split_preds = [], []
+        for inner_pre_agg, holdout_mask in splits:
+            try:
+                proj = _call_its_method(fn, inner_pre_agg, pre_agg, col, m, mtu_minutes)
+                pred = proj.values[holdout_mask]
+                true_vals = pre_agg[col].values[holdout_mask]
+                mae = float(np.mean(np.abs(pred - true_vals)))
+                if np.isfinite(mae):
+                    split_maes.append(mae)
+                    split_preds.append(pred)
+            except Exception:
+                pass
+        if split_maes:
+            mae_by_member[m] = float(np.mean(split_maes))
+            pred_by_member[m] = np.concatenate(split_preds)
 
     finite_maes = [v for v in mae_by_member.values() if np.isfinite(v)]
     if not finite_maes:
         return None
     best_mae = min(finite_maes)
 
+    # De-duplicate: keep only the best-MAE representative of each cluster
+    # of members whose backtest predictions are numerically indistinguishable.
     ranked = sorted(mae_by_member.items(), key=lambda kv: kv[1])
-    survivors = [m for m, mae in ranked if mae <= quality_ratio * best_mae]
-    if len(survivors) < min(min_survivors, len(ranked)):
-        survivors = [m for m, _ in ranked[:min_survivors]]
+    deduped, seen_preds = [], []
+    for m, mae in ranked:
+        pred = pred_by_member[m]
+        is_dup = any(pred.shape == seen.shape and
+                    np.allclose(pred, seen, atol=dedupe_tol, rtol=dedupe_tol)
+                    for seen in seen_preds)
+        if not is_dup:
+            deduped.append((m, mae))
+            seen_preds.append(pred)
+    if not deduped:
+        return None
+
+    survivors = [m for m, mae in deduped if mae <= quality_ratio * best_mae]
+    if len(survivors) < min(min_survivors, len(deduped)):
+        survivors = [m for m, _ in deduped[:min_survivors]]
 
     eps = 1e-6
-    raw_weights = {m: 1.0 / (mae_by_member[m] + eps) for m in survivors}
+    raw_weights = {m: (1.0 / (mae_by_member[m] + eps)) ** 2 for m in survivors}
     total_weight = sum(raw_weights.values())
     return {m: w / total_weight for m, w in raw_weights.items()}
 
@@ -3958,14 +4153,22 @@ def _its_ensemble(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     pseudo-method are excluded to avoid recursion).
 
     "Adaptive" + "exclude bad models": _ensemble_backtest_weights() grades
-    every member on a held-out slice of the pre-period ITSELF (never
-    during/post data — see its own docstring), drops members that
-    backtested far worse than the best one, and weights the survivors
-    ∝ 1/backtest-MAE. The final projection is those survivors' REAL
-    full-pre-period projections into the real during/post window,
-    combined with those weights. This adapts per-outage: which methods
-    get excluded and how the rest are weighted depends on that outage's
-    own pre-period, not a fixed roster decided in advance.
+    every member on up to 2 rolling-origin held-out windows of the
+    pre-period ITSELF (never during/post data — see its own docstring),
+    de-duplicates members whose backtest predictions are numerically
+    identical (several legitimately converge on the same seasonal-mean
+    answer on some pre-periods — counting that answer 2-3x over would
+    just dilute genuinely different members, not add diversity), drops
+    members that backtested far worse than the best one, and weights the
+    survivors ∝ 1/backtest-MAE² (inverse-SQUARED, so a clearly better
+    member dominates rather than being averaged down toward the pack —
+    plain inverse-error weighting was tried first and measured too flat).
+    The final projection is those survivors' REAL full-pre-period
+    projections into the real during/post window, combined with those
+    weights. This adapts per-outage: which methods get excluded, which
+    get treated as duplicates, and how the rest are weighted all depend
+    on that outage's own pre-period, not a fixed roster decided in
+    advance.
 
     Falls back to an unweighted per-timestamp MEDIAN of every member's
     full-pre-period projection when the pre-period is too short (<14
@@ -3986,10 +4189,13 @@ def _its_ensemble(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     projections is leak-free too, and the backtest weights themselves are
     computed entirely from pre-period data (see
     _ensemble_backtest_weights()), so nothing added here can introduce a
-    leak. Slowest method to run — backtesting adds roughly another full
-    fit per member (SARIMA's ~10-25s AIC grid search twice) on top of the
-    final projection fits, so budget roughly double a plain "all" mode
-    run.
+    leak. By far the slowest method to run — rolling-origin backtesting
+    fits most members up to 2 extra times each on top of their final
+    projection fit (SARIMA's ~10-25s AIC grid search alone, up to 3x),
+    and lightgbm/catboost/ridge now ALSO tune their own hyperparameters
+    internally on every one of those fits (see _its_gbm()/_its_ridge()),
+    so budget noticeably more than a plain "all" mode run, not just
+    double.
     """
     members = [m for m in _ITS_METHODS if m != "ensemble"]
 
@@ -4082,6 +4288,12 @@ _ITS_METHODS = {
             "later steps — so a lag can never read a real during/post "
             "observation. lag7d is only populated once ≥7 days of pre-period "
             "history exist; shorter pre-periods still train on lag1d/lag2d. "
+            "HYPERPARAMETER TUNING: depth/learning_rate/n_estimators are "
+            "chosen from a small grid via a held-out slice of the "
+            "pre-period itself (see _tune_lag_hyperparams()), not fixed in "
+            "advance -- below 14 days of pre-period this has no effect "
+            "(too short to tune reliably) and the original fixed "
+            "configuration is used unchanged. "
             "Falls back to ARIMA if lightgbm isn't installed, seasonal naive "
             "if the pre-period is too short to fit. "
             "Minimum baseline: 14 days. Recommended: ≥30 days (so lag7d has "
@@ -4093,10 +4305,11 @@ _ITS_METHODS = {
         "min_days":    14,
         "description": (
             "Same lag1d/lag2d/lag7d + NDA-mean + calendar feature set as the "
-            "LightGBM method above (see its description for the rationale "
-            "and the recursive leak-avoidance projection scheme), fit with "
-            "CatBoost instead. CatBoost also handles missing lag values "
-            "natively. Falls back to ARIMA if catboost isn't installed, "
+            "LightGBM method above (see its description for the rationale, "
+            "the recursive leak-avoidance projection scheme, and the "
+            "hyperparameter tuning both share), fit with CatBoost instead. "
+            "CatBoost also handles missing lag values natively. Falls back "
+            "to ARIMA if catboost isn't installed, "
             "seasonal naive if the pre-period is too short to fit. "
             "Minimum baseline: 14 days. Recommended: ≥30 days."),
         "fn": _its_catboost,
@@ -4116,7 +4329,11 @@ _ITS_METHODS = {
             "explicitly reports Ridge improving alongside XGBoost/CatBoost/ "
             "LightGBM -- the benefit isn't tree-specific. Missing lag values "
             "(no native NaN handling in a linear model) are mean-imputed "
-            "from pre-period-only training statistics. Falls back to "
+            "from pre-period-only training statistics. HYPERPARAMETER "
+            "TUNING: the L2 regularization strength (alpha) is chosen from "
+            "a small grid via a held-out slice of the pre-period itself, "
+            "same mechanism and same <14-day no-op threshold as "
+            "LightGBM/CatBoost above. Falls back to "
             "seasonal naive if the pre-period is too short to fit. "
             "Minimum baseline: 7 days (lag7d needs at least one full week "
             "to ever be non-imputed). Cheapest lag-feature method to fit."),
@@ -4221,30 +4438,39 @@ _ITS_METHODS = {
         "min_days":    2,
         "description": (
             "Adaptive blend of every other registered method: backtests "
-            "each candidate on a held-out slice of the pre-period ITSELF "
-            "(never during/post data), drops any that backtested far worse "
-            "than the best one, and weights the survivors' real "
-            "full-pre-period projections proportional to 1/backtest-MAE. "
-            "Which methods get excluded and how the rest are weighted is "
-            "recomputed per-outage from that outage's own pre-period -- "
-            "not a fixed roster decided in advance. Falls back to an "
-            "unweighted per-timestamp MEDIAN of all members when the "
-            "pre-period is under 14 days (too short for a reliable "
-            "backtest split); median rather than mean there too, since a "
-            "mean lets a single badly-wrong member (fourier_trend/STL both "
-            "derail on a pre-period level shift -- see their own "
-            "descriptions) drag the whole blend toward it, while the "
-            "median can't be moved past the next-most-central projection "
-            "by one outlier. No single method dominated across the "
-            "pre-period/holdout-length combinations tested during "
+            "each candidate on up to 2 rolling-origin held-out windows of "
+            "the pre-period ITSELF (never during/post data), DE-DUPLICATES "
+            "members whose backtest predictions come out numerically "
+            "identical (several legitimately converge on the same "
+            "seasonal-mean answer on some pre-periods -- keeping every one "
+            "would dilute genuinely different members, not add diversity), "
+            "drops any survivor that backtested far worse than the best "
+            "one, and weights the rest proportional to "
+            "1/backtest-MAE-SQUARED -- a clearly-better member dominates "
+            "rather than getting averaged down toward the pack (plain "
+            "1/MAE weighting was tried first and measured too flat). "
+            "Which methods get excluded, which get treated as duplicates, "
+            "and how the rest are weighted is all recomputed per-outage "
+            "from that outage's own pre-period -- not a fixed roster "
+            "decided in advance. Falls back to an unweighted per-timestamp "
+            "MEDIAN of all members when the pre-period is under 14 days "
+            "(too short for a reliable backtest split); median rather than "
+            "mean there too, since a mean lets a single badly-wrong member "
+            "(fourier_trend/STL both derail on a pre-period level shift -- "
+            "see their own descriptions) drag the whole blend toward it, "
+            "while the median can't be moved past the next-most-central "
+            "projection by one outlier. No single method dominated across "
+            "the pre-period/holdout-length combinations tested during "
             "development (see CLAUDE.md's 'Backtested accuracy' note); "
             "this is meant to track whichever method actually suits a "
             "given outage's own history, without the user having to guess "
             "in advance. Not guaranteed best on every outage. By far the "
-            "slowest method to run -- the backtest step means most members "
-            "(SARIMA's ~10-25s AIC grid search included) get fit roughly "
-            "twice, on top of the survivors' final-projection fit -- budget "
-            "at least double a plain 'all' mode run. "
+            "slowest method to run -- rolling-origin backtesting fits most "
+            "members up to 2 extra times each (SARIMA's ~10-25s AIC grid "
+            "search alone, up to 3x total), and lightgbm/catboost/ridge "
+            "each tune their own hyperparameters internally on every one "
+            "of those fits too -- budget noticeably more than a plain "
+            "'all' mode run, not just double. "
             "Minimum baseline: 2 days (members below that threshold "
             "individually fall back further, same as running them alone; "
             "backtest weighting itself only activates at 14+ days)."),
