@@ -573,35 +573,73 @@ pytest test_pipeline.py -v
       of view. A caller building pre_agg/all_agg outside
       single_event_analysis() must do the same widening itself for these
       two methods to have anything to work with.
-    - ACCURACY REALITY CHECK (backtested the same pre-period-only way as
-      the "Backtested accuracy" note below, right after building these):
-      neither physics-informed method clearly beats a plain black-box
-      forecast of the same target on synthetic data. ram_identity vs
-      seasonal_naive-on-"ram" directly: 21.8 vs 19.6 MAE at 30 days, 14.9
-      vs 14.3 at 60 days, 20.5 vs 20.9 at 90 days — a wash, not a win.
-      ptdf_flow vs catboost-on-"fall" directly: 7.5 vs 7.5 at 20 days, 7.6
-      vs 7.4 at 40 days — ptdf_flow beats the generic methods
-      (seasonal_naive/arima/theta) but not a well-tuned single-target
-      catboost fit. Reason: both methods decompose one target into
-      several sub-series (7 components for RAM, 4 PTDF/net-position
-      series for flow), fit each independently, then combine — each
-      sub-fit's own estimation error adds up, sometimes outweighing
-      whatever the formula's structure buys back, whereas a single model
-      forecasting the target directly has fewer places for error to
-      accumulate and can implicitly pick up the same hour/dow structure
-      the physics formula encodes anyway. CONCLUSION: treat these two as
-      INTERPRETABILITY/CONSISTENCY tools first, accuracy tools second —
-      ram_identity's real value is that its output CANNOT contradict its
-      own components (useful for "RAM moved by X because fall moved by Y"
-      reporting), ptdf_flow's is that it self-validates rather than
-      silently trusting an unproven relationship — not that either is
-      expected to have the lowest MAE. This could look different on REAL
-      JAO data (if real components have genuine outage-driven divergence
-      from calendar patterns a black-box model would need much more data
-      to learn, the physics decomposition gets that structure for free
-      from the formula instead of having to discover it) — untested here
-      since this repo has no real JAO history, and worth re-checking once
-      real data is available rather than assuming either direction.
+    - ACCURACY REALITY CHECK, ROUND 1 (superseded by ROUND 2 below — kept
+      for the record since it's what drove the fix): the first backtest of
+      these methods found neither physics-informed method clearly beat a
+      plain black-box forecast of the same target. ram_identity vs
+      seasonal_naive-on-"ram": 21.8 vs 19.6 MAE at 30 days, 14.9 vs 14.3 at
+      60 days, 20.5 vs 20.9 at 90 days — a wash. Root cause, diagnosed by
+      reading synthetic.py's `generate_jao_csv()`: of the 7 RAM-identity
+      terms, only `fall` carried real predictable structure (diurnal +
+      weekly); `fmax`/`frm` were near-constant and `fnrao`/`amr`/`faac`/
+      `iva` were close to i.i.d. noise or rare unclustered spikes — nothing
+      for a decomposition to exploit that a direct forecast of "ram"
+      couldn't already get from the aggregate's own hour/dow pattern, so
+      splitting into 7 independently-fit sub-series just accumulated 7
+      sub-fits' worth of estimation error for no offsetting benefit. This
+      was a property of the TEST DATA, not a flaw in the decomposition
+      itself — see ROUND 2.
+    - ACCURACY REALITY CHECK, ROUND 2 (current): fixed by (1) giving
+      fnrao/amr/faac/iva genuine day-level persistence in synthetic.py (an
+      AR(1) "regime" component, mean-reverting, one value per calendar
+      day, broadcast to MTU resolution via `_ar1_day_regime()` — distinct
+      from the hour/dow pattern seasonal_naive/theta already see, since a
+      specific day's regime level is invisible to any method that only
+      conditions on (hour, weekday)), so there's now real signal for a
+      decomposition to actually exploit; and (2) re-picking
+      `_RAM_COMPONENT_METHOD` from an actual per-component backtest rather
+      than domain-story reasoning alone — this caught two real mistakes:
+      theta was ~2x worse than seasonal_naive on fnrao and consistently
+      worse than hurdle on the zero-inflated amr, and seasonal_naive
+      catastrophically mis-forecast frm (MAE 42.8 vs ridge's 2.2 at a
+      60-day pre-period) whenever the pre-period straddles the Dec-2024
+      structural step, because its (hour, dow) lookup table averages pre-
+      and post-step values into one contaminated mean while ridge's
+      lag1d/lag7d features track the current level instead (see
+      `_RAM_COMPONENT_METHOD`'s own comment in propagation.py for the full
+      per-component numbers). With both fixes, ram_identity vs
+      seasonal_naive/catboost-on-"ram" directly (single NO3 CNEC, 3
+      staggered pre-period start offsets averaged per length): at 30 days,
+      roughly tied (28.1 vs 28.4 seasonal_naive vs 28.0 catboost); at 60
+      days, ram_identity clearly wins (42.5 vs catboost 48.4 vs
+      seasonal_naive 53.6); at 90 days, ram_identity wins by a wide margin
+      (26.9 vs catboost 36.1 vs seasonal_naive 50.8) — the longer
+      pre-period lets both the day-regime signal accumulate and lets
+      ridge's frm fix matter more (more chances for the fit window to
+      straddle the Dec-2024 step). CONCLUSION (revised): on data where the
+      RAM identity's components actually carry genuine, exploitable
+      structure — which any real grid plausibly does, given real
+      operational/regulatory quantities aren't i.i.d. noise — the
+      decomposition is a genuine accuracy win at pre-periods of ~60+ days,
+      not merely an interpretability/consistency tool as ROUND 1
+      concluded. Still worth re-verifying against real JAO data once
+      available rather than assuming the synthetic result transfers
+      exactly, but this is no longer a "wash, so treat it as
+      interpretability-only" finding.
+    - ptdf_flow's own number is UNCHANGED by either round above (its input
+      — `fall`'s generation — wasn't touched): vs catboost-on-"fall"
+      directly, 7.5 vs 7.5 MAE at 20 days, 7.6 vs 7.4 at 40 days —
+      ptdf_flow beats the generic methods (seasonal_naive/arima/theta) but
+      not a well-tuned single-target catboost fit, and its own bottleneck
+      is different from ram_identity's (it's gated on `netpos_<ZONE>`
+      columns nothing has merged into synthetic.py's output yet, not on
+      the components lacking exploitable structure) — still best
+      understood as an interpretability/self-validation tool for now,
+      unlike ram_identity's now-demonstrated accuracy edge. Re-checking it
+      the same way ram_identity was re-checked here (give the synthetic
+      net-position series genuine day-level structure, per-zone) is a
+      natural next step if this method's accuracy specifically becomes a
+      priority.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by
