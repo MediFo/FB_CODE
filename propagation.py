@@ -5129,6 +5129,101 @@ def pre_period_abs_ptdf(pre_df: pd.DataFrame, ptdf_col: str) -> pd.Series:
     return pre_df[ptdf_col].abs().groupby(pre_df["cneName"]).mean()
 
 
+def estimate_price_spread(df: pd.DataFrame, cnec: str, ref_zone: str,
+                          ref_price: float, tgt_zone: str,
+                          timestamp, timestamp_tol_minutes: float = 1.0) -> dict:
+    """
+    Estimate a target bidding zone's day-ahead price from a KNOWN reference
+    zone's price, for ONE specific CNEC at ONE specific timestamp, using
+    the standard flow-based zonal price-decomposition identity:
+
+        price_target ≈ price_reference
+                        + shadowPrice_CNEC × (PTDF_target,CNEC − PTDF_reference,CNEC)
+
+    This is the textbook FBMC price-spread formula: a binding CNEC's
+    shadow price is the marginal €/MW value of relaxing its constraint,
+    and two zones' PTDF sensitivities on that same CNEC tell you how much
+    each zone's net position moves that CNEC's flow per MW — so the
+    product is that CNEC's own contribution to the price difference
+    between the two zones. This function computes exactly that ONE
+    contribution, from ONE CNEC — it is deliberately NOT a full zonal
+    price forecast, which would sum this same term over every binding
+    CNEC in the network (see the "CNEC scope" design choice recorded
+    alongside this function's caller in app_jao_NP_API_fix_d14.py's Tab 9
+    Single Event "Price Spread" pane).
+
+    `ref_zone`/`tgt_zone` are bare zone codes (e.g. "FI", "NO3") — this
+    function looks up `ptdf_<ref_zone>`/`ptdf_<tgt_zone>` columns. Refuses
+    (returns `ok=False`) rather than silently computing from missing data
+    if either PTDF column is absent, or is NaN on the matched row —
+    the same "validate before trusting the physics" posture
+    `_its_ptdf_flow()`'s own correlation gate uses elsewhere in this file.
+    Also refuses if `cnec` has no rows, or no row within
+    `timestamp_tol_minutes` of `timestamp` (handles float-precision/
+    string round-tripping on an otherwise-exact dropdown-selected
+    timestamp, without silently matching some other MTU far away in time).
+
+    Returns a dict, always carrying `ok`/`error`/`cnec`/`ref_zone`/
+    `tgt_zone`/`ref_price`; on success (`ok=True`) also carries
+    `matched_timestamp`, `shadow_price`, `ptdf_ref`, `ptdf_tgt`,
+    `ptdf_diff`, `price_spread`, `target_price_estimate`.
+    """
+    result = {"ok": False, "error": None, "cnec": cnec,
+              "ref_zone": ref_zone, "tgt_zone": tgt_zone,
+              "ref_price": ref_price}
+
+    sub = df[df["cneName"] == cnec] if "cneName" in df.columns else df.iloc[0:0]
+    if sub.empty:
+        result["error"] = f"No rows found for CNEC {cnec!r}."
+        return result
+
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    dt_diff = (sub["dateTimeUtc"] - ts).abs()
+    idx_nearest = dt_diff.idxmin()
+    if dt_diff.loc[idx_nearest] > pd.Timedelta(minutes=timestamp_tol_minutes):
+        result["error"] = (
+            f"No row for CNEC {cnec!r} within {timestamp_tol_minutes} "
+            f"minute(s) of {ts} (nearest available: "
+            f"{sub['dateTimeUtc'].loc[idx_nearest]}).")
+        return result
+    row = sub.loc[idx_nearest]
+
+    ptdf_ref_col = f"ptdf_{ref_zone}"
+    ptdf_tgt_col = f"ptdf_{tgt_zone}"
+    missing = [c for c in (ptdf_ref_col, ptdf_tgt_col)
+              if c not in sub.columns or pd.isna(row.get(c))]
+    if missing:
+        result["error"] = (
+            f"Missing PTDF data for this CNEC/timestamp: {', '.join(missing)}. "
+            f"Refusing to estimate a price spread from partial physics data.")
+        return result
+
+    sp_col = "shadowPrice_clean" if "shadowPrice_clean" in sub.columns else "shadowPrice"
+    if sp_col not in sub.columns or pd.isna(row.get(sp_col)):
+        result["error"] = f"Missing {sp_col!r} for this CNEC/timestamp."
+        return result
+
+    shadow_price = float(row[sp_col])
+    ptdf_ref = float(row[ptdf_ref_col])
+    ptdf_tgt = float(row[ptdf_tgt_col])
+    ptdf_diff = ptdf_tgt - ptdf_ref
+    price_spread = shadow_price * ptdf_diff
+
+    result.update(
+        ok=True,
+        matched_timestamp=row["dateTimeUtc"],
+        shadow_price=shadow_price,
+        ptdf_ref=ptdf_ref,
+        ptdf_tgt=ptdf_tgt,
+        ptdf_diff=ptdf_diff,
+        price_spread=price_spread,
+        target_price_estimate=ref_price + price_spread,
+    )
+    return result
+
+
 def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
                            baseline_days: int = 7,
                            post_days: int = 3,

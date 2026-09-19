@@ -2718,6 +2718,14 @@ class App:
         if self._ma_fig_single is not None and self._ma_canvas_single is not None:
             self._ma_fig_single.clear(); self._ma_canvas_single.draw()
         self._ma_fig_decomp.clear(); self._ma_canvas_decomp.draw()
+        self._ma_spread_cnec.config(values=[]); self._ma_spread_cnec.set('')
+        self._ma_spread_ref_zone.config(values=[]); self._ma_spread_ref_zone.set('')
+        self._ma_spread_tgt_zone.config(values=[]); self._ma_spread_tgt_zone.set('')
+        self._ma_spread_ts.config(values=[]); self._ma_spread_ts.set('')
+        self._ma_spread_all_ts_values = []
+        self._ma_spread_result_txt.config(state='normal')
+        self._ma_spread_result_txt.delete('1.0', tk.END)
+        self._ma_spread_result_txt.config(state='disabled')
         self._ma_setup_status.config(text="All data cleared. Apply Setup to reload.",
                                      foreground=C_AMBER)
 
@@ -3807,6 +3815,206 @@ class App:
         ct_hsb.grid(row=1, column=0, sticky='ew')
         self._ma_cnec_tree.grid(row=0, column=0, sticky='nsew')
 
+        # Price Spread tab -- optional "result": given a KNOWN price in one
+        # zone, estimate another zone's price via the standard FBMC
+        # price-decomposition identity for ONE CNEC:
+        #   price_target = price_reference
+        #                  + shadowPrice_CNEC * (PTDF_target - PTDF_reference)
+        # Backed by propagation.estimate_price_spread(). Scoped to the
+        # CURRENTLY analysed event on purpose (CNEC/timestamp choices are
+        # populated from this event's own window, not the whole dataset) --
+        # this is a single-CNEC "what does this one constraint contribute"
+        # estimate, not a full zonal price forecast (see that function's
+        # own docstring for why summing over every binding CNEC would be
+        # the fuller version of this, and MAINTENANCE_TAB_GUIDE.md).
+        sf5 = ttk.Frame(snb, style='Card.TFrame')
+        snb.add(sf5, text='  Price Spread  ')
+        sf5.columnconfigure(0, weight=1)
+
+        ctrl5 = ttk.LabelFrame(
+            sf5, text=" Estimate a target zone's price from a reference "
+                      "zone's known price (one CNEC) ", padding=10)
+        ctrl5.grid(row=0, column=0, sticky='ew', padx=8, pady=8)
+        ctrl5.columnconfigure(1, weight=1)
+
+        ttk.Label(ctrl5, text="CNEC:").grid(row=0, column=0, sticky='w')
+        self._ma_spread_cnec = ttk.Combobox(ctrl5, width=42, state='readonly')
+        self._ma_spread_cnec.grid(row=0, column=1, columnspan=3, sticky='ew', padx=6)
+        self._ma_spread_cnec.bind(
+            '<<ComboboxSelected>>', lambda e: self._ma_refresh_spread_timestamps())
+
+        ttk.Label(ctrl5, text="Reference zone:").grid(row=1, column=0, sticky='w', pady=(8, 0))
+        self._ma_spread_ref_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
+        self._ma_spread_ref_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
+        ttk.Label(ctrl5, text="Reference price (currency/MWh):").grid(
+            row=1, column=2, sticky='w', padx=(16, 0), pady=(8, 0))
+        self._ma_spread_ref_price = ttk.Entry(ctrl5, width=10)
+        self._ma_spread_ref_price.insert(0, "40.0")
+        self._ma_spread_ref_price.grid(row=1, column=3, sticky='w', padx=6, pady=(8, 0))
+
+        ttk.Label(ctrl5, text="Target zone:").grid(row=2, column=0, sticky='w', pady=(6, 0))
+        self._ma_spread_tgt_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
+        self._ma_spread_tgt_zone.grid(row=2, column=1, sticky='w', padx=6, pady=(6, 0))
+
+        ttk.Label(ctrl5, text="Timestamp (UTC):").grid(row=3, column=0, sticky='w', pady=(6, 0))
+        self._ma_spread_all_ts_values = []
+        self._ma_spread_ts = ttk.Combobox(ctrl5, width=28)
+        self._ma_spread_ts.grid(row=3, column=1, columnspan=2, sticky='w', padx=6, pady=(6, 0))
+        self._ma_spread_ts.bind('<KeyRelease>', self._ma_filter_spread_ts)
+        ttk.Label(ctrl5, text="(from this event's pre/during/post window; type to search)",
+                  style='Muted.TLabel').grid(row=3, column=3, sticky='w', pady=(6, 0))
+
+        ttk.Button(ctrl5, text="Estimate", style='Accent.TButton',
+                   command=self._ma_run_price_spread).grid(
+            row=4, column=0, sticky='w', pady=(10, 0))
+
+        det5 = tk.Frame(sf5, bg=C_INK)
+        det5.grid(row=1, column=0, sticky='nsew', padx=8, pady=(0, 8))
+        sf5.rowconfigure(1, weight=1)
+        self._ma_spread_result_txt = tk.Text(
+            det5, font=FONT_MONO, background=C_INK, foreground=C_TINT,
+            relief='flat', borderwidth=0, padx=10, pady=8, height=12, state='disabled')
+        sb5 = tk.Scrollbar(det5, command=self._ma_spread_result_txt.yview, bg='#18181B')
+        self._ma_spread_result_txt.config(yscrollcommand=sb5.set)
+        sb5.pack(side=tk.RIGHT, fill=tk.Y)
+        self._ma_spread_result_txt.pack(fill=tk.BOTH, expand=True)
+
+    def _ma_refresh_spread_controls(self, res):
+        """Populate the Price Spread pane's CNEC/zone/timestamp pickers from
+        the event that was JUST analysed -- called from _ma_single_done().
+        CNECs come from this event's own per-CNEC table (not the whole
+        dataset), zones come from whichever ptdf_<ZONE> columns are actually
+        present (never a hardcoded zone list -- real JAO exports don't all
+        carry the same zones), and timestamps come from this event's own
+        pre/during/post window for the FIRST of those CNECs so the dropdown
+        starts non-empty without requiring a CNEC pick first."""
+        cnec_df = res.get('cnec_table')
+        cnecs = (sorted(str(c) for c in cnec_df['cnec'].dropna().unique())
+                if cnec_df is not None and not cnec_df.empty and 'cnec' in cnec_df.columns
+                else [])
+        self._ma_spread_cnec.config(values=cnecs)
+        if cnecs:
+            self._ma_spread_cnec.set(cnecs[0])
+        else:
+            self._ma_spread_cnec.set('')
+
+        zones = []
+        if self._ma_jao_df is not None:
+            zones = sorted(c[len('ptdf_'):] for c in self._ma_jao_df.columns
+                           if c.startswith('ptdf_'))
+        self._ma_spread_ref_zone.config(values=zones)
+        self._ma_spread_tgt_zone.config(values=zones)
+        if zones:
+            self._ma_spread_ref_zone.set(zones[0])
+            self._ma_spread_tgt_zone.set(zones[-1])
+
+        self._ma_refresh_spread_timestamps()
+
+    def _ma_refresh_spread_timestamps(self):
+        """(Re)populate the timestamp combobox for whichever CNEC is
+        currently selected, scoped to the analysed event's own
+        pre/during/post window (derived from the 'its' DataFrame's own
+        timestamp range, which already spans that window for whichever
+        columns were computed) rather than that CNEC's entire history."""
+        self._ma_spread_all_ts_values = []
+        res = getattr(self, '_ma_single_res', None)
+        cnec = self._ma_spread_cnec.get().strip()
+        if (not res or not cnec or self._ma_jao_df is None
+                or 'cneName' not in self._ma_jao_df.columns):
+            self._ma_spread_ts.config(values=[])
+            return
+        its = res.get('its')
+        if its is None or its.empty or 'dateTimeUtc' not in its.columns:
+            self._ma_spread_ts.config(values=[])
+            return
+        t0, t1 = its['dateTimeUtc'].min(), its['dateTimeUtc'].max()
+        sub = self._ma_jao_df[
+            (self._ma_jao_df['cneName'] == cnec) &
+            (self._ma_jao_df['dateTimeUtc'] >= t0) &
+            (self._ma_jao_df['dateTimeUtc'] <= t1)]
+        values = sorted(ts.isoformat() for ts in sub['dateTimeUtc'].dropna().unique())
+        self._ma_spread_all_ts_values = values
+        self._ma_spread_ts.config(values=values)
+        if values:
+            self._ma_spread_ts.set(values[0])
+
+    def _ma_filter_spread_ts(self, event=None):
+        """Type-to-filter for the timestamp combobox, same pattern as
+        _ma_filter_target_cnec."""
+        if event is not None and event.keysym in (
+                'Up', 'Down', 'Left', 'Right', 'Return', 'KP_Enter',
+                'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R'):
+            return
+        typed = self._ma_spread_ts.get().strip().lower()
+        all_values = self._ma_spread_all_ts_values
+        filtered = all_values if not typed else [v for v in all_values if typed in v.lower()]
+        self._ma_spread_ts['values'] = filtered
+        if filtered:
+            try:
+                self._ma_spread_ts.event_generate('<Down>')
+            except tk.TclError:
+                pass
+
+    def _ma_run_price_spread(self):
+        if not self._prop:
+            messagebox.showerror("Price Spread", self._prop_not_loaded_message())
+            return
+        if self._ma_jao_df is None:
+            messagebox.showwarning("Price Spread", "Apply Setup first.")
+            return
+        cnec = self._ma_spread_cnec.get().strip()
+        ref_zone = self._ma_spread_ref_zone.get().strip()
+        tgt_zone = self._ma_spread_tgt_zone.get().strip()
+        ts_raw = self._ma_spread_ts.get().strip()
+        if not (cnec and ref_zone and tgt_zone and ts_raw):
+            messagebox.showwarning(
+                "Price Spread",
+                "Select a CNEC, reference zone, target zone, and timestamp "
+                "(run Single Event analysis first to populate these).")
+            return
+        try:
+            ref_price = float(self._ma_spread_ref_price.get().strip())
+        except ValueError:
+            messagebox.showerror("Price Spread", "Reference price must be a number.")
+            return
+        import pandas as pd
+        try:
+            ts = pd.Timestamp(ts_raw)
+        except (ValueError, TypeError):
+            messagebox.showerror("Price Spread", f"Could not parse timestamp: {ts_raw!r}")
+            return
+
+        r = self._prop.estimate_price_spread(
+            self._ma_jao_df, cnec, ref_zone, ref_price, tgt_zone, ts)
+
+        self._ma_spread_result_txt.config(state='normal')
+        self._ma_spread_result_txt.delete('1.0', tk.END)
+        if not r["ok"]:
+            self._ma_spread_result_txt.insert(tk.END, f"Could not estimate: {r['error']}")
+        else:
+            lines = [
+                f"CNEC:              {r['cnec']}",
+                f"Matched timestamp: {r['matched_timestamp']}",
+                "",
+                f"Reference zone:    {r['ref_zone']}   price = {r['ref_price']:.2f}",
+                f"Target zone:       {r['tgt_zone']}",
+                "",
+                f"Shadow price (this CNEC):      {r['shadow_price']:.4f}",
+                f"PTDF[{r['ref_zone']}]:{'':<{max(1, 14-len(r['ref_zone']))}}{r['ptdf_ref']:+.5f}",
+                f"PTDF[{r['tgt_zone']}]:{'':<{max(1, 14-len(r['tgt_zone']))}}{r['ptdf_tgt']:+.5f}",
+                f"PTDF difference (target - reference): {r['ptdf_diff']:+.5f}",
+                "",
+                f"Price spread from this CNEC:  {r['price_spread']:+.4f}",
+                f"Estimated target zone price:  {r['target_price_estimate']:.2f}",
+                "",
+                "This is ONE CNEC's contribution to the price difference "
+                "between the two zones, not a full zonal price forecast --",
+                "the real difference is the sum of this term over every "
+                "binding CNEC connecting the two zones.",
+            ]
+            self._ma_spread_result_txt.insert(tk.END, "\n".join(lines))
+        self._ma_spread_result_txt.config(state='disabled')
+
     def _ma_refresh_single_list(self):
         if self._ma_outages_df is not None and not self._ma_outages_df.empty:
             ids = self._ma_outages_df['outage_id'].dropna().unique().tolist()
@@ -4161,6 +4369,9 @@ class App:
                     else:
                         vals.append(str(v)[:50])
                 self._ma_cnec_tree.insert('', tk.END, values=vals)
+
+        # ── Price Spread tab controls ────────────────────────────────
+        self._ma_refresh_spread_controls(res)
 
         # Switch to Summary sub-tab automatically
         self._ma_single_nb.select(0)

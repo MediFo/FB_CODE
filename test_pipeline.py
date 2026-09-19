@@ -39,7 +39,7 @@ from propagation import (
     summarize_hypotheses, PipelineConfig, run_pipeline,
     DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str, jao_datetime_to_utc,
     build_event_time_dummies, run_event_study,
-    single_event_analysis, pre_period_abs_ptdf,
+    single_event_analysis, pre_period_abs_ptdf, estimate_price_spread,
     build_report_ctx, run_nordic_matrix, render_nordic_matrix_report,
     NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
     fetch_entsoe_outages,
@@ -1172,6 +1172,83 @@ class TestPrePeriodAbsPtdf:
     def test_missing_column_returns_empty(self):
         df = pd.DataFrame({"cneName": ["A"], "other_col": [1.0]})
         assert pre_period_abs_ptdf(df, "ptdf_FI").empty
+
+
+# ── 16b. Price spread estimator (single-CNEC FBMC price decomposition) ───────
+
+class TestEstimatePriceSpread:
+    """price_target = price_reference + shadowPrice_CNEC * (PTDF_target - PTDF_reference),
+    for one CNEC at one timestamp -- the Tab 9 Single Event "Price Spread"
+    pane's backing function."""
+
+    def _df(self):
+        ts = pd.to_datetime(["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z",
+                             "2025-01-01T00:30:00Z"])
+        return pd.DataFrame({
+            "cneName": ["X", "X", "X"],
+            "dateTimeUtc": ts,
+            "shadowPrice": [0.0, 25.0, 0.0],
+            "ptdf_FI":  [-0.05, -0.05, -0.05],
+            "ptdf_NO3": [0.30, 0.30, 0.30],
+        })
+
+    def test_computes_expected_spread_and_target_price(self):
+        df = self._df()
+        ts = df["dateTimeUtc"].iloc[1]
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", ts)
+        assert r["ok"] is True
+        expected_spread = 25.0 * (0.30 - (-0.05))
+        assert r["price_spread"] == pytest.approx(expected_spread)
+        assert r["target_price_estimate"] == pytest.approx(40.0 + expected_spread)
+
+    def test_zero_shadow_price_gives_zero_spread(self):
+        df = self._df()
+        ts = df["dateTimeUtc"].iloc[0]
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", ts)
+        assert r["ok"] is True
+        assert r["price_spread"] == pytest.approx(0.0)
+        assert r["target_price_estimate"] == pytest.approx(40.0)
+
+    def test_missing_cnec_refuses(self):
+        r = estimate_price_spread(self._df(), "NOT_A_CNEC", "FI", 40.0, "NO3",
+                                  self._df()["dateTimeUtc"].iloc[0])
+        assert r["ok"] is False
+        assert "No rows" in r["error"]
+
+    def test_missing_ptdf_column_refuses(self):
+        df = self._df()
+        r = estimate_price_spread(df, "X", "FI", 40.0, "SE3",
+                                  df["dateTimeUtc"].iloc[0])
+        assert r["ok"] is False
+        assert "ptdf_SE3" in r["error"]
+
+    def test_nan_ptdf_value_refuses(self):
+        df = self._df()
+        df.loc[1, "ptdf_NO3"] = float("nan")
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3",
+                                  df["dateTimeUtc"].iloc[1])
+        assert r["ok"] is False
+        assert "ptdf_NO3" in r["error"]
+
+    def test_timestamp_outside_tolerance_refuses(self):
+        df = self._df()
+        far_ts = df["dateTimeUtc"].iloc[0] + pd.Timedelta(days=1)
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", far_ts)
+        assert r["ok"] is False
+        assert "No row" in r["error"]
+
+    def test_timestamp_within_tolerance_snaps_to_nearest(self):
+        df = self._df()
+        near_ts = df["dateTimeUtc"].iloc[1] + pd.Timedelta(seconds=10)
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", near_ts)
+        assert r["ok"] is True
+        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[1]
+
+    def test_naive_timestamp_treated_as_utc(self):
+        df = self._df()
+        naive_ts = df["dateTimeUtc"].iloc[1].tz_localize(None)
+        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", naive_ts)
+        assert r["ok"] is True
 
 
 # ── 17. Recovery direction (magnitude-blind metric fix) ───────────────────────

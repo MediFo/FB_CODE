@@ -138,15 +138,16 @@ Event's.
 
 ### 3.6 Single Event
 
-The richest sub-tab, and the only one with its own inner notebook (4
-panes: Summary, ITS, ΔRAM decomposition, DiD, Per-CNEC table). One call
-does all the work: `propagation.single_event_analysis()`, given the
-selected outage row, baseline/post-event day counts, and an ITS method
-key. The method dropdown is built directly from
-`propagation.ITS_METHOD_NAMES` (plus a synthetic `"all"` entry) — see
-`TUTORIAL.md` Chapter 21 for what each of the 15 methods actually does;
-this tab doesn't add any method-selection logic of its own, it's a thin
-UI over the same catalog `dashboard.py`'s Single Event tab uses.
+The richest sub-tab, and the only one with its own inner notebook (6
+panes: Summary, ITS, ΔRAM decomposition, DiD, Per-CNEC table, Price
+Spread). One call does all the work for the first 5: `propagation
+.single_event_analysis()`, given the selected outage row,
+baseline/post-event day counts, and an ITS method key. The method
+dropdown is built directly from `propagation.ITS_METHOD_NAMES` (plus a
+synthetic `"all"` entry) — see `TUTORIAL.md` Chapter 21 for what each of
+the 15 methods actually does; this tab doesn't add any method-selection
+logic of its own, it's a thin UI over the same catalog `dashboard.py`'s
+Single Event tab uses.
 
 What each pane reads from `single_event_analysis()`'s return dict:
 
@@ -157,12 +158,52 @@ What each pane reads from `single_event_analysis()`'s return dict:
 | ΔRAM decomposition | `decomp` | Horizontal bar chart, one bar per RAM-identity term's average MW contribution |
 | DiD | `did`, `did_estimates` | High-\|PTDF_FI\| CNECs (treatment) vs low (control); ATT = (high_during−high_pre) − (low_during−low_pre) |
 | Per-CNEC table | `cnec_table` | Per-CNEC pre/during/Δ for f0, ram, shadowPrice |
+| Price Spread | `cnec_table` (for the CNEC list) + `its` (for the timestamp window) | **Not** part of `single_event_analysis()`'s own output — see below |
 
 Runs in a background thread (`_ma_single_thread`), same reentrancy guard
 pattern as Run Analysis. Rows with a null/blank `cneName` are dropped
 before the call — a defensive fix for `sorted(cneName.unique())` crashing
 on a mixed float/str column, which is a real shape real JAO exports can
 have.
+
+**Price Spread pane (optional, added after the rest of this tab).** Given
+a reference zone's known price, a target zone, one CNEC, and a
+timestamp, estimates the target zone's price via the standard FBMC
+zone-to-zone price-decomposition identity for that ONE CNEC:
+
+```
+price_target ≈ price_reference + shadowPrice_CNEC × (PTDF_target,CNEC − PTDF_reference,CNEC)
+```
+
+Backed by `propagation.estimate_price_spread(df, cnec, ref_zone,
+ref_price, tgt_zone, timestamp)` — a small, standalone, unit-tested
+function (`TestEstimatePriceSpread` in `test_pipeline.py`), independent
+of `single_event_analysis()`. It is deliberately **not** a full zonal
+price forecast: it's ONE CNEC's contribution only, not a sum over every
+binding CNEC between the two zones (see the design note in that
+function's own docstring, and its call site's comment in
+`_ma_build_single()`, for why that scope was chosen over the fuller
+sum-over-all-CNECs version). The result pane says so explicitly, every
+time.
+
+The CNEC/zone/timestamp pickers are populated from the **currently
+analysed event**, not the whole dataset: CNECs come from that event's own
+`cnec_table`; zones come from whichever `ptdf_<ZONE>` columns actually
+exist in the loaded data (discovered dynamically, never a hardcoded zone
+list — real JAO exports don't all carry the same zones); timestamps come
+from that CNEC's rows within the event's own pre/during/post window
+(derived from `its['dateTimeUtc']`'s min/max). This means the pane is
+empty until at least one Single Event analysis has completed —
+`_ma_refresh_spread_controls()` is called at the end of `_ma_single_done()`
+specifically to populate it.
+
+`propagation.estimate_price_spread()` **refuses** (returns `ok=False`
+with an explanatory `error` string, shown directly in the result pane)
+rather than computing from partial data, in three cases: the CNEC has no
+rows at all, neither zone's `ptdf_<ZONE>` column exists (or is `NaN` on
+the matched row), or no row exists within 1 minute of the requested
+timestamp. This mirrors `_its_ptdf_flow()`'s own "validate before
+trusting the physics" posture elsewhere in `propagation.py`.
 
 ### 3.7 Explain
 
