@@ -2719,7 +2719,6 @@ class App:
             self._ma_fig_single.clear(); self._ma_canvas_single.draw()
         self._ma_fig_decomp.clear(); self._ma_canvas_decomp.draw()
         self._ma_spread_cnec.config(values=[]); self._ma_spread_cnec.set('')
-        self._ma_spread_ref_zone.config(values=[]); self._ma_spread_ref_zone.set('')
         self._ma_spread_tgt_zone.config(values=[]); self._ma_spread_tgt_zone.set('')
         self._ma_spread_ts.config(values=[]); self._ma_spread_ts.set('')
         self._ma_spread_all_ts_values = []
@@ -3815,25 +3814,30 @@ class App:
         ct_hsb.grid(row=1, column=0, sticky='ew')
         self._ma_cnec_tree.grid(row=0, column=0, sticky='nsew')
 
-        # Price Spread tab -- optional "result": given a KNOWN price in one
-        # zone, estimate another zone's price via the standard FBMC
-        # price-decomposition identity for ONE CNEC:
-        #   price_target = price_reference
-        #                  + shadowPrice_CNEC * (PTDF_target - PTDF_reference)
-        # Backed by propagation.estimate_price_spread(). Scoped to the
-        # CURRENTLY analysed event on purpose (CNEC/timestamp choices are
-        # populated from this event's own window, not the whole dataset) --
-        # this is a single-CNEC "what does this one constraint contribute"
-        # estimate, not a full zonal price forecast (see that function's
-        # own docstring for why summing over every binding CNEC would be
-        # the fuller version of this, and MAINTENANCE_TAB_GUIDE.md).
+        # Price Spread tab -- optional "result": how much has this CNEC's
+        # contribution to a TARGET zone's price moved, at one timestamp,
+        # relative to what it would have been without the outage --
+        #   impact = (shadowPrice_actual * PTDF_target_actual)
+        #            - (shadowPrice_cf   * PTDF_target_cf)
+        # where "_cf" is the ITS counterfactual (Y(0), fit on this event's
+        # own pre-period) for BOTH shadow price and PTDF. An earlier design
+        # compared this CNEC's contribution to TWO zones' prices at once
+        # (needing a user-typed reference-zone price as an anchor); this
+        # answers a different, better-fitting question -- how the OUTAGE
+        # changed this CNEC's effect on ONE zone -- so there's no reference
+        # zone/price here at all, see propagation.estimate_cnec_price_impact()'s
+        # own docstring for the full reasoning. Backed by that function.
+        # Scoped to the CURRENTLY analysed event on purpose (CNEC/timestamp
+        # choices come from this event's own window, and the counterfactual
+        # method reuses whatever's picked in the "Counterfactual model"
+        # selector above) -- see MAINTENANCE_TAB_GUIDE.md.
         sf5 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf5, text='  Price Spread  ')
         sf5.columnconfigure(0, weight=1)
 
         ctrl5 = ttk.LabelFrame(
-            sf5, text=" Estimate a target zone's price from a reference "
-                      "zone's known price (one CNEC) ", padding=10)
+            sf5, text=" This CNEC's price impact on a target zone "
+                      "(actual vs. counterfactual) ", padding=10)
         ctrl5.grid(row=0, column=0, sticky='ew', padx=8, pady=8)
         ctrl5.columnconfigure(1, weight=1)
 
@@ -3843,30 +3847,26 @@ class App:
         self._ma_spread_cnec.bind(
             '<<ComboboxSelected>>', lambda e: self._ma_refresh_spread_timestamps())
 
-        ttk.Label(ctrl5, text="Reference zone:").grid(row=1, column=0, sticky='w', pady=(8, 0))
-        self._ma_spread_ref_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
-        self._ma_spread_ref_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
-        ttk.Label(ctrl5, text="Reference price (currency/MWh):").grid(
-            row=1, column=2, sticky='w', padx=(16, 0), pady=(8, 0))
-        self._ma_spread_ref_price = ttk.Entry(ctrl5, width=10)
-        self._ma_spread_ref_price.insert(0, "40.0")
-        self._ma_spread_ref_price.grid(row=1, column=3, sticky='w', padx=6, pady=(8, 0))
-
-        ttk.Label(ctrl5, text="Target zone:").grid(row=2, column=0, sticky='w', pady=(6, 0))
+        ttk.Label(ctrl5, text="Target zone:").grid(row=1, column=0, sticky='w', pady=(8, 0))
         self._ma_spread_tgt_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
-        self._ma_spread_tgt_zone.grid(row=2, column=1, sticky='w', padx=6, pady=(6, 0))
+        self._ma_spread_tgt_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
 
-        ttk.Label(ctrl5, text="Timestamp (UTC):").grid(row=3, column=0, sticky='w', pady=(6, 0))
+        ttk.Label(ctrl5, text="Timestamp (UTC):").grid(row=2, column=0, sticky='w', pady=(6, 0))
         self._ma_spread_all_ts_values = []
         self._ma_spread_ts = ttk.Combobox(ctrl5, width=28)
-        self._ma_spread_ts.grid(row=3, column=1, columnspan=2, sticky='w', padx=6, pady=(6, 0))
+        self._ma_spread_ts.grid(row=2, column=1, columnspan=2, sticky='w', padx=6, pady=(6, 0))
         self._ma_spread_ts.bind('<KeyRelease>', self._ma_filter_spread_ts)
         ttk.Label(ctrl5, text="(from this event's pre/during/post window; type to search)",
-                  style='Muted.TLabel').grid(row=3, column=3, sticky='w', pady=(6, 0))
+                  style='Muted.TLabel').grid(row=2, column=3, sticky='w', pady=(6, 0))
 
-        ttk.Button(ctrl5, text="Estimate", style='Accent.TButton',
+        ttk.Button(ctrl5, text="Estimate Impact", style='Accent.TButton',
                    command=self._ma_run_price_spread).grid(
-            row=4, column=0, sticky='w', pady=(10, 0))
+            row=3, column=0, sticky='w', pady=(10, 0))
+        ttk.Label(ctrl5, text="Uses this event's own pre-period as the "
+                             "counterfactual baseline, and the same "
+                             "counterfactual model selected above.",
+                  style='Muted.TLabel').grid(
+            row=3, column=1, columnspan=3, sticky='w', pady=(10, 0))
 
         det5 = tk.Frame(sf5, bg=C_INK)
         det5.grid(row=1, column=0, sticky='nsew', padx=8, pady=(0, 8))
@@ -3902,11 +3902,9 @@ class App:
         if self._ma_jao_df is not None:
             zones = sorted(c[len('ptdf_'):] for c in self._ma_jao_df.columns
                            if c.startswith('ptdf_'))
-        self._ma_spread_ref_zone.config(values=zones)
         self._ma_spread_tgt_zone.config(values=zones)
         if zones:
-            self._ma_spread_ref_zone.set(zones[0])
-            self._ma_spread_tgt_zone.set(zones[-1])
+            self._ma_spread_tgt_zone.set(zones[0])
 
         self._ma_refresh_spread_timestamps()
 
@@ -3962,20 +3960,21 @@ class App:
         if self._ma_jao_df is None:
             messagebox.showwarning("Price Spread", "Apply Setup first.")
             return
+        res = getattr(self, '_ma_single_res', None)
+        if not res or not res.get('summary', {}).get('start_utc'):
+            messagebox.showwarning(
+                "Price Spread", "Run Single Event analysis first — the "
+                "outage's own start time is used as the counterfactual "
+                "pre-period cutoff.")
+            return
         cnec = self._ma_spread_cnec.get().strip()
-        ref_zone = self._ma_spread_ref_zone.get().strip()
         tgt_zone = self._ma_spread_tgt_zone.get().strip()
         ts_raw = self._ma_spread_ts.get().strip()
-        if not (cnec and ref_zone and tgt_zone and ts_raw):
+        if not (cnec and tgt_zone and ts_raw):
             messagebox.showwarning(
                 "Price Spread",
-                "Select a CNEC, reference zone, target zone, and timestamp "
-                "(run Single Event analysis first to populate these).")
-            return
-        try:
-            ref_price = float(self._ma_spread_ref_price.get().strip())
-        except ValueError:
-            messagebox.showerror("Price Spread", "Reference price must be a number.")
+                "Select a CNEC, target zone, and timestamp (run Single "
+                "Event analysis first to populate these).")
             return
         import pandas as pd
         try:
@@ -3983,34 +3982,54 @@ class App:
         except (ValueError, TypeError):
             messagebox.showerror("Price Spread", f"Could not parse timestamp: {ts_raw!r}")
             return
+        try:
+            pre_end = pd.Timestamp(res['summary']['start_utc'])
+        except (ValueError, TypeError):
+            messagebox.showerror(
+                "Price Spread",
+                f"Could not parse this event's start time: "
+                f"{res['summary']['start_utc']!r}")
+            return
 
-        r = self._prop.estimate_price_spread(
-            self._ma_jao_df, cnec, ref_zone, ref_price, tgt_zone, ts)
+        # Reuse whichever counterfactual model is selected above (the same
+        # one Single Event's own ITS run used) -- "all" isn't a real,
+        # fittable method on its own, so fall back to the default in that
+        # case.
+        label = self._ma_its_method_var.get()
+        its_method = self._ma_its_method_map.get(label, "seasonal_naive")
+        if its_method == "all":
+            its_method = self._prop.ITS_DEFAULT_METHOD
+
+        r = self._prop.estimate_cnec_price_impact(
+            self._ma_jao_df, cnec, tgt_zone, pre_end, ts, its_method=its_method)
 
         self._ma_spread_result_txt.config(state='normal')
         self._ma_spread_result_txt.delete('1.0', tk.END)
         if not r["ok"]:
             self._ma_spread_result_txt.insert(tk.END, f"Could not estimate: {r['error']}")
         else:
+            sign = "+" if r['impact'] >= 0 else ""
             lines = [
-                f"CNEC:              {r['cnec']}",
-                f"Matched timestamp: {r['matched_timestamp']}",
+                f"CNEC:               {r['cnec']}",
+                f"Target zone:        {r['tgt_zone']}",
+                f"Matched timestamp:  {r['matched_timestamp']}",
+                f"Counterfactual model: {r['its_method']}"
+                f"  (pre-period ends at this event's outage start, {pre_end})",
                 "",
-                f"Reference zone:    {r['ref_zone']}   price = {r['ref_price']:.2f}",
-                f"Target zone:       {r['tgt_zone']}",
+                f"{'':22s}{'Actual':>14s}{'Counterfactual':>18s}",
+                f"Shadow price:       {r['shadow_price_actual']:>14.4f}{r['shadow_price_cf']:>18.4f}",
+                f"PTDF[{tgt_zone}]:{'':<{max(1, 15-len(tgt_zone))}}{r['ptdf_target_actual']:>14.5f}{r['ptdf_target_cf']:>18.5f}",
                 "",
-                f"Shadow price (this CNEC):      {r['shadow_price']:.4f}",
-                f"PTDF[{r['ref_zone']}]:{'':<{max(1, 14-len(r['ref_zone']))}}{r['ptdf_ref']:+.5f}",
-                f"PTDF[{r['tgt_zone']}]:{'':<{max(1, 14-len(r['tgt_zone']))}}{r['ptdf_tgt']:+.5f}",
-                f"PTDF difference (target - reference): {r['ptdf_diff']:+.5f}",
+                f"Contribution to {tgt_zone}'s price (shadowPrice x PTDF):",
+                f"  actual:          {r['actual_contribution']:+.4f}",
+                f"  counterfactual:  {r['counterfactual_contribution']:+.4f}",
                 "",
-                f"Price spread from this CNEC:  {r['price_spread']:+.4f}",
-                f"Estimated target zone price:  {r['target_price_estimate']:.2f}",
+                f"IMPACT (actual - counterfactual):  {sign}{r['impact']:.4f}",
                 "",
-                "This is ONE CNEC's contribution to the price difference "
-                "between the two zones, not a full zonal price forecast --",
-                "the real difference is the sum of this term over every "
-                "binding CNEC connecting the two zones.",
+                "This is ONE CNEC's own change in contribution to the "
+                "target zone's price, not the full zonal price change --",
+                "the real total is the sum of this same term over every "
+                "binding CNEC affected by the outage.",
             ]
             self._ma_spread_result_txt.insert(tk.END, "\n".join(lines))
         self._ma_spread_result_txt.config(state='disabled')

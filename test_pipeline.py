@@ -39,7 +39,7 @@ from propagation import (
     summarize_hypotheses, PipelineConfig, run_pipeline,
     DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str, jao_datetime_to_utc,
     build_event_time_dummies, run_event_study,
-    single_event_analysis, pre_period_abs_ptdf, estimate_price_spread,
+    single_event_analysis, pre_period_abs_ptdf, estimate_cnec_price_impact,
     build_report_ctx, run_nordic_matrix, render_nordic_matrix_report,
     NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
     fetch_entsoe_outages,
@@ -1174,81 +1174,125 @@ class TestPrePeriodAbsPtdf:
         assert pre_period_abs_ptdf(df, "ptdf_FI").empty
 
 
-# ── 16b. Price spread estimator (single-CNEC FBMC price decomposition) ───────
+# ── 16b. CNEC price impact estimator (actual vs ITS counterfactual) ──────────
 
-class TestEstimatePriceSpread:
-    """price_target = price_reference + shadowPrice_CNEC * (PTDF_target - PTDF_reference),
-    for one CNEC at one timestamp -- the Tab 9 Single Event "Price Spread"
-    pane's backing function."""
+class TestEstimateCnecPriceImpact:
+    """impact = (shadowPrice_actual * PTDF_target_actual)
+                - (shadowPrice_cf * PTDF_target_cf),
+    for one CNEC/zone at one timestamp, both terms projected via the same
+    ITS counterfactual machinery every other method here uses -- the
+    Tab 9 Single Event "Price Spread" pane's backing function."""
 
     def _df(self):
-        ts = pd.to_datetime(["2025-01-01T00:00:00Z", "2025-01-01T00:15:00Z",
-                             "2025-01-01T00:30:00Z"])
+        # 4 pre-period rows, all Mondays at hour 0 (same (hour,dow) cell),
+        # constant values -- seasonal_naive's counterfactual for that cell
+        # is then exactly the pre-period mean, so the expected numbers are
+        # exact, not approximate. One "during" row, same (hour,dow) cell
+        # (a later Monday at hour 0) but different actual values.
+        pre_dates = ["2025-01-06", "2025-01-13", "2025-01-20", "2025-01-27"]
+        during_date = "2025-02-03"
+        ts = pd.to_datetime([f"{d}T00:00:00Z" for d in pre_dates + [during_date]])
+        n_pre = len(pre_dates)
         return pd.DataFrame({
-            "cneName": ["X", "X", "X"],
+            "cneName":     ["X"] * (n_pre + 1),
             "dateTimeUtc": ts,
-            "shadowPrice": [0.0, 25.0, 0.0],
-            "ptdf_FI":  [-0.05, -0.05, -0.05],
-            "ptdf_NO3": [0.30, 0.30, 0.30],
+            "shadowPrice": [10.0] * n_pre + [50.0],
+            "ptdf_NO3":    [0.20] * n_pre + [0.25],
         })
 
-    def test_computes_expected_spread_and_target_price(self):
+    def test_computes_expected_impact_with_seasonal_naive(self):
         df = self._df()
-        ts = df["dateTimeUtc"].iloc[1]
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", ts)
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                       its_method="seasonal_naive")
         assert r["ok"] is True
-        expected_spread = 25.0 * (0.30 - (-0.05))
-        assert r["price_spread"] == pytest.approx(expected_spread)
-        assert r["target_price_estimate"] == pytest.approx(40.0 + expected_spread)
+        assert r["shadow_price_actual"] == pytest.approx(50.0)
+        assert r["shadow_price_cf"]     == pytest.approx(10.0)
+        assert r["ptdf_target_actual"]  == pytest.approx(0.25)
+        assert r["ptdf_target_cf"]      == pytest.approx(0.20)
+        assert r["actual_contribution"] == pytest.approx(50.0 * 0.25)
+        assert r["counterfactual_contribution"] == pytest.approx(10.0 * 0.20)
+        assert r["impact"] == pytest.approx(50.0 * 0.25 - 10.0 * 0.20)
 
-    def test_zero_shadow_price_gives_zero_spread(self):
+    def test_no_actual_movement_gives_zero_impact(self):
+        """If the 'during' row is identical to the pre-period pattern
+        (same (hour,dow) cell, same values), the counterfactual matches
+        the actual exactly and the impact must be exactly zero."""
         df = self._df()
-        ts = df["dateTimeUtc"].iloc[0]
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", ts)
+        df.loc[df.index[-1], ["shadowPrice", "ptdf_NO3"]] = [10.0, 0.20]
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                       its_method="seasonal_naive")
         assert r["ok"] is True
-        assert r["price_spread"] == pytest.approx(0.0)
-        assert r["target_price_estimate"] == pytest.approx(40.0)
+        assert r["impact"] == pytest.approx(0.0, abs=1e-9)
 
     def test_missing_cnec_refuses(self):
-        r = estimate_price_spread(self._df(), "NOT_A_CNEC", "FI", 40.0, "NO3",
-                                  self._df()["dateTimeUtc"].iloc[0])
+        df = self._df()
+        r = estimate_cnec_price_impact(df, "NOT_A_CNEC", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
         assert r["ok"] is False
         assert "No rows" in r["error"]
 
     def test_missing_ptdf_column_refuses(self):
         df = self._df()
-        r = estimate_price_spread(df, "X", "FI", 40.0, "SE3",
-                                  df["dateTimeUtc"].iloc[0])
+        r = estimate_cnec_price_impact(df, "X", "SE3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
         assert r["ok"] is False
         assert "ptdf_SE3" in r["error"]
 
-    def test_nan_ptdf_value_refuses(self):
+    def test_too_short_pre_period_refuses(self):
         df = self._df()
-        df.loc[1, "ptdf_NO3"] = float("nan")
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3",
-                                  df["dateTimeUtc"].iloc[1])
+        # pre_end before any pre-period row exists at all
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-01-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
         assert r["ok"] is False
-        assert "ptdf_NO3" in r["error"]
+        assert "pre-period" in r["error"] or "Fewer than 4" in r["error"]
 
     def test_timestamp_outside_tolerance_refuses(self):
         df = self._df()
-        far_ts = df["dateTimeUtc"].iloc[0] + pd.Timedelta(days=1)
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", far_ts)
+        far_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(days=1)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       far_ts)
         assert r["ok"] is False
         assert "No row" in r["error"]
 
     def test_timestamp_within_tolerance_snaps_to_nearest(self):
         df = self._df()
-        near_ts = df["dateTimeUtc"].iloc[1] + pd.Timedelta(seconds=10)
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", near_ts)
+        near_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(seconds=10)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       near_ts)
         assert r["ok"] is True
-        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[1]
+        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[-1]
 
-    def test_naive_timestamp_treated_as_utc(self):
+    def test_naive_timestamps_treated_as_utc(self):
         df = self._df()
-        naive_ts = df["dateTimeUtc"].iloc[1].tz_localize(None)
-        r = estimate_price_spread(df, "X", "FI", 40.0, "NO3", naive_ts)
+        r = estimate_cnec_price_impact(
+            df, "X", "NO3",
+            pd.Timestamp("2025-02-01T00:00:00Z").tz_localize(None),
+            df["dateTimeUtc"].iloc[-1].tz_localize(None))
         assert r["ok"] is True
+
+    def test_no_leakage_pre_period_is_strictly_before_pre_end(self):
+        """Sabotage the 'during' row to an extreme outlier and confirm the
+        counterfactual (fit only on rows before pre_end) doesn't move --
+        same discipline every other ITS method in this file is held to."""
+        df = self._df()
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r_before = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                              its_method="seasonal_naive")
+        df.loc[df.index[-1], ["shadowPrice", "ptdf_NO3"]] = [99999.0, 99999.0]
+        r_after = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                             its_method="seasonal_naive")
+        assert r_before["shadow_price_cf"] == pytest.approx(r_after["shadow_price_cf"])
+        assert r_before["ptdf_target_cf"]  == pytest.approx(r_after["ptdf_target_cf"])
 
 
 # ── 17. Recovery direction (magnitude-blind metric fix) ───────────────────────

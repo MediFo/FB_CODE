@@ -5129,57 +5129,88 @@ def pre_period_abs_ptdf(pre_df: pd.DataFrame, ptdf_col: str) -> pd.Series:
     return pre_df[ptdf_col].abs().groupby(pre_df["cneName"]).mean()
 
 
-def estimate_price_spread(df: pd.DataFrame, cnec: str, ref_zone: str,
-                          ref_price: float, tgt_zone: str,
-                          timestamp, timestamp_tol_minutes: float = 1.0) -> dict:
+def estimate_cnec_price_impact(df: pd.DataFrame, cnec: str, tgt_zone: str,
+                               pre_end, timestamp,
+                               its_method: str = ITS_DEFAULT_METHOD,
+                               mtu_minutes: int = 15,
+                               timestamp_tol_minutes: float = 1.0) -> dict:
     """
-    Estimate a target bidding zone's day-ahead price from a KNOWN reference
-    zone's price, for ONE specific CNEC at ONE specific timestamp, using
-    the standard flow-based zonal price-decomposition identity:
+    Estimate how much ONE CNEC's contribution to ONE target zone's
+    day-ahead price has moved, at ONE specific timestamp, relative to what
+    it would have been without whatever changed the CNEC's behaviour (an
+    outage, typically) — the FBMC price-decomposition term
+    `shadowPrice_CNEC × PTDF_{tgt_zone},CNEC`, evaluated ACTUAL vs its ITS
+    COUNTERFACTUAL (Y(0), fit on data strictly before `pre_end` — same
+    "pre-period only" discipline as every other ITS method in this file,
+    see the section header comment above `_ITS_METHODS`):
 
-        price_target ≈ price_reference
-                        + shadowPrice_CNEC × (PTDF_target,CNEC − PTDF_reference,CNEC)
+        impact = (shadowPrice_actual × PTDF_target_actual)
+                 − (shadowPrice_counterfactual × PTDF_target_counterfactual)
 
-    This is the textbook FBMC price-spread formula: a binding CNEC's
-    shadow price is the marginal €/MW value of relaxing its constraint,
-    and two zones' PTDF sensitivities on that same CNEC tell you how much
-    each zone's net position moves that CNEC's flow per MW — so the
-    product is that CNEC's own contribution to the price difference
-    between the two zones. This function computes exactly that ONE
-    contribution, from ONE CNEC — it is deliberately NOT a full zonal
-    price forecast, which would sum this same term over every binding
-    CNEC in the network (see the "CNEC scope" design choice recorded
-    alongside this function's caller in app_jao_NP_API_fix_d14.py's Tab 9
-    Single Event "Price Spread" pane).
+    An earlier version of this function instead compared the CNEC's
+    contribution to TWO DIFFERENT zones' prices at the same moment
+    (`shadowPrice × (PTDF_target − PTDF_reference)`, needing a
+    user-supplied reference-zone price as an anchor). That answers a
+    different question ("how does this CNEC split the price between two
+    zones right now") than what this function answers ("how has this
+    CNEC's effect on ONE zone's price changed because of the outage") —
+    the latter needs an actual-vs-counterfactual comparison, not a
+    second zone, which is why there is no `ref_zone` here at all.
 
-    `ref_zone`/`tgt_zone` are bare zone codes (e.g. "FI", "NO3") — this
-    function looks up `ptdf_<ref_zone>`/`ptdf_<tgt_zone>` columns. Refuses
-    (returns `ok=False`) rather than silently computing from missing data
-    if either PTDF column is absent, or is NaN on the matched row —
-    the same "validate before trusting the physics" posture
-    `_its_ptdf_flow()`'s own correlation gate uses elsewhere in this file.
-    Also refuses if `cnec` has no rows, or no row within
-    `timestamp_tol_minutes` of `timestamp` (handles float-precision/
-    string round-tripping on an otherwise-exact dropdown-selected
-    timestamp, without silently matching some other MTU far away in time).
+    BOTH `shadowPrice` and `PTDF_target` get their OWN counterfactual
+    projection via `its_method` (not just shadow price): PTDF itself can
+    move during an AC-line outage on the target zone (H2's own logic,
+    `ptdf_FI` shifting under `is_ac` in synthetic.py is the same
+    mechanism) — treating PTDF as fixed while only shadow price moves
+    would silently misattribute a topology-driven PTDF shift to shadow
+    price alone. Reuses `_build_its_for_col()`, the same dispatcher
+    `single_event_analysis()`'s own ITS run uses, so this respects
+    whichever of the 15 registered methods the caller picks, with that
+    method's own fallback chain if the pre-period is too short.
 
-    Returns a dict, always carrying `ok`/`error`/`cnec`/`ref_zone`/
-    `tgt_zone`/`ref_price`; on success (`ok=True`) also carries
-    `matched_timestamp`, `shadow_price`, `ptdf_ref`, `ptdf_tgt`,
-    `ptdf_diff`, `price_spread`, `target_price_estimate`.
+    Refuses (returns `ok=False`, `error` set) rather than computing from
+    partial data: `cnec` has no rows; `ptdf_<tgt_zone>` doesn't exist in
+    the data; the pre-period (rows strictly before `pre_end`) has fewer
+    than 4 distinct timestamps to fit a counterfactual from; or no row
+    exists within `timestamp_tol_minutes` of `timestamp`. Same
+    "validate before trusting the physics" posture `_its_ptdf_flow()`'s
+    own correlation gate uses elsewhere in this file.
+
+    Returns a dict, always carrying `ok`/`error`/`cnec`/`tgt_zone`/
+    `its_method`; on success (`ok=True`) also carries
+    `matched_timestamp`, `shadow_price_actual`, `shadow_price_cf`,
+    `ptdf_target_actual`, `ptdf_target_cf`, `actual_contribution`,
+    `counterfactual_contribution`, `impact`.
     """
     result = {"ok": False, "error": None, "cnec": cnec,
-              "ref_zone": ref_zone, "tgt_zone": tgt_zone,
-              "ref_price": ref_price}
+              "tgt_zone": tgt_zone, "its_method": its_method}
 
     sub = df[df["cneName"] == cnec] if "cneName" in df.columns else df.iloc[0:0]
     if sub.empty:
         result["error"] = f"No rows found for CNEC {cnec!r}."
         return result
 
+    ptdf_col = f"ptdf_{tgt_zone}"
+    if ptdf_col not in sub.columns or sub[ptdf_col].isna().all():
+        result["error"] = (
+            f"No PTDF data for zone {tgt_zone!r} on this CNEC "
+            f"(column {ptdf_col!r} missing or entirely empty). Refusing "
+            f"to estimate an impact from partial physics data.")
+        return result
+
+    sp_col = "shadowPrice_clean" if "shadowPrice_clean" in sub.columns else "shadowPrice"
+    if sp_col not in sub.columns or sub[sp_col].isna().all():
+        result["error"] = f"No {sp_col!r} data for this CNEC."
+        return result
+
     ts = pd.Timestamp(timestamp)
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
+    pre_end_ts = pd.Timestamp(pre_end)
+    if pre_end_ts.tzinfo is None:
+        pre_end_ts = pre_end_ts.tz_localize("UTC")
+
+    sub = sub.sort_values("dateTimeUtc")
     dt_diff = (sub["dateTimeUtc"] - ts).abs()
     idx_nearest = dt_diff.idxmin()
     if dt_diff.loc[idx_nearest] > pd.Timedelta(minutes=timestamp_tol_minutes):
@@ -5188,38 +5219,60 @@ def estimate_price_spread(df: pd.DataFrame, cnec: str, ref_zone: str,
             f"minute(s) of {ts} (nearest available: "
             f"{sub['dateTimeUtc'].loc[idx_nearest]}).")
         return result
-    row = sub.loc[idx_nearest]
+    matched_row = sub.loc[idx_nearest]
+    matched_ts = matched_row["dateTimeUtc"]
 
-    ptdf_ref_col = f"ptdf_{ref_zone}"
-    ptdf_tgt_col = f"ptdf_{tgt_zone}"
-    missing = [c for c in (ptdf_ref_col, ptdf_tgt_col)
-              if c not in sub.columns or pd.isna(row.get(c))]
-    if missing:
+    pre = sub[sub["dateTimeUtc"] < pre_end_ts]
+
+    def _project(col: str) -> Optional[float]:
+        """Fit `its_method`'s counterfactual on the pre-period, project
+        it onto `matched_ts`. Returns None if the pre-period is too thin
+        to fit anything (mirrors _run_its_for_method()'s own `< 4` guard)."""
+        pre_agg = pre.groupby("dateTimeUtc")[[col]].mean().reset_index()
+        if len(pre_agg) < 4:
+            return None
+        pre_agg["hour"] = pre_agg["dateTimeUtc"].dt.hour
+        pre_agg["dow"]  = pre_agg["dateTimeUtc"].dt.dayofweek
+        all_agg = sub.groupby("dateTimeUtc")[[col]].mean().reset_index()
+        all_agg["hour"] = all_agg["dateTimeUtc"].dt.hour
+        all_agg["dow"]  = all_agg["dateTimeUtc"].dt.dayofweek
+        projected = _build_its_for_col(pre_agg, all_agg, col, its_method, mtu_minutes)
+        match_mask = all_agg["dateTimeUtc"] == matched_ts
+        if not match_mask.any():
+            return None
+        return float(projected.values[match_mask.values][0])
+
+    if len(pre.groupby("dateTimeUtc")) < 4:
         result["error"] = (
-            f"Missing PTDF data for this CNEC/timestamp: {', '.join(missing)}. "
-            f"Refusing to estimate a price spread from partial physics data.")
+            f"Fewer than 4 distinct pre-period timestamps before "
+            f"{pre_end_ts} for CNEC {cnec!r} — too little data to fit a "
+            f"{its_method!r} counterfactual.")
         return result
 
-    sp_col = "shadowPrice_clean" if "shadowPrice_clean" in sub.columns else "shadowPrice"
-    if sp_col not in sub.columns or pd.isna(row.get(sp_col)):
-        result["error"] = f"Missing {sp_col!r} for this CNEC/timestamp."
+    shadow_price_cf = _project(sp_col)
+    ptdf_target_cf  = _project(ptdf_col)
+    if shadow_price_cf is None or ptdf_target_cf is None:
+        result["error"] = (
+            "Could not fit a counterfactual projection onto the "
+            "requested timestamp (pre-period too short, or the "
+            "timestamp fell outside the aggregated window).")
         return result
 
-    shadow_price = float(row[sp_col])
-    ptdf_ref = float(row[ptdf_ref_col])
-    ptdf_tgt = float(row[ptdf_tgt_col])
-    ptdf_diff = ptdf_tgt - ptdf_ref
-    price_spread = shadow_price * ptdf_diff
+    shadow_price_actual = float(matched_row[sp_col])
+    ptdf_target_actual  = float(matched_row[ptdf_col])
+    actual_contribution = shadow_price_actual * ptdf_target_actual
+    cf_contribution      = shadow_price_cf * ptdf_target_cf
 
     result.update(
         ok=True,
-        matched_timestamp=row["dateTimeUtc"],
-        shadow_price=shadow_price,
-        ptdf_ref=ptdf_ref,
-        ptdf_tgt=ptdf_tgt,
-        ptdf_diff=ptdf_diff,
-        price_spread=price_spread,
-        target_price_estimate=ref_price + price_spread,
+        matched_timestamp=matched_ts,
+        shadow_price_actual=shadow_price_actual,
+        shadow_price_cf=shadow_price_cf,
+        ptdf_target_actual=ptdf_target_actual,
+        ptdf_target_cf=ptdf_target_cf,
+        actual_contribution=actual_contribution,
+        counterfactual_contribution=cf_contribution,
+        impact=actual_contribution - cf_contribution,
     )
     return result
 

@@ -158,7 +158,7 @@ What each pane reads from `single_event_analysis()`'s return dict:
 | ΔRAM decomposition | `decomp` | Horizontal bar chart, one bar per RAM-identity term's average MW contribution |
 | DiD | `did`, `did_estimates` | High-\|PTDF_FI\| CNECs (treatment) vs low (control); ATT = (high_during−high_pre) − (low_during−low_pre) |
 | Per-CNEC table | `cnec_table` | Per-CNEC pre/during/Δ for f0, ram, shadowPrice |
-| Price Spread | `cnec_table` (for the CNEC list) + `its` (for the timestamp window) | **Not** part of `single_event_analysis()`'s own output — see below |
+| Price Spread | `cnec_table` (CNEC list) + `its` (timestamp window) + `summary['start_utc']` (counterfactual cutoff) | **Not** part of `single_event_analysis()`'s own output — see below |
 
 Runs in a background thread (`_ma_single_thread`), same reentrancy guard
 pattern as Run Analysis. Rows with a null/blank `cneName` are dropped
@@ -166,44 +166,64 @@ before the call — a defensive fix for `sorted(cneName.unique())` crashing
 on a mixed float/str column, which is a real shape real JAO exports can
 have.
 
-**Price Spread pane (optional, added after the rest of this tab).** Given
-a reference zone's known price, a target zone, one CNEC, and a
-timestamp, estimates the target zone's price via the standard FBMC
-zone-to-zone price-decomposition identity for that ONE CNEC:
+**Price Spread pane (optional, added after the rest of this tab).**
+Shows how much ONE CNEC's contribution to a TARGET zone's price has
+moved, at one timestamp the user picks, relative to what it would have
+been without the outage:
 
 ```
-price_target ≈ price_reference + shadowPrice_CNEC × (PTDF_target,CNEC − PTDF_reference,CNEC)
+impact = (shadowPrice_actual × PTDF_target_actual)
+         − (shadowPrice_counterfactual × PTDF_target_counterfactual)
 ```
 
-Backed by `propagation.estimate_price_spread(df, cnec, ref_zone,
-ref_price, tgt_zone, timestamp)` — a small, standalone, unit-tested
-function (`TestEstimatePriceSpread` in `test_pipeline.py`), independent
-of `single_event_analysis()`. It is deliberately **not** a full zonal
-price forecast: it's ONE CNEC's contribution only, not a sum over every
-binding CNEC between the two zones (see the design note in that
-function's own docstring, and its call site's comment in
-`_ma_build_single()`, for why that scope was chosen over the fuller
-sum-over-all-CNECs version). The result pane says so explicitly, every
-time.
+Both `shadowPrice` and `PTDF_target` get their own ITS counterfactual
+projection (fit on this event's own pre-period, i.e. everything strictly
+before the outage's `start_utc`) — not just shadow price — because PTDF
+itself can shift during an AC-line outage on the target zone (the same
+mechanism H2 tests for). An **earlier version of this pane** compared the
+CNEC's contribution to *two different zones'* prices at the same instant
+(`shadowPrice × (PTDF_target − PTDF_reference)`), which needed a
+user-typed reference-zone price as an anchor — that answers "how does
+this CNEC split the price between two zones right now," a different
+question from "how has this CNEC's effect on ONE zone's price changed
+*because of the outage*," which is what this pane now answers. That's
+why there's no reference zone or reference price input anymore.
 
-The CNEC/zone/timestamp pickers are populated from the **currently
-analysed event**, not the whole dataset: CNECs come from that event's own
-`cnec_table`; zones come from whichever `ptdf_<ZONE>` columns actually
-exist in the loaded data (discovered dynamically, never a hardcoded zone
-list — real JAO exports don't all carry the same zones); timestamps come
-from that CNEC's rows within the event's own pre/during/post window
-(derived from `its['dateTimeUtc']`'s min/max). This means the pane is
-empty until at least one Single Event analysis has completed —
+Backed by `propagation.estimate_cnec_price_impact(df, cnec, tgt_zone,
+pre_end, timestamp, its_method=...)` — a small, standalone, unit-tested
+function (`TestEstimateCnecPriceImpact` in `test_pipeline.py`,
+including a leak-safety test mirroring every other ITS method's own),
+independent of `single_event_analysis()`'s own return dict. It is
+deliberately **not** a full zonal price forecast: it's ONE CNEC's own
+impact, not a sum over every binding CNEC affected by the outage — the
+result pane says so explicitly, every time.
+
+The `its_method` passed in is **not** a separate choice in this pane —
+it reuses whichever counterfactual model is currently selected in the
+"Counterfactual model" dropdown above (Chapter 21 of `TUTORIAL.md`
+covers what each of the 15 methods actually does), falling back to
+`propagation.ITS_DEFAULT_METHOD` if `"all"` is selected there (which
+isn't a single fittable method on its own). The CNEC/zone/timestamp
+pickers are populated from the **currently analysed event**, not the
+whole dataset: CNECs come from that event's own `cnec_table`; the target
+zone list comes from whichever `ptdf_<ZONE>` columns actually exist in
+the loaded data (discovered dynamically, never a hardcoded zone list —
+real JAO exports don't all carry the same zones); timestamps come from
+that CNEC's rows within the event's own pre/during/post window (derived
+from `its['dateTimeUtc']`'s min/max). This means the pane is empty until
+at least one Single Event analysis has completed —
 `_ma_refresh_spread_controls()` is called at the end of `_ma_single_done()`
 specifically to populate it.
 
-`propagation.estimate_price_spread()` **refuses** (returns `ok=False`
-with an explanatory `error` string, shown directly in the result pane)
-rather than computing from partial data, in three cases: the CNEC has no
-rows at all, neither zone's `ptdf_<ZONE>` column exists (or is `NaN` on
-the matched row), or no row exists within 1 minute of the requested
-timestamp. This mirrors `_its_ptdf_flow()`'s own "validate before
-trusting the physics" posture elsewhere in `propagation.py`.
+`propagation.estimate_cnec_price_impact()` **refuses** (returns
+`ok=False` with an explanatory `error` string, shown directly in the
+result pane) rather than computing from partial data: the CNEC has no
+rows at all; the target zone's `ptdf_<ZONE>` column doesn't exist or is
+entirely empty; the pre-period (rows strictly before the outage's
+`start_utc`) has fewer than 4 distinct timestamps to fit a counterfactual
+from; or no row exists within 1 minute of the requested timestamp. This
+mirrors `_its_ptdf_flow()`'s own "validate before trusting the physics"
+posture elsewhere in `propagation.py`.
 
 ### 3.7 Explain
 
