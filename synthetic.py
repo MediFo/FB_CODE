@@ -212,6 +212,33 @@ def generate_jao_csv(start: datetime, end: datetime,
     dow = timestamps.dayofweek
     weekly = -30 * (dow >= 5)  # weekends slightly lower
 
+    # Day-level index per timestamp, used below to give fnrao/amr/faac/iva
+    # genuine day-to-day persistence -- distinct from the diurnal/weekly
+    # hour-of-day/day-of-week pattern already on 'fall' (which
+    # seasonal_naive/theta already see via hour+dow grouping), a specific
+    # calendar day's regime level is invisible to any method that only
+    # conditions on (hour, weekday). Without this, fnrao/amr/faac/iva were
+    # each close to i.i.d. noise or near-constant, giving lag-feature/
+    # decomposition-based ITS methods (see _its_ram_identity() in
+    # propagation.py) nothing to exploit that a direct forecast of 'ram'
+    # couldn't already get from the aggregate's own hour/dow pattern --
+    # making any accuracy comparison between them unfair to the
+    # decomposition approach. See CLAUDE.md's "ACCURACY REALITY CHECK".
+    day_index = (timestamps.normalize() - timestamps.normalize().min()).days.values
+    n_days = int(day_index.max()) + 1
+
+    def _ar1_day_regime(phi: float = 0.65) -> np.ndarray:
+        """Mean-reverting AR(1) walk, one value per calendar day, unit std,
+        broadcast to MTU resolution. A fresh call consumes n_days rng draws."""
+        days = np.zeros(n_days)
+        innovations = rng.normal(0, 1, n_days)
+        for d in range(1, n_days):
+            days[d] = phi * days[d - 1] + innovations[d]
+        std = days.std()
+        if std > 1e-9:
+            days = days / std
+        return days[day_index]
+
     rows = []
     for cnec, zfrom, zto in NO3_CNECS:
         # Baseline values
@@ -255,18 +282,35 @@ def generate_jao_csv(start: datetime, end: datetime,
         frm[post_dec24] = frm_base
         frm += rng.normal(0, 1, n)
 
-        # FRA: small, sometimes positive during HVDC outages (cross-zonal RA)
+        # FRA: small, sometimes positive during HVDC outages (cross-zonal RA),
+        # plus a day-level regime (TSO cross-zonal RA allocation tends to
+        # persist across a day, not reset every 15 min).
+        regime_fra = _ar1_day_regime()
         fra = np.where(is_hvdc, rng.uniform(0, 30, n), rng.uniform(0, 5, n))
+        fra = np.maximum(fra + 5.0 * regime_fra, 0.0)
 
-        # AMR: zero most of the time
-        amr = np.where(rng.uniform(0, 1, n) > 0.97, rng.uniform(20, 80, n), 0.0)
+        # AMR: zero most of the time, but the daily spike PROBABILITY (not
+        # just each spike's magnitude) is day-regime-modulated -- redispatch
+        # actions cluster on high-stress grid days rather than firing
+        # independently every 15 min. Bounded so it stays "zero most of the
+        # time" (~90-99% zero rows) like before.
+        regime_amr = _ar1_day_regime()
+        amr_prob = np.clip(0.03 + 0.02 * regime_amr, 0.005, 0.10)
+        amr = np.where(rng.uniform(0, 1, n) < amr_prob, rng.uniform(20, 80, n), 0.0)
 
-        # FAAC: tiny constant
-        faac = rng.uniform(0, 5, n)
+        # FAAC: tiny, but with a slow day-level level shift under the
+        # per-MTU noise rather than pure i.i.d. noise around one constant.
+        regime_faac = _ar1_day_regime()
+        faac = np.clip(1.5 + 1.2 * regime_faac + rng.normal(0, 0.7, n), 0.0, None)
 
-        # IVA: more frequent during forced outages, especially HVDC forced
-        # (0.01 baseline rate is not outage-induced and is left unscaled)
-        iva_prob = 0.01 + effect_scale * (0.10 * is_forced + 0.15 * (is_hvdc * is_forced))
+        # IVA: more frequent during forced outages, especially HVDC forced.
+        # The non-outage-induced baseline rate now drifts by day (a mild
+        # "congestion regime" independent of any specific outage) instead of
+        # sitting fixed at 0.01 -- still deliberately left unscaled by
+        # effect_scale, same as before, since it isn't outage-induced.
+        regime_iva = _ar1_day_regime()
+        iva_baseline = np.clip(0.01 + 0.02 * np.clip(regime_iva, -1.5, 1.5), 0.002, 0.05)
+        iva_prob = iva_baseline + effect_scale * (0.10 * is_forced + 0.15 * (is_hvdc * is_forced))
         iva_active = rng.uniform(0, 1, n) < iva_prob
         iva = np.where(iva_active, rng.uniform(20, 150, n), 0.0)
 
