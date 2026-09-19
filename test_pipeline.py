@@ -9,6 +9,7 @@ import sys
 import os
 import json
 import warnings
+from unittest import mock
 warnings.filterwarnings("ignore")
 
 # All files are in the same folder as this script. This directory also has
@@ -1629,3 +1630,294 @@ class TestEnsembleItsMethod:
             splits = _pipe._carve_rolling_origin_splits(df)
             assert len(splits) == expected, (
                 f"{n_days} days -> expected {expected} splits, got {len(splits)}")
+
+    def test_excludes_ram_identity_and_ptdf_flow_from_its_own_members(self):
+        """Regression guard against infinite recursion: ram_identity and
+        ptdf_flow both fall back to _its_ensemble() when their physics
+        doesn't apply -- if _its_ensemble() ever listed them as its own
+        candidate members again, that fallback call would recurse forever
+        the moment either one's fallback condition is met. Never real
+        members of its own pool, whatever _ITS_METHODS contains."""
+        import inspect
+        src = inspect.getsource(_pipe._its_ensemble)
+        assert '"ram_identity"' in src and '"ptdf_flow"' in src, (
+            "expected _its_ensemble()'s member-list construction to "
+            "explicitly exclude ram_identity/ptdf_flow by name")
+
+
+# ── 23. Physics-informed ITS methods (ram_identity, ptdf_flow) + Nord Pool ────
+
+def _ram_identity_series(n_days=30, mtu_minutes=15, seed=7):
+    """A series with all 7 RAM-identity components, exactly satisfying
+    RAM = Fmax - FRM - fall + fnrao + AMR - FAAC - IVA by construction."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    hour = idx.hour + idx.minute / 60
+    dow = idx.dayofweek
+    fmax  = np.full(len(idx), 1500.0) + rng.normal(0, 5, len(idx))
+    frm   = np.full(len(idx), 200.0)
+    fnrao = 50 + 10 * np.sin(2 * np.pi * hour / 24) + rng.normal(0, 3, len(idx))
+    amr   = 30 + rng.normal(0, 2, len(idx))
+    faac  = 100 + 20 * np.cos(2 * np.pi * dow / 7) + rng.normal(0, 4, len(idx))
+    fall  = 200 + 80 * np.sin(2 * np.pi * hour / 24 - 1.0) + rng.normal(0, 8, len(idx))
+    iva   = np.where(rng.random(len(idx)) < 0.05,
+                     np.abs(rng.normal(20, 5, len(idx))), 0.0)
+    ram = fmax - frm - fall + fnrao + amr - faac - iva
+    df = pd.DataFrame({"dateTimeUtc": idx, "ram": ram, "fmax": fmax, "frm": frm,
+                       "fnrao": fnrao, "amr": amr, "faac": faac, "fall": fall, "iva": iva})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df
+
+
+class TestRamIdentityItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "ram_identity" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["ram_identity"]
+        assert entry["fn"] is _pipe._its_ram_identity
+        assert entry["label"] and entry["description"]
+
+    def test_projection_satisfies_identity_exactly(self):
+        """The whole point of this method: the returned RAM projection
+        must equal the sum of its (signed) component projections to
+        floating-point precision, not just approximately -- it's
+        COMPUTED from them, never independently fit."""
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+
+        recomputed = np.zeros(len(df))
+        for c, sign in _pipe._RAM_IDENTITY_TERMS.items():
+            method = _pipe._RAM_COMPONENT_METHOD[c]
+            fn = _pipe._ITS_METHODS[method]["fn"]
+            proj_c = _pipe._call_its_method(fn, pre_agg, df, c, method, 15)
+            recomputed += sign * proj_c.values
+        assert np.allclose(proj.values, recomputed, atol=1e-9), (
+            "projected RAM must equal Σ(sign × projected component) exactly")
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        components = ["ram"] + list(_pipe._RAM_IDENTITY_TERMS.keys())
+        sabotaged.loc[during_mask, components] = 99999.0
+
+        proj = _pipe._its_ram_identity(pre_agg, sabotaged, "ram", mtu_minutes=15)
+        assert proj[during_mask].max() < 10000, (
+            "ram_identity leaked a sabotaged during-period component value")
+        assert not proj[during_mask].isna().any()
+
+    def test_attaches_identity_check_diagnostic(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+        diag = proj.attrs.get("ram_identity_check")
+        assert diag is not None
+        assert diag["pct_within_1mw_pre_period"] > 0.99, (
+            "identity was constructed to hold exactly -- diagnostic should confirm it")
+
+    def test_falls_back_to_ensemble_when_component_missing(self):
+        """Computing RAM from an incomplete subset of the formula would
+        silently produce a different, WRONG quantity -- must degrade to
+        ensemble instead, not fabricate a partial-formula number."""
+        df = _ram_identity_series().drop(columns=["iva"])
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+        assert "ram_identity_check" not in proj.attrs
+
+    def test_non_ram_column_delegates_to_theta(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj_ri = _pipe._its_ram_identity(pre_agg, df, "fmax", mtu_minutes=15)
+        proj_th = _pipe._its_theta(pre_agg, df, "fmax", mtu_minutes=15)
+        assert np.allclose(proj_ri.values, proj_th.values)
+
+
+class TestPtdfFlowItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "ptdf_flow" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["ptdf_flow"]
+        assert entry["fn"] is _pipe._its_ptdf_flow
+        assert entry["label"] and entry["description"]
+
+    def _physics_series(self, n_days=20, mtu_minutes=15, seed=3, noisy_target=False):
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                            freq=f"{mtu_minutes}min", tz="UTC")
+        hour = idx.hour + idx.minute / 60
+        dow = idx.dayofweek
+        ptdf_fi  = 0.3 + 0.02 * np.sin(2 * np.pi * hour / 24) + rng.normal(0, 0.005, len(idx))
+        ptdf_se1 = -0.15 + rng.normal(0, 0.005, len(idx))
+        np_fi  = 500 + 200 * np.sin(2 * np.pi * hour / 24 - 1) + rng.normal(0, 20, len(idx))
+        np_se1 = -300 + 100 * np.cos(2 * np.pi * dow / 7) + rng.normal(0, 15, len(idx))
+        fall = (rng.normal(1000, 300, len(idx)) if noisy_target
+               else ptdf_fi * np_fi + ptdf_se1 * np_se1)
+        df = pd.DataFrame({"dateTimeUtc": idx, "fall": fall,
+                           "ptdf_FI": ptdf_fi, "netpos_FI": np_fi,
+                           "ptdf_SE1": ptdf_se1, "netpos_SE1": np_se1})
+        df["hour"] = df["dateTimeUtc"].dt.hour
+        df["dow"] = df["dateTimeUtc"].dt.dayofweek
+        return df
+
+    def test_validates_and_reconstructs_when_physics_holds(self):
+        df = self._physics_series(noisy_target=False)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        v = proj.attrs["ptdf_flow_validation"]
+        assert v["status"] == "validated"
+        assert v["pre_period_correlation"] > 0.9
+        assert set(v["zones_used"]) == {"FI", "SE1"}
+
+    def test_falls_back_when_physics_does_not_hold(self):
+        df = self._physics_series(noisy_target=True)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        v = proj.attrs["ptdf_flow_validation"]
+        assert v["status"] == "failed_validation_fell_back_to_ensemble"
+        assert not proj.isna().any()
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = self._physics_series(noisy_target=False)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        cols = ["fall", "ptdf_FI", "netpos_FI", "ptdf_SE1", "netpos_SE1"]
+        sabotaged.loc[during_mask, cols] = 99999.0
+
+        proj = _pipe._its_ptdf_flow(pre_agg, sabotaged, "fall", mtu_minutes=15)
+        assert proj[during_mask].max() < 500000, (
+            "ptdf_flow leaked a sabotaged during-period value "
+            "(99999 * 99999 scale would be ~1e10 if it had)")
+        assert not proj[during_mask].isna().any()
+
+    def test_no_netpos_data_falls_back_gracefully(self):
+        df, _, _ = _synthetic_seasonal_series(n_days=20)
+        df = df.rename(columns={"val": "fall"})
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        assert proj.attrs["ptdf_flow_validation"]["status"] == "no_netpos_data"
+        assert not proj.isna().any()
+
+    def test_non_flow_column_delegates_to_theta(self):
+        df = self._physics_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        # Rename target so col != "fall"/"flowFB"
+        df2 = df.rename(columns={"fall": "something_else"})
+        pre2 = pre_agg.rename(columns={"fall": "something_else"})
+        proj_pf = _pipe._its_ptdf_flow(pre2, df2, "something_else", mtu_minutes=15)
+        proj_th = _pipe._its_theta(pre2, df2, "something_else", mtu_minutes=15)
+        assert np.allclose(proj_pf.values, proj_th.values)
+
+
+class TestNordPoolFetch:
+    """fetch_nordpool_net_positions()/merge_nordpool_net_positions() --
+    mocked HTTP throughout, no live network dependency (same posture as
+    the rest of this suite: synthetic/mocked data, never a live API call
+    in pytest)."""
+
+    def test_fetch_and_pivot_to_wide_format(self):
+        def fake_post(url, headers=None, data=None, timeout=None):
+            r = mock.Mock(status_code=200)
+            r.raise_for_status = lambda: None
+            r.json = lambda: {"access_token": "FAKE"}
+            return r
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            date_str = dict(params)["date"]
+            zones = [v for k, v in params if k == "areas"]
+            payload = [{"deliveryArea": z,
+                       "volumes": [{"deliveryStart": f"{date_str}T{h:02d}:00:00Z",
+                                   "sell": 100.0 + h, "buy": 40.0} for h in range(24)]}
+                      for z in zones]
+            r = mock.Mock(status_code=200)
+            r.json = lambda: payload
+            return r
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post
+            mock_requests.get = fake_get
+            net_pos = _pipe.fetch_nordpool_net_positions(["FI", "SE1"],
+                                                          "2024-01-01", "2024-01-02")
+
+        assert not net_pos.empty
+        assert set(net_pos.columns) == {"dateTimeUtc", "netpos_FI", "netpos_SE1"}
+        assert net_pos.attrs["nordpool_fetch_failures"]["days_failed"] == 0
+        # sell(100+h) - buy(40) at h=0 -> 60.0
+        assert net_pos["netpos_FI"].iloc[0] == 60.0
+
+    def test_auth_failure_returns_empty_with_diagnostic(self):
+        def fake_post_raises(url, headers=None, data=None, timeout=None):
+            raise ConnectionError("refused")
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post_raises
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-01")
+
+        assert result.empty
+        assert list(result.columns) == ["dateTimeUtc", "netpos_FI"]
+        assert result.attrs["nordpool_fetch_failures"]["auth_failed"] is True
+
+    def test_http_error_counted_as_day_failure(self):
+        def fake_post_ok(url, headers=None, data=None, timeout=None):
+            r = mock.Mock(status_code=200)
+            r.raise_for_status = lambda: None
+            r.json = lambda: {"access_token": "T"}
+            return r
+
+        def fake_get_500(url, headers=None, params=None, timeout=None):
+            return mock.Mock(status_code=500, text="server error")
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post_ok
+            mock_requests.get = fake_get_500
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-02")
+
+        assert result.empty
+        assert result.attrs["nordpool_fetch_failures"]["days_failed"] == 2
+
+    def test_library_missing_returns_empty_with_diagnostic(self):
+        with mock.patch("propagation.requests", None):
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-01")
+        assert result.empty
+        assert result.attrs["nordpool_fetch_failures"]["library_missing"] is True
+
+    def test_merge_asof_forward_fills_within_tolerance(self):
+        net_pos = pd.DataFrame({
+            "dateTimeUtc": pd.to_datetime(["2024-01-01T00:00:00Z", "2024-01-01T01:00:00Z"], utc=True),
+            "netpos_FI": [60.0, 61.0],
+        })
+        jao_like = pd.DataFrame({
+            "dateTimeUtc": pd.date_range("2024-01-01T00:00", periods=8, freq="15min", tz="UTC"),
+            "cneName": "TEST",
+            "ram": range(8),
+        })
+        merged = _pipe.merge_nordpool_net_positions(jao_like, net_pos)
+        assert (merged["netpos_FI"].iloc[:4] == 60.0).all()   # 00:00-00:45 -> 00:00 value
+        assert (merged["netpos_FI"].iloc[4:8] == 61.0).all()  # 01:00-01:45 -> 01:00 value
+
+    def test_merge_with_empty_net_pos_is_noop(self):
+        jao_like = pd.DataFrame({
+            "dateTimeUtc": pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC"),
+            "ram": [1, 2, 3, 4],
+        })
+        empty_net_pos = pd.DataFrame(columns=["dateTimeUtc", "netpos_FI"])
+        merged = _pipe.merge_nordpool_net_positions(jao_like, empty_net_pos)
+        assert list(merged.columns) == list(jao_like.columns)
+        assert len(merged) == len(jao_like)

@@ -464,6 +464,115 @@ pytest test_pipeline.py -v
   on every call, not cached, so flipping it takes effect immediately.
   Not yet wired to a GUI checkbox or CLI flag in dashboard.py/
   app_jao_NP_API_fix_d14.py/run_analysis.py — currently code-only.
+- Two PHYSICS-INFORMED ITS methods (`_ITS_METHODS` now has 15 entries):
+  requested explicitly as "physics-informed AI" — the idea being that some
+  of this pipeline's target columns aren't independent physical quantities
+  at all, they're derived from other columns already in the data by a
+  known formula, so a model that respects that formula by CONSTRUCTION
+  should beat one that has to rediscover it statistically.
+    - `"ram_identity"` — RAM is not independently observed here, it's the
+      accounting identity RAM = Fmax − FRM − fall + fnrao + AMR − FAAC − IVA
+      (the exact formula build_covariates()'s `ram_check` already verifies
+      balances within 1 MW on ~100% of real rows, and decompose_delta_ram()
+      already uses for its own before/after attribution — this method is
+      the missing COUNTERFACTUAL-FORECASTING use of that same identity, not
+      a new formula). `_its_ram_identity()` forecasts each of the 7 terms
+      with the sub-method suited to ITS OWN dynamics
+      (`_RAM_COMPONENT_METHOD`: seasonal_naive for fmax/frm — both
+      structural, and frm is literally the H6 placebo's null hypothesis;
+      theta for fnrao/amr/faac; catboost for fall, the term outages
+      actually move (H1's own dependent variable); hurdle for iva, which
+      is zero-inflated/TSO-discretionary and documented as nonzero mainly
+      during forced outages) and COMPUTES RAM from them — the projected
+      Series literally equals Σ(sign × projected component), verified to
+      floating-point precision by
+      `TestRamIdentityItsMethod::test_projection_satisfies_identity_exactly`,
+      not just "close." Falls back to `_its_theta()` for any column other
+      than "ram" (nothing to decompose for a different target), and to
+      `_its_ensemble()` for "ram" itself if any of the 7 raw component
+      columns is missing — computing RAM from an incomplete subset would
+      silently produce a different, WRONG quantity, the exact AMR/IVA-
+      dropping mistake this formula's own history above already warns
+      about, not a merely-degraded RAM. Attaches a `ram_identity_check`
+      diagnostic to the returned Series' `.attrs` (pre-period formula-
+      balance %) so the projection's own footing can be checked, not
+      just trusted on faith.
+    - `"ptdf_flow"` — reconstructs flow-type columns ("fall"/"flowFB") as
+      Σ_zone PTDF_zone,CNEC,t × NetPosition_zone,t, the DC/PTDF-based flow
+      decomposition Nordic FBMC is actually built on. UNLIKE ram_identity,
+      this is explicitly NOT presented as a proven identity in this repo:
+      "fall" (F_allReference) is a REFERENCE-case flow from the D-2 common
+      grid model, not necessarily numerically identical to
+      Σ PTDF × REALIZED net position, so overclaiming it as exact would be
+      dishonest modeling. `_its_ptdf_flow()` instead VALIDATES itself —
+      computes the same Σ PTDF_actual × NetPosition_actual against the
+      ACTUAL observed target on pre-period rows, and only trusts the
+      reconstruction if the correlation clears `min_validation_corr`
+      (default 0.5), falling back to `_its_ensemble()` otherwise. The
+      validation outcome (status/correlation/zones used) is ALWAYS
+      attached to `.attrs["ptdf_flow_validation"]`, whichever path was
+      taken — verified both ways by
+      `TestPtdfFlowItsMethod::test_validates_and_reconstructs_when_physics_holds`
+      / `::test_falls_back_when_physics_does_not_hold`. Each zone's PTDF
+      and net position get their own seasonal_naive counterfactual (PTDF's
+      own projection is deliberately what "removes" an AC-outage's
+      topology shift, per H2's own logic) before combining. OPT-IN:
+      requires `netpos_<ZONE>` columns already merged into the data (see
+      below) alongside the `ptdf_<ZONE>` columns JAO already provides —
+      out of the box, nothing has done that merge, so this gracefully
+      degrades to ensemble for everyone until it has, the same posture
+      lightgbm/catboost/tbats already use for a missing library, just for
+      a missing data source instead.
+    - Both are explicitly EXCLUDED from `_its_ensemble()`'s own member
+      pool (`members = [m for m in _ITS_METHODS if m not in ("ensemble",
+      "ram_identity", "ptdf_flow")]`) — not merely from habit. Both
+      methods fall back to `_its_ensemble()` when their physics doesn't
+      apply; if either were also listed as one of ensemble's own
+      candidates, that fallback call would recurse straight back into
+      ensemble's member-evaluation loop, which would try to evaluate them
+      again, triggering the same fallback again — unbounded recursion the
+      moment either one's fallback condition is met, not a hypothetical
+      edge case (missing component columns / no netpos data are both the
+      DEFAULT state for any caller that hasn't specifically set them up).
+      Guarded by `TestEnsembleItsMethod
+      ::test_excludes_ram_identity_and_ptdf_flow_from_its_own_members`.
+    - New propagation.py capability this needed:
+      `fetch_nordpool_net_positions(zones, start_date, end_date)` (Nord
+      Pool day-ahead Auction Volumes endpoint, sell − buy per zone/MTU —
+      one request per day covering every zone via repeated `areas` params,
+      not one request per zone) and `merge_nordpool_net_positions(no3_df,
+      net_pos_df)` (a vectorized `pd.merge_asof` "nearest earlier, bounded
+      by `max_gap_minutes`" join onto JAO's 15-min grid). This is genuinely
+      NEW plumbing, not a refactor: before this, Nord Pool net-position
+      data only ever reached a single GUI tab's live chart
+      (app_jao_NP_API_fix_d14.py's Tab 7, `_tab7_done`) — fetched fresh
+      per click, held in local Python variables, never persisted or joined
+      into anything propagation.py's analytical functions could see.
+      `NORDPOOL_USER`/`NORDPOOL_PASSWORD`/`NP_TOKEN_URL`/`NP_VOL_URL` are
+      DELIBERATELY DUPLICATED from the GUI file's own copies (same
+      "independent copy, not shared" reasoning as the JAO timestamp-zone
+      toggle above) rather than importing them, to avoid any risk of
+      touching the GUI's own already-working Tab 5-8 fetch code for this.
+      Same known, out-of-scope credential-hardcoding limitation already
+      documented below for ENTSOE_TOKEN. Tested entirely with mocked HTTP
+      (`unittest.mock.patch("propagation.requests")`, matching this
+      suite's existing "no live network calls in pytest" posture) — see
+      `TestNordPoolFetch`, covering the happy path, auth failure, HTTP
+      errors, a missing `requests` library, and the merge_asof gap-
+      tolerance behavior.
+    - Both new methods need pre_agg/all_agg to carry columns beyond just
+      the one being forecast (ram_identity needs all 7 RAM terms;
+      ptdf_flow needs ptdf_*/netpos_* pairs) — a real change from every
+      other ITS method's "only ever reads `col`/hour/dow" contract.
+      `single_event_analysis()`'s `_run_its_for_method()` closure now
+      widens `pre_agg`/`all_agg` to carry `_RAM_IDENTITY_TERMS` columns
+      and any `ptdf_*`/`netpos_*` columns present in the source data
+      alongside `col`, for EVERY method's call, not just these two — safe
+      for the other 13 methods since they've always ignored any column
+      beyond `col`/hour/dow, so this is purely additive from their point
+      of view. A caller building pre_agg/all_agg outside
+      single_event_analysis() must do the same widening itself for these
+      two methods to have anything to work with.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by

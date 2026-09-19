@@ -3651,8 +3651,10 @@ class App:
             "tbats":          "TBATS (daily+weekly)     [min 14 days]",
             "theta":          "Theta method              [min 7 days]",
             "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
+            "ram_identity":   "RAM Identity (physics-informed)   [min 7 days]",
+            "ptdf_flow":      "PTDF x Net Position (physics-informed) [min 7 days]",
             "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
-            "all":            "All thirteen  [run & compare side-by-side]",
+            "all":            "All fifteen  [run & compare side-by-side]",
         }
         _prop = getattr(self, '_prop', None)
         _method_keys = (list(_prop.ITS_METHOD_NAMES) + ["all"]) if _prop else list(_method_labels)
@@ -3981,6 +3983,8 @@ class App:
             "tbats":          ("#9E6B8E", ":"),
             "theta":          ("#8EA05A", "--"),
             "hurdle":         ("#C97B4A", "-."),
+            "ram_identity":   ("#4A7A6B", "-"),
+            "ptdf_flow":      ("#7A5A9C", "-"),
             "ensemble":       ("#2E2E2E", "-"),
         }
         # Clear and rebuild the tkinter legend bar above the canvas

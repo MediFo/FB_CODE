@@ -818,6 +818,209 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
     return result
 
 
+# ---------------------------------------------------------------------------
+# Nord Pool net position fetch — feeds the "ptdf_flow" physics-informed ITS
+# method (see _its_ptdf_flow() in the ITS COUNTERFACTUAL MODELS section):
+# flow_t ≈ Σ_zone PTDF_{zone,CNEC,t} × NetPosition_{zone,t}. Nothing else in
+# propagation.py currently consumes Nord Pool data — this is new plumbing,
+# not a refactor of anything existing.
+# ---------------------------------------------------------------------------
+# These credentials/URLs deliberately DUPLICATE app_jao_NP_API_fix_d14.py's
+# own NORDPOOL_USER/NORDPOOL_PASSWORD/NP_VOL_URL rather than importing them —
+# same reasoning as every other "independent copy, not shared" surface in
+# this codebase (see CLAUDE.md's JAO-timestamp-zone entry): the GUI's own
+# Tab 5-8 fetch code already works for its own single-CNEC/single-day
+# display use case, and this module's version exists for a different one
+# (fetching every relevant zone over a full analysis window, for the
+# analytical pipeline) — sharing code between them would risk regressing
+# four already-working tabs to avoid duplicating ~10 lines of constants.
+# Same known, out-of-scope credential-hardcoding limitation CLAUDE.md
+# already documents for ENTSOE_TOKEN.
+NORDPOOL_USER     = "API_DATA_MEHDI"
+NORDPOOL_PASSWORD = "OsloNordpool@123"
+NP_TOKEN_URL = "https://sts.nordpoolgroup.com/connect/token"
+NP_VOL_URL   = "https://data-api.nordpoolgroup.com/api/v2/Auction/Volumes/ByAreas"
+
+
+def get_nordpool_access_token(log_cb: LogCallback = _noop) -> Optional[str]:
+    """Authenticate against the Nord Pool market-data API. Returns the
+    bearer token, or None on any failure (network, credentials, or a
+    non-2xx response) — callers treat None as "Nord Pool unavailable" and
+    degrade gracefully, the same posture as a missing/failed ENTSO-E
+    fetch."""
+    if requests is None:
+        log_cb("  Nord Pool fetch skipped: requests library not installed.")
+        return None
+    headers = {
+        "Authorization": "Basic Y2xpZW50X21hcmtldGRhdGFfYXBpOmNsaWVudF9tYXJrZXRkYXRhX2FwaQ==",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {"grant_type": "password", "scope": "marketdata_api",
+            "username": NORDPOOL_USER, "password": NORDPOOL_PASSWORD}
+    try:
+        r = requests.post(NP_TOKEN_URL, headers=headers, data=data, timeout=10)
+        r.raise_for_status()
+        token = r.json().get("access_token")
+        if not token:
+            log_cb("  Nord Pool auth succeeded but returned no access_token.")
+        return token
+    except Exception as exc:
+        log_cb(f"  Nord Pool auth failed: {exc}")
+        return None
+
+
+def fetch_nordpool_net_positions(zones: Sequence[str], start_date, end_date,
+                                 log_cb: LogCallback = _noop) -> pd.DataFrame:
+    """
+    Fetch day-ahead net position (sell − buy, MW) for every zone in
+    `zones`, for every calendar day in [start_date, end_date] (inclusive),
+    from Nord Pool's Auction Volumes endpoint. One request per day, ALL
+    zones in that one request via repeated `areas` query params — the
+    same multi-area request shape app_jao_NP_API_fix_d14.py's Tab 8
+    animation already uses for prices/flows — not one request per
+    (day, zone) pair.
+
+    Returns a WIDE dataframe: `dateTimeUtc` (tz-aware UTC) plus one
+    `netpos_<ZONE>` column per requested zone, at whatever native
+    resolution Nord Pool published for that delivery day (historically
+    hourly, moving to 15-minute across the Nordic market on a schedule
+    that varies by zone/vintage). This function does NOT resample or
+    forward-fill anything — see merge_nordpool_net_positions() for the
+    as-of join that reconciles this against JAO's own MTU grid.
+
+    Never raises: returns an empty (zero-row, right-columns) dataframe if
+    authentication fails or every request fails, mirroring
+    fetch_entsoe_outages()'s "confirmed zero vs fetch failed" posture.
+    Per-day fetch failures are logged via log_cb and counted in the
+    returned dataframe's `.attrs["nordpool_fetch_failures"]` — the same
+    disambiguation mechanism fetch_entsoe_outages() already uses (and for
+    the same reason: "0 events"/an empty net-position table looks
+    identical whether nothing was ever wrong or the fetch never worked).
+    """
+    empty_cols = ["dateTimeUtc"] + [f"netpos_{z}" for z in zones]
+
+    def _empty_with_failure(**failure_kwargs) -> pd.DataFrame:
+        result = pd.DataFrame(columns=empty_cols)
+        result.attrs["nordpool_fetch_failures"] = failure_kwargs
+        return result
+
+    if requests is None:
+        log_cb("  Nord Pool net-position fetch skipped: requests library not installed.")
+        return _empty_with_failure(library_missing=True, auth_failed=False,
+                                   days_failed=0, days_total=0)
+
+    token = get_nordpool_access_token(log_cb)
+    if not token:
+        return _empty_with_failure(library_missing=False, auth_failed=True,
+                                   days_failed=0, days_total=0)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    dates = pd.date_range(pd.Timestamp(start_date).normalize(),
+                          pd.Timestamp(end_date).normalize(), freq="1D")
+
+    def _to_utc_ts(ts_str: str) -> pd.Timestamp:
+        ts = pd.Timestamp(ts_str)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+    rows = []
+    days_failed = 0
+    for d in dates:
+        date_str = d.strftime("%Y-%m-%d")
+        params = [("market", "DayAhead"), ("date", date_str)] + [("areas", z) for z in zones]
+        try:
+            r = requests.get(NP_VOL_URL, headers=headers, params=params, timeout=20)
+            if r.status_code != 200:
+                log_cb(f"  Nord Pool volumes {date_str}: HTTP {r.status_code}")
+                days_failed += 1
+                continue
+            payload = r.json()
+            if not isinstance(payload, list):
+                log_cb(f"  Nord Pool volumes {date_str}: unexpected response shape")
+                days_failed += 1
+                continue
+            for area_data in payload:
+                zone = area_data.get("deliveryArea")
+                if zone not in zones:
+                    continue
+                for v in area_data.get("volumes", []):
+                    ts = v.get("deliveryStart")
+                    if not ts:
+                        continue
+                    try:
+                        sell = float(v.get("sell") or 0.0)
+                        buy  = float(v.get("buy")  or 0.0)
+                        rows.append({"dateTimeUtc": _to_utc_ts(ts), "zone": zone,
+                                    "net_position_mw": sell - buy})
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:
+            log_cb(f"  Nord Pool volumes {date_str}: {exc}")
+            days_failed += 1
+            continue
+
+    if rows:
+        raw = pd.DataFrame(rows)
+        result = (raw.pivot_table(index="dateTimeUtc", columns="zone",
+                                  values="net_position_mw", aggfunc="mean")
+                 .reset_index())
+        result.columns = ["dateTimeUtc"] + [f"netpos_{z}" for z in result.columns[1:]]
+        result = result.sort_values("dateTimeUtc").reset_index(drop=True)
+    else:
+        result = pd.DataFrame(columns=empty_cols)
+
+    result.attrs["nordpool_fetch_failures"] = {
+        "library_missing": False, "auth_failed": False,
+        "days_failed": days_failed, "days_total": len(dates),
+    }
+    if days_failed:
+        log_cb(f"  Nord Pool net positions: {days_failed}/{len(dates)} day(s) failed to fetch")
+    return result
+
+
+def merge_nordpool_net_positions(no3_df: pd.DataFrame, net_pos_df: pd.DataFrame,
+                                 max_gap_minutes: int = 90) -> pd.DataFrame:
+    """
+    Left-join netpos_<ZONE> columns from fetch_nordpool_net_positions()
+    onto a JAO covariate dataframe (no3_df, at 15-min MTU resolution),
+    matching each JAO row to the most recent Nord Pool settlement period
+    AT OR BEFORE it (forward-fill via merge_asof), bounded by
+    `max_gap_minutes`. Nord Pool auction products have historically
+    settled hourly (moving to 15-minute across the Nordic market on a
+    schedule that varies by zone/vintage), so an exact-timestamp join
+    would silently drop most JAO rows whenever Nord Pool is still on
+    hourly settlement — the same "nearest earlier, bounded gap" treatment
+    app_jao_NP_API_fix_d14.py's own `_asof_value()` already uses for its
+    single-CNEC GUI display, reimplemented here as a vectorized
+    `pd.merge_asof` over the whole dataframe (that GUI version loops
+    per-row in pure Python — fine for one CNEC's worth of rows on a
+    chart, far too slow for a full multi-CNEC analytical dataframe).
+
+    A JAO row with no Nord Pool value within max_gap_minutes gets NaN in
+    every netpos_<ZONE> column — never a silently-substituted 0 (see
+    `_asof_value()`'s own docstring for why that would be indistinguishable
+    from a genuine zero, and so worse than a visible gap). _its_ptdf_flow()
+    already treats a NaN-heavy netpos_<ZONE> column as unusable for that
+    zone (excluded from its reconstruction) rather than letting it corrupt
+    the result.
+
+    Returns `no3_df` UNCHANGED (a copy) if `net_pos_df` is empty — e.g.
+    because fetch_nordpool_net_positions() itself failed — so a missing
+    Nord Pool fetch degrades this merge step to a no-op rather than an
+    error, consistent with "ptdf_flow" itself falling back gracefully
+    when no netpos_<ZONE> columns are present at all.
+    """
+    if net_pos_df.empty:
+        return no3_df.copy()
+
+    left  = no3_df.sort_values("dateTimeUtc")
+    right = net_pos_df.sort_values("dateTimeUtc")
+    merged = pd.merge_asof(left, right, on="dateTimeUtc", direction="backward",
+                           tolerance=pd.Timedelta(minutes=max_gap_minutes))
+    if "cneName" in merged.columns:
+        return merged.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
+    return merged.reset_index(drop=True)
+
+
 def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
     """Load a hand-curated outage CSV. Creates a template if missing."""
     p = Path(path)
@@ -3569,6 +3772,249 @@ def _its_hurdle(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     return all_agg.apply(_project, axis=1)
 
 
+# RAM = Fmax - FRM - fall + fnrao + AMR - FAAC - IVA (see build_covariates()'s
+# ram_check and decompose_delta_ram() -- this is the SAME formula, same sign
+# convention, verified on real data to balance within 1 MW on ~100% of rows
+# whenever the export carries all seven terms). _its_ram_identity() below is
+# the counterfactual-forecasting use of that identity: componentwise sign map
+# shared with both of those, so a bug fixed in one can't silently drift out
+# of sync with the others.
+_RAM_IDENTITY_TERMS: dict = {
+    "fmax": +1.0, "frm": -1.0, "fnrao": +1.0,
+    "amr": +1.0, "faac": -1.0, "fall": -1.0, "iva": -1.0,
+}
+
+# Which ITS method forecasts each RAM component's own counterfactual, chosen
+# for that component's actual dynamics rather than one blanket method for
+# all seven -- see _its_ram_identity()'s docstring for the reasoning behind
+# each pick.
+_RAM_COMPONENT_METHOD: dict = {
+    "fmax": "seasonal_naive", "frm": "seasonal_naive",
+    "fnrao": "theta", "amr": "theta", "faac": "theta",
+    "fall": "catboost", "iva": "hurdle",
+}
+
+
+def _its_ram_identity(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                      mtu_minutes: int = 15) -> pd.Series:
+    """
+    Physics-informed counterfactual: instead of forecasting RAM as an
+    independent black-box target, forecast each of the seven terms in
+    the Nordic RAM identity separately and COMPUTE the counterfactual RAM
+    from them. See _ITS_METHODS["ram_identity"]["description"] for the
+    full rationale.
+
+    RAM is not an independently observed physical quantity here — it is
+    an accounting identity of fmax/frm/fnrao/amr/faac/fall/iva (see
+    _RAM_IDENTITY_TERMS, and build_covariates()'s ram_check, which
+    verifies this on real data). Every OTHER ITS method in this section
+    treats "ram" as just another opaque column, which means nothing stops
+    a projected RAM from being inconsistent with what its own components
+    would imply. This method makes that impossible by construction: the
+    returned Series IS Σ (sign × projected component), so it satisfies
+    the identity exactly, not approximately.
+
+    Each component gets the sub-method suited to its own dynamics
+    (_RAM_COMPONENT_METHOD), not one blanket choice:
+      fmax, frm  — seasonal_naive. Both are structural/near-constant per
+                   CNEC; frm specifically is the H6 placebo's own null
+                   hypothesis (should NOT move with individual outages),
+                   so forecasting it with anything more flexible than the
+                   zero-variance seasonal mean would risk manufacturing
+                   spurious movement the placebo exists to rule out.
+      fnrao, amr, faac — theta. Secondary adjustment terms without a
+                   documented strong outage-response story; theta is
+                   cheap and a solid general-purpose choice here.
+      fall       — catboost. The term outages actually move (H1's own
+                   dependent variable) — deserves the richest per-column
+                   method available. catboost, not the slower "ensemble",
+                   to keep this method's own runtime reasonable, since it
+                   already fits 7 sub-models per call.
+      iva        — hurdle. IVA is TSO-discretionary and documented as
+                   "expected to be nonzero exactly during forced outages"
+                   (decompose_delta_ram()) / "zero on NO3 CNECs in short
+                   windows" (CLAUDE.md known limitations) — a genuinely
+                   zero-inflated series, the exact shape "hurdle" targets.
+                   Fit on the pre-period, hurdle's (hour, dow) P(binding)
+                   table naturally captures the BASELINE (mostly
+                   outage-free) rate at which IVA activates — precisely
+                   the right Y(0) to project forward.
+
+    Falls back to _its_theta() for any column other than "ram" (the
+    identity has nothing to decompose for a different target — this
+    method's whole value is specific to RAM), and to _its_ensemble() for
+    "ram" itself if any of the seven component columns isn't present in
+    pre_agg/all_agg (computing RAM from an INCOMPLETE subset of the
+    formula would silently produce a different, wrong quantity, not a
+    degraded RAM — exactly the AMR/IVA-dropping bug this formula's own
+    history in CLAUDE.md warns about). Requires pre_agg/all_agg to carry
+    the raw component columns alongside `col` — see
+    single_event_analysis()'s _run_its_for_method(), which widens the
+    per-column pre_agg/all_agg specifically so this method (and
+    _its_ptdf_flow()) can reach them.
+
+    Diagnostic (not required to use the projection, but there to avoid
+    trusting it blindly): the returned Series carries a
+    `ram_identity_check` entry in its `.attrs`, reusing the exact same
+    "does the identity balance within 1 MW" check build_covariates()'s
+    ram_check already runs — computed here on the PRE-PERIOD rows this
+    projection was fit from, so a caller can see whether this particular
+    CNEC/window's data actually supports the identity before trusting a
+    projection built on it.
+    """
+    if col != "ram":
+        return _its_theta(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    components = list(_RAM_IDENTITY_TERMS.keys())
+    missing = [c for c in components
+              if c not in pre_agg.columns or c not in all_agg.columns
+              or pre_agg[c].isna().all()]
+    if missing:
+        return _its_ensemble(pre_agg, all_agg, "ram", mtu_minutes=mtu_minutes)
+
+    projected_ram = np.zeros(len(all_agg))
+    component_series = {}
+    for c in components:
+        method = _RAM_COMPONENT_METHOD[c]
+        fn = _ITS_METHODS[method]["fn"]
+        proj_c = _call_its_method(fn, pre_agg, all_agg, c, method, mtu_minutes)
+        component_series[c] = proj_c
+        projected_ram += _RAM_IDENTITY_TERMS[c] * proj_c.values
+
+    result = pd.Series(projected_ram, index=all_agg.index)
+
+    # Identity-balance diagnostic on the PRE-PERIOD rows only (never
+    # during/post — this is purely informational, not part of the
+    # projection, and must obey the same "pre-period only" discipline as
+    # everything else in this section on principle).
+    if "ram" in pre_agg.columns and pre_agg["ram"].notna().any():
+        formula_pre = sum(_RAM_IDENTITY_TERMS[c] * pre_agg[c].fillna(0.0) for c in components)
+        diff = (pre_agg["ram"] - formula_pre).abs()
+        pct_ok = float((diff < 1.0).mean())
+        result.attrs["ram_identity_check"] = {
+            "pct_within_1mw_pre_period": pct_ok,
+            "mean_abs_diff_mw": float(diff.mean()),
+            "n_pre_period_rows": int(len(pre_agg)),
+        }
+
+    return result
+
+
+def _its_ptdf_flow(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                   mtu_minutes: int = 15,
+                   min_validation_corr: float = 0.5) -> pd.Series:
+    """
+    Physics-informed counterfactual for flow-type columns ("fall"/
+    "flowFB"): reconstruct the counterfactual as
+        flow_t ≈ Σ_zone PTDF_{zone,CNEC,t} × NetPosition_{zone,t}
+    — the DC/PTDF-based flow decomposition FBMC methodology is built on
+    (PTDFs derive from the grid's admittance matrix; a CNEC's loading is
+    the linear combination of every zone's net position, weighted by
+    that zone's sensitivity). See _ITS_METHODS["ptdf_flow"]["description"]
+    for the full rationale, and CLAUDE.md's domain-facts entry for why
+    this method validates itself rather than trusting the physics blindly.
+
+    UNLIKE _its_ram_identity(), this relationship is NOT a proven
+    accounting identity in this codebase — "fall" (F_allReference) is a
+    REFERENCE-case flow from the D-2 common grid model, not necessarily
+    numerically identical to Σ PTDF × REALIZED net position. Treating it
+    as exact would overclaim. So this method VALIDATES itself on the
+    pre-period before trusting the reconstruction: it computes
+    Σ PTDF_actual × NetPosition_actual against the ACTUAL observed `col`
+    on pre-period rows, and if the correlation is below
+    `min_validation_corr`, falls back to _its_ensemble() instead of
+    handing back a physics-flavored number that doesn't actually fit
+    this CNEC's data. The validation result is always attached to the
+    returned Series' `.attrs["ptdf_flow_validation"]`, whichever path is
+    taken, so a caller can see why.
+
+    Each zone's PTDF and net position get their OWN counterfactual
+    projection (seasonal_naive — both are ordinarily stable; PTDF's
+    projection is deliberately what "removes" an AC-outage's topology
+    shift, per H2's own logic, and net position is market-driven, not
+    directly caused by a single CNEC-level outage), then combined via the
+    linear formula above — never the raw observed during/post values,
+    same pre-period-only discipline as every other method here.
+
+    Requires netpos_<ZONE> columns already merged into pre_agg/all_agg
+    (see merge_nordpool_net_positions()) alongside the matching
+    ptdf_<ZONE> columns JAO already provides — falls back to
+    _its_ensemble() if none of the zones has both, since the whole
+    reconstruction needs at least one PTDF×position pair to mean
+    anything. This is an OPT-IN capability: out of the box, no caller has
+    fetched and merged net-position data, so this method gracefully
+    degrades to ensemble for everyone until that merge step is run —
+    exactly the same "library not installed" style fallback lightgbm/
+    catboost/tbats already use, just for a data dependency instead of a
+    package one.
+    """
+    if col not in ("fall", "flowFB"):
+        return _its_theta(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    zone_cols = []
+    for c in pre_agg.columns:
+        if not c.startswith("ptdf_") or c.endswith("_abs"):
+            continue
+        zone = c[len("ptdf_"):]
+        netpos_col = f"netpos_{zone}"
+        if (netpos_col in pre_agg.columns and netpos_col in all_agg.columns
+                and pre_agg[c].notna().any() and pre_agg[netpos_col].notna().any()):
+            zone_cols.append((zone, c, netpos_col))
+
+    if not zone_cols:
+        result = _its_ensemble(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+        result.attrs["ptdf_flow_validation"] = {
+            "status": "no_netpos_data",
+            "reason": ("no ptdf_<ZONE>/netpos_<ZONE> column pair found in "
+                      "pre_agg -- fetch_nordpool_net_positions() + "
+                      "merge_nordpool_net_positions() haven't been run for "
+                      "this data, or no zone had both columns populated"),
+        }
+        return result
+
+    # ── Validate on the pre-period: does Σ PTDF_actual × NP_actual ─────────
+    # actually track the observed target here, before trusting a projection
+    # built the same way?
+    reconstructed_pre = np.zeros(len(pre_agg))
+    for _zone, ptdf_col, netpos_col in zone_cols:
+        reconstructed_pre += (pre_agg[ptdf_col].fillna(0.0).values
+                              * pre_agg[netpos_col].fillna(0.0).values)
+    actual_pre = pre_agg[col].values.astype(float)
+    valid_mask = np.isfinite(reconstructed_pre) & np.isfinite(actual_pre)
+    if valid_mask.sum() >= 5 and np.std(reconstructed_pre[valid_mask]) > 1e-9:
+        corr = float(np.corrcoef(reconstructed_pre[valid_mask], actual_pre[valid_mask])[0, 1])
+    else:
+        corr = float("nan")
+
+    validation = {
+        "status": "validated",
+        "zones_used": [z for z, _, _ in zone_cols],
+        "n_pre_period_rows": int(valid_mask.sum()),
+        "pre_period_correlation": corr,
+        "min_required_correlation": min_validation_corr,
+    }
+
+    if not np.isfinite(corr) or corr < min_validation_corr:
+        result = _its_ensemble(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+        validation["status"] = "failed_validation_fell_back_to_ensemble"
+        result.attrs["ptdf_flow_validation"] = validation
+        return result
+
+    # ── Passed validation: project each zone's PTDF and net position, ──────
+    # combine via the linear PTDF-flow formula.
+    projected_flow = np.zeros(len(all_agg))
+    for _zone, ptdf_col, netpos_col in zone_cols:
+        ptdf_proj   = _call_its_method(_its_seasonal_naive, pre_agg, all_agg,
+                                       ptdf_col, "seasonal_naive", mtu_minutes)
+        netpos_proj = _call_its_method(_its_seasonal_naive, pre_agg, all_agg,
+                                       netpos_col, "seasonal_naive", mtu_minutes)
+        projected_flow += ptdf_proj.values * netpos_proj.values
+
+    result = pd.Series(projected_flow, index=all_agg.index)
+    result.attrs["ptdf_flow_validation"] = validation
+    return result
+
+
 def _clamp_recovery_frac(impact: float, recovery_residual: float) -> float:
     """Compute recovery fraction clamped to [-1.0, 1.0].
 
@@ -4231,7 +4677,13 @@ def _its_ensemble(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     so budget noticeably more than a plain "all" mode run, not just
     double.
     """
-    members = [m for m in _ITS_METHODS if m != "ensemble"]
+    # ram_identity/ptdf_flow are excluded, not just "ensemble" itself: both
+    # fall back to _its_ensemble() when their physics doesn't apply to this
+    # column/data (see their own docstrings) -- including them as members
+    # here would let that fallback call straight back into this function,
+    # an infinite recursion for any column/CNEC where either one degrades.
+    members = [m for m in _ITS_METHODS
+              if m not in ("ensemble", "ram_identity", "ptdf_flow")]
 
     weights = _ensemble_backtest_weights(pre_agg, col, mtu_minutes, members)
     if weights is None:
@@ -4470,6 +4922,79 @@ _ITS_METHODS = {
             "Minimum baseline: 2 days, same as seasonal_naive."),
         "fn": _its_hurdle,
     },
+    "ram_identity": {
+        "label":       "RAM Identity (physics-informed)",
+        "min_days":    7,
+        "description": (
+            "Physics-informed: instead of forecasting RAM as an "
+            "independent black-box target, forecasts each of the seven "
+            "terms in the Nordic RAM identity (RAM = Fmax - FRM - fall + "
+            "fnrao + AMR - FAAC - IVA -- the same formula build_covariates()' "
+            "ram_check already verifies balances within 1 MW on ~100% of "
+            "real rows) with its own suited method -- seasonal_naive for "
+            "fmax/frm (structural; frm is literally the H6 placebo's null "
+            "hypothesis), theta for fnrao/amr/faac, catboost for fall (the "
+            "term outages actually move -- H1's own dependent variable), "
+            "hurdle for iva (zero-inflated, TSO-discretionary, documented "
+            "as nonzero mainly during forced outages) -- and COMPUTES the "
+            "counterfactual RAM from them. This makes an internally "
+            "inconsistent projection impossible by construction, not just "
+            "unlikely: the result IS the sum of its (signed) parts, never "
+            "an independently-fit number that happens to differ from what "
+            "its own components would imply. Only decomposes 'ram' "
+            "specifically -- falls back to theta for any other column, and "
+            "to ensemble for 'ram' itself if any of the seven raw component "
+            "columns is missing from pre_agg/all_agg (computing RAM from an "
+            "incomplete subset would silently produce a different, WRONG "
+            "quantity -- the exact AMR/IVA-dropping mistake this formula's "
+            "own history warns about, see CLAUDE.md). Requires pre_agg/ "
+            "all_agg to carry the raw fmax/frm/fnrao/amr/faac/fall/iva "
+            "columns -- single_event_analysis() widens them for this "
+            "purpose; a caller building pre_agg/all_agg itself must do the "
+            "same. Attaches a `ram_identity_check` diagnostic to the "
+            "returned Series' .attrs (pre-period formula-balance %) so the "
+            "projection's own footing can be checked, not just trusted. "
+            "Minimum baseline: 7 days (governed by its weakest component "
+            "sub-method's own floor)."),
+        "fn": _its_ram_identity,
+    },
+    "ptdf_flow": {
+        "label":       "PTDF x Net Position (physics-informed)",
+        "min_days":    7,
+        "description": (
+            "Physics-informed: reconstructs the counterfactual flow as "
+            "Σ_zone PTDF_zone,CNEC,t x NetPosition_zone,t -- the DC/PTDF-"
+            "based flow decomposition Nordic FBMC is built on (a CNEC's "
+            "loading is the linear combination of every zone's net "
+            "position, weighted by that zone's grid-topology sensitivity). "
+            "Unlike ram_identity, this is NOT a proven accounting identity "
+            "in this codebase -- 'fall' (F_allReference) is a REFERENCE-"
+            "case flow from the D-2 common grid model, not necessarily "
+            "identical to Σ PTDF x REALIZED net position -- so this method "
+            "VALIDATES the reconstruction against the actually observed "
+            "column on pre-period data before trusting it (correlation "
+            "must clear min_validation_corr, default 0.5), falling back to "
+            "ensemble when it doesn't. The validation outcome is always "
+            "attached to the returned Series' .attrs['ptdf_flow_validation'] "
+            "regardless of which path was taken, so a caller can see why. "
+            "Each zone's PTDF and net position get their OWN seasonal_naive "
+            "counterfactual (deliberately simple -- PTDF's own projection is "
+            "what 'removes' an AC-outage's topology shift per H2's logic, "
+            "and net position is market-driven, not directly caused by a "
+            "single CNEC-level outage) before combining via the linear "
+            "formula. Only applies to 'fall'/'flowFB' -- falls back to theta "
+            "for any other column. OPT-IN: requires netpos_<ZONE> columns "
+            "already merged into pre_agg/all_agg (see "
+            "fetch_nordpool_net_positions()/merge_nordpool_net_positions()) "
+            "alongside the matching ptdf_<ZONE> columns JAO already "
+            "provides -- out of the box, no caller has done that merge, so "
+            "this gracefully degrades to ensemble for everyone until it is, "
+            "the same 'library not installed' style fallback lightgbm/"
+            "catboost/tbats use, just for a data dependency instead of a "
+            "package one. "
+            "Minimum baseline: 7 days."),
+        "fn": _its_ptdf_flow,
+    },
     "ensemble": {
         "label":       "Ensemble (adaptive, backtest-weighted)",
         "min_days":    2,
@@ -4569,6 +5094,8 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "tbats"          — TBATS with daily+weekly seasonality
         "theta"          — Theta method on deseasonalized residuals
         "hurdle"         — two-part zero-inflated model (for shadow price)
+        "ram_identity"   — physics-informed: forecasts RAM's 7 components, computes RAM
+        "ptdf_flow"      — physics-informed: reconstructs flow as Σ PTDF x net position
         "ensemble"       — adaptive, backtest-weighted blend of every method above
         "all"            — run every registered method; dashboard can compare them
 
@@ -4770,6 +5297,8 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     #   "tbats"          — TBATS with daily+weekly seasonality
     #   "theta"          — Theta method on deseasonalized residuals
     #   "hurdle"         — two-part zero-inflated model (for shadow price)
+    #   "ram_identity"   — physics-informed: forecasts RAM's 7 components, computes RAM
+    #   "ptdf_flow"      — physics-informed: reconstructs flow as Σ PTDF x net position
     #   "ensemble"       — adaptive, backtest-weighted blend of every method above
     #   "all"            — run every registered method, return its_all dict
     #
@@ -4804,7 +5333,20 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         s_lookups = {}
         s_means   = {}
         for col in _its_cols:
-            pre_agg = pre.groupby("dateTimeUtc")[col].mean().reset_index()
+            # Extra columns carried alongside `col`, purely for the two
+            # physics-informed methods (_its_ram_identity()/_its_ptdf_flow())
+            # -- every other method only ever reads `col`/hour/dow from
+            # pre_agg/all_agg and ignores anything else, so widening this is
+            # backward-compatible with all of them. RAM-identity terms come
+            # from _RAM_IDENTITY_TERMS; ptdf_*/netpos_* are prefix-matched
+            # since the exact zone set varies per JAO export and whether
+            # merge_nordpool_net_positions() has been run for this data.
+            _extra = [c for c in _RAM_IDENTITY_TERMS if c in pre.columns and c != col]
+            _extra += [c for c in pre.columns
+                      if (c.startswith("ptdf_") or c.startswith("netpos_")) and c != col]
+            _extra = list(dict.fromkeys(_extra))   # de-dup, keep first-seen order
+
+            pre_agg = pre.groupby("dateTimeUtc")[[col] + _extra].mean().reset_index()
             if len(pre_agg) < 4:
                 continue
             pre_agg["hour"] = pre_agg["dateTimeUtc"].dt.hour
@@ -4815,7 +5357,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             s_lookups[col] = _sn
             s_means[col]   = float(pre_agg[col].mean())
 
-            all_agg = window.groupby("dateTimeUtc")[col].mean().reset_index()
+            all_agg = window.groupby("dateTimeUtc")[[col] + _extra].mean().reset_index()
             all_agg = all_agg.sort_values("dateTimeUtc").reset_index(drop=True)
             all_agg["hour"] = all_agg["dateTimeUtc"].dt.hour
             all_agg["dow"]  = all_agg["dateTimeUtc"].dt.dayofweek
@@ -4828,7 +5370,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             all_agg.loc[all_agg.dateTimeUtc >= e, "period"] = "post"
             all_agg["param"]  = col
             all_agg["method"] = method_key
-            rows.append(all_agg.drop(columns=["hour","dow"]))
+            rows.append(all_agg.drop(columns=["hour","dow"] + _extra))
 
             dur_rows  = all_agg[all_agg.period == "during"]
             post_rows = all_agg[all_agg.period == "post"]

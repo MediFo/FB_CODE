@@ -1260,8 +1260,10 @@ class App:
             "tbats":          "TBATS (daily+weekly)     [min 14 days]",
             "theta":          "Theta method              [min 7 days]",
             "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
+            "ram_identity":   "RAM Identity (physics-informed)   [min 7 days]",
+            "ptdf_flow":      "PTDF x Net Position (physics-informed) [min 7 days]",
             "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
-            "all":            "All thirteen  [run & compare side-by-side]",
+            "all":            "All fifteen  [run & compare side-by-side]",
         }
         _method_cb = ttk.Combobox(
             ctrl,
@@ -1597,6 +1599,8 @@ class App:
             "tbats":          ("#a65b8e", ":"),
             "theta":          ("#7fa65b", "--"),
             "hurdle":         ("#c97b3c", "-."),
+            "ram_identity":   ("#3d7a6b", "-"),
+            "ptdf_flow":      ("#6b4c8c", "-"),
             "ensemble":       ("#1a1a1a", "-"),
         }
 
