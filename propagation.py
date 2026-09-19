@@ -3787,10 +3787,28 @@ _RAM_IDENTITY_TERMS: dict = {
 # Which ITS method forecasts each RAM component's own counterfactual, chosen
 # for that component's actual dynamics rather than one blanket method for
 # all seven -- see _its_ram_identity()'s docstring for the reasoning behind
-# each pick.
+# each pick. Originally an all-theta choice for fnrao/amr/faac and
+# seasonal_naive for frm, picked on domain-story grounds alone; re-picked
+# from a pre-period-only backtest (fit N days, project a held-out
+# continuation, compare to known truth -- same method as CLAUDE.md's
+# "Backtested accuracy"/"ACCURACY REALITY CHECK" notes) once synthetic.py
+# started giving these terms genuine day-level structure to actually
+# distinguish candidates on (see synthetic.py's _ar1_day_regime()). theta
+# turned out ~2x worse than seasonal_naive on fnrao and consistently worse
+# than hurdle on the zero-inflated amr; seasonal_naive turned out to
+# catastrophically mis-forecast frm (MAE 42.8 vs ridge's 2.2 at a 60-day
+# pre-period) whenever the fit window straddles the Dec-2024 structural
+# step, because its hour/dow lookup table averages pre- and post-step
+# values together into a contaminated mean -- ridge instead tracks the
+# CURRENT level via lag1d/lag7d, which contain no outage information, so
+# this doesn't reintroduce the outage-sensitivity H6's placebo exists to
+# rule out, it just stops the projection from lagging behind a known
+# calibration change. faac (theta) and fall (catboost) backtested as
+# already-correct; iva (hurdle) ties for best and keeps its zero-inflation
+# rationale.
 _RAM_COMPONENT_METHOD: dict = {
-    "fmax": "seasonal_naive", "frm": "seasonal_naive",
-    "fnrao": "theta", "amr": "theta", "faac": "theta",
+    "fmax": "seasonal_naive", "frm": "ridge",
+    "fnrao": "seasonal_naive", "amr": "hurdle", "faac": "theta",
     "fall": "catboost", "iva": "hurdle",
 }
 
@@ -3815,21 +3833,52 @@ def _its_ram_identity(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     the identity exactly, not approximately.
 
     Each component gets the sub-method suited to its own dynamics
-    (_RAM_COMPONENT_METHOD), not one blanket choice:
-      fmax, frm  — seasonal_naive. Both are structural/near-constant per
-                   CNEC; frm specifically is the H6 placebo's own null
-                   hypothesis (should NOT move with individual outages),
-                   so forecasting it with anything more flexible than the
-                   zero-variance seasonal mean would risk manufacturing
-                   spurious movement the placebo exists to rule out.
-      fnrao, amr, faac — theta. Secondary adjustment terms without a
-                   documented strong outage-response story; theta is
-                   cheap and a solid general-purpose choice here.
+    (_RAM_COMPONENT_METHOD), not one blanket choice -- picked from an
+    actual pre-period-only backtest per component (fit N days, project a
+    held-out continuation, compare to known truth), not domain-story
+    guesswork alone; see _RAM_COMPONENT_METHOD's own comment for the
+    backtest numbers that justified each pick:
+      fmax       — seasonal_naive. Structural/near-constant per CNEC —
+                   every candidate method backtests at ~0 MAE here, so the
+                   cheapest correct one wins.
+      frm        — ridge. Structural like fmax, and frm is the H6
+                   placebo's own null hypothesis (should NOT move with
+                   individual outages) -- but seasonal_naive's (hour, dow)
+                   lookup table turned out to catastrophically mis-forecast
+                   frm whenever the pre-period straddles the Dec-2024
+                   structural step (it averages pre- and post-step values
+                   into one contaminated mean; backtested MAE 42.8 vs
+                   ridge's 2.2 at a 60-day pre-period spanning the step).
+                   ridge's lag1d/lag7d features track the CURRENT level
+                   instead, without carrying any outage information, so
+                   this doesn't reopen the door to the spurious
+                   outage-sensitivity the placebo rules out — it only
+                   stops the projection from lagging behind a known,
+                   outage-independent calibration change.
+      fnrao      — seasonal_naive. Backtested ~2x more accurate than
+                   theta (the original pick) on synthetic data once
+                   fnrao carried genuine day-level structure to
+                   distinguish candidates on — theta's ARIMA-on-residual
+                   machinery added noise here rather than signal.
+      amr        — hurdle. AMR is zero most of the time by construction
+                   (see synthetic.py) — a genuinely zero-inflated series,
+                   the exact shape "hurdle" targets, and it backtested at
+                   or near the best MAE of any candidate at every
+                   pre-period length tested; theta (the original pick)
+                   was consistently worse.
+      faac       — theta. Backtested as already the best candidate —
+                   faac is small but continuous with a persistent
+                   day-level drift, not zero-inflated, which suits
+                   theta's short-series residual modeling better than a
+                   zero-inflation table (hurdle) or a pure lookup
+                   (seasonal_naive) would.
       fall       — catboost. The term outages actually move (H1's own
                    dependent variable) — deserves the richest per-column
-                   method available. catboost, not the slower "ensemble",
-                   to keep this method's own runtime reasonable, since it
-                   already fits 7 sub-models per call.
+                   method available, and backtests as the best or
+                   statistically-tied-for-best candidate. catboost, not
+                   the slower "ensemble", to keep this method's own
+                   runtime reasonable, since it already fits 7 sub-models
+                   per call.
       iva        — hurdle. IVA is TSO-discretionary and documented as
                    "expected to be nonzero exactly during forced outages"
                    (decompose_delta_ram()) / "zero on NO3 CNECs in short
@@ -3838,7 +3887,8 @@ def _its_ram_identity(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
                    Fit on the pre-period, hurdle's (hour, dow) P(binding)
                    table naturally captures the BASELINE (mostly
                    outage-free) rate at which IVA activates — precisely
-                   the right Y(0) to project forward.
+                   the right Y(0) to project forward. Backtests at or
+                   near the best MAE of any candidate.
 
     Falls back to _its_theta() for any column other than "ram" (the
     identity has nothing to decompose for a different target — this
