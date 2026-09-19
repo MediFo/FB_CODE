@@ -573,6 +573,35 @@ pytest test_pipeline.py -v
       of view. A caller building pre_agg/all_agg outside
       single_event_analysis() must do the same widening itself for these
       two methods to have anything to work with.
+    - ACCURACY REALITY CHECK (backtested the same pre-period-only way as
+      the "Backtested accuracy" note below, right after building these):
+      neither physics-informed method clearly beats a plain black-box
+      forecast of the same target on synthetic data. ram_identity vs
+      seasonal_naive-on-"ram" directly: 21.8 vs 19.6 MAE at 30 days, 14.9
+      vs 14.3 at 60 days, 20.5 vs 20.9 at 90 days — a wash, not a win.
+      ptdf_flow vs catboost-on-"fall" directly: 7.5 vs 7.5 at 20 days, 7.6
+      vs 7.4 at 40 days — ptdf_flow beats the generic methods
+      (seasonal_naive/arima/theta) but not a well-tuned single-target
+      catboost fit. Reason: both methods decompose one target into
+      several sub-series (7 components for RAM, 4 PTDF/net-position
+      series for flow), fit each independently, then combine — each
+      sub-fit's own estimation error adds up, sometimes outweighing
+      whatever the formula's structure buys back, whereas a single model
+      forecasting the target directly has fewer places for error to
+      accumulate and can implicitly pick up the same hour/dow structure
+      the physics formula encodes anyway. CONCLUSION: treat these two as
+      INTERPRETABILITY/CONSISTENCY tools first, accuracy tools second —
+      ram_identity's real value is that its output CANNOT contradict its
+      own components (useful for "RAM moved by X because fall moved by Y"
+      reporting), ptdf_flow's is that it self-validates rather than
+      silently trusting an unproven relationship — not that either is
+      expected to have the lowest MAE. This could look different on REAL
+      JAO data (if real components have genuine outage-driven divergence
+      from calendar patterns a black-box model would need much more data
+      to learn, the physics decomposition gets that structure for free
+      from the formula instead of having to discover it) — untested here
+      since this repo has no real JAO history, and worth re-checking once
+      real data is available rather than assuming either direction.
 - Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
   available in this repo): with a two-timescale synthetic series — MTU-to-
   MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by
