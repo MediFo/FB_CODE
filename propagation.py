@@ -3979,12 +3979,20 @@ def _its_ptdf_flow(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     taken, so a caller can see why.
 
     Each zone's PTDF and net position get their OWN counterfactual
-    projection (seasonal_naive — both are ordinarily stable; PTDF's
-    projection is deliberately what "removes" an AC-outage's topology
-    shift, per H2's own logic, and net position is market-driven, not
-    directly caused by a single CNEC-level outage), then combined via the
-    linear formula above — never the raw observed during/post values,
-    same pre-period-only discipline as every other method here.
+    projection, but NOT the same sub-method for both — re-picked from a
+    per-column backtest the same way _RAM_COMPONENT_METHOD was (see its
+    comment): PTDF stays seasonal_naive (near-constant per CNEC by
+    construction; every candidate ties within noise, so the cheapest wins,
+    and its projection is deliberately what "removes" an AC-outage's
+    topology shift, per H2's own logic). Net position gets ridge instead —
+    it's a market-driven quantity with real day-to-day persistence (cold
+    snaps, demand swings) a hound/dow-only lookup can't see, and
+    seasonal_naive backtested consistently worse than ridge (never best at
+    either pre-period length tested, ~13% worse at a 30-day pre-period)
+    since it can only see the hour/dow pattern, not the day-specific
+    regime level; ridge, not catboost (which edges it out slightly), to
+    keep the total cost down since this method already fits up to 2
+    sub-projections per zone across every zone with data.
 
     Requires netpos_<ZONE> columns already merged into pre_agg/all_agg
     (see merge_nordpool_net_positions()) alongside the matching
@@ -4056,8 +4064,8 @@ def _its_ptdf_flow(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
     for _zone, ptdf_col, netpos_col in zone_cols:
         ptdf_proj   = _call_its_method(_its_seasonal_naive, pre_agg, all_agg,
                                        ptdf_col, "seasonal_naive", mtu_minutes)
-        netpos_proj = _call_its_method(_its_seasonal_naive, pre_agg, all_agg,
-                                       netpos_col, "seasonal_naive", mtu_minutes)
+        netpos_proj = _call_its_method(_its_ridge, pre_agg, all_agg,
+                                       netpos_col, "ridge", mtu_minutes)
         projected_flow += ptdf_proj.values * netpos_proj.values
 
     result = pd.Series(projected_flow, index=all_agg.index)
