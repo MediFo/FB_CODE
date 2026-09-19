@@ -206,11 +206,19 @@ def generate_jao_csv(start: datetime, end: datetime,
         mask = (ts_np >= r["start_utc"].to_datetime64()) & (ts_np < r["end_utc"].to_datetime64())
         mw_hvdc[mask] += float(r["capacity_mw"])
 
-    # Diurnal & weekly patterns
+    # Diurnal & weekly patterns. Small here deliberately -- this is 'fall's
+    # OWN direct residual pattern (genuine local structure not mediated by
+    # net position, e.g. thermal/reactive effects), NOT the CNEC's whole
+    # diurnal/weekly signal: most of that now flows through the larger
+    # netpos-mediated diurnal/weekly term below (per-CNEC, inside the main
+    # generation loop) instead, so _its_ptdf_flow()'s Σ PTDF×NetPosition
+    # reconstruction has a real chance of seeing it. This split changes
+    # nothing about 'fall' as a direct-forecast target -- its total
+    # diurnal/weekly magnitude is unchanged, just differently composed.
     hr = timestamps.hour
-    diurnal = 50 * np.sin(2 * np.pi * hr / 24)
+    diurnal = 12 * np.sin(2 * np.pi * hr / 24)
     dow = timestamps.dayofweek
-    weekly = -30 * (dow >= 5)  # weekends slightly lower
+    weekly = -8 * (dow >= 5)  # weekends slightly lower
 
     # Day-level index per timestamp, used below to give fnrao/amr/faac/iva
     # genuine day-to-day persistence -- distinct from the diurnal/weekly
@@ -271,9 +279,15 @@ def generate_jao_csv(start: datetime, end: datetime,
         # quantity, not an outage effect) Σ PTDF_base × NetPosition term
         # into 'fall' itself below: the real F_allReference genuinely
         # depends on the D-2 base-case net positions, which 'fall'
-        # previously had no dependency on at all. Amplitudes kept modest
-        # (well under fall's existing noise+diurnal+outage-effect scale)
-        # so this doesn't drown out the outage effects H1/H2 detect.
+        # previously had no dependency on at all. Diurnal/weekly amplitude
+        # here is deliberately LARGER than 'fall' keeps directly below (see
+        # that comment) -- a backtest showed most of fall's diurnal/weekly
+        # pattern needs to flow through this netpos-mediated channel for
+        # _its_ptdf_flow() to have any real chance of reconstructing it;
+        # this changes nothing about 'fall' itself as a direct-forecast
+        # target (seasonal_naive/catboost only ever see fall's final
+        # values, not how it's internally composed), only whether the
+        # PHYSICS-BASED reconstruction can also see that same structure.
         _ptdf_base_by_zone = {
             "FI": ptdf_FI_base, "NO3": ptdf_NO3_base, "NO4": ptdf_NO4_base,
             "SE1": ptdf_SE1_base, "SE2": ptdf_SE2_base, "SE3": ptdf_SE3_base,
@@ -282,7 +296,7 @@ def generate_jao_csv(start: datetime, end: datetime,
         fall_netpos_term = np.zeros(n)
         for _zone, _ptdf_base in _ptdf_base_by_zone.items():
             _regime_np = _ar1_day_regime()
-            _npzone = (40 * np.sin(2 * np.pi * hr / 24) - 15 * (dow >= 5)
+            _npzone = (70 * np.sin(2 * np.pi * hr / 24) - 35 * (dow >= 5)
                       + 30 * _regime_np + rng.normal(0, 15, n))
             netpos_by_zone[_zone] = _npzone
             fall_netpos_term += _ptdf_base * _npzone
