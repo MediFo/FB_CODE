@@ -248,6 +248,44 @@ def generate_jao_csv(start: datetime, end: datetime,
         ptdf_NO3_base = rng.uniform(0.20, 0.40)
         ptdf_FI_FS_base = rng.uniform(-0.04, -0.01)
         ptdf_FI_EL_base = rng.uniform(-0.03, -0.01)
+        # NO4/SE1/SE2/SE3 PTDFs used to be redrawn fresh, INDEPENDENTLY, on
+        # every single row -- no persistent per-CNEC value at all, unlike a
+        # real PTDF (stable for a CNEC, shifting only slowly with grid
+        # topology) or ptdf_FI/ptdf_NO3 above (both base + small per-MTU
+        # noise). Fixed to the same base + small-noise shape so they're
+        # usable as genuine physics inputs below and in _its_ptdf_flow()
+        # (propagation.py).
+        ptdf_NO4_base = rng.uniform(0.10, 0.20)
+        ptdf_SE1_base = rng.uniform(0.05, 0.15)
+        ptdf_SE2_base = rng.uniform(0.02, 0.08)
+        ptdf_SE3_base = rng.uniform(0.01, 0.05)
+
+        # Zone net positions (day-ahead market schedules): real economic
+        # quantities, so -- unlike fnrao/amr/faac/iva above, which are
+        # grid-operational -- they get the diurnal/weekly demand pattern
+        # too, on top of their own day-level AR(1) regime (cold snaps /
+        # demand swings a single global diurnal/weekly curve can't
+        # capture). Written out as netpos_<ZONE> columns for
+        # _its_ptdf_flow() to reconstruct 'fall' from, and also feeds an
+        # UNSCALED (not effect_scale-multiplied -- a base-case market
+        # quantity, not an outage effect) Σ PTDF_base × NetPosition term
+        # into 'fall' itself below: the real F_allReference genuinely
+        # depends on the D-2 base-case net positions, which 'fall'
+        # previously had no dependency on at all. Amplitudes kept modest
+        # (well under fall's existing noise+diurnal+outage-effect scale)
+        # so this doesn't drown out the outage effects H1/H2 detect.
+        _ptdf_base_by_zone = {
+            "FI": ptdf_FI_base, "NO3": ptdf_NO3_base, "NO4": ptdf_NO4_base,
+            "SE1": ptdf_SE1_base, "SE2": ptdf_SE2_base, "SE3": ptdf_SE3_base,
+        }
+        netpos_by_zone = {}
+        fall_netpos_term = np.zeros(n)
+        for _zone, _ptdf_base in _ptdf_base_by_zone.items():
+            _regime_np = _ar1_day_regime()
+            _npzone = (40 * np.sin(2 * np.pi * hr / 24) - 15 * (dow >= 5)
+                      + 30 * _regime_np + rng.normal(0, 15, n))
+            netpos_by_zone[_zone] = _npzone
+            fall_netpos_term += _ptdf_base * _npzone
 
         # fall (F_allReference): the reference flow that actually enters the RAM
         # formula (see CLAUDE.md / METHODOLOGY.md) — this is where outage effects
@@ -259,6 +297,7 @@ def generate_jao_csv(start: datetime, end: datetime,
         # that check a real test again.
         fall = (rng.normal(0, 30, n)                   # noise
               + diurnal + weekly                       # patterns
+              + fall_netpos_term                       # D-2 base-case net-position term
               + effect_scale * 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
               + effect_scale * 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
               + effect_scale * 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
@@ -275,6 +314,17 @@ def generate_jao_csv(start: datetime, end: datetime,
         ptdf_FI_EL = np.where(is_hvdc & (mw_hvdc > 600) & (mw_hvdc < 700),
                               rng.normal(0, 0.001, n),
                               ptdf_FI_EL_base + rng.normal(0, 0.001, n))
+
+        # NO3/NO4/SE1/SE2/SE3 PTDFs: base + small per-MTU noise, vectorized
+        # (this used to be drawn one rng call at a time inside the per-row
+        # loop below -- moved up here alongside the other ptdf_* arrays,
+        # same base+noise shape, just precomputed instead of drawn 96*days
+        # times in a Python loop).
+        ptdf_NO3 = ptdf_NO3_base + rng.normal(0, 0.005, n)
+        ptdf_NO4 = ptdf_NO4_base + rng.normal(0, 0.005, n)
+        ptdf_SE1 = ptdf_SE1_base + rng.normal(0, 0.005, n)
+        ptdf_SE2 = ptdf_SE2_base + rng.normal(0, 0.005, n)
+        ptdf_SE3 = ptdf_SE3_base + rng.normal(0, 0.005, n)
 
         # FRM: structural, with December 2024 step change
         frm = np.full(n, frm_base * 0.5)  # pre-Dec-2024 lower
@@ -360,11 +410,17 @@ def generate_jao_csv(start: datetime, end: datetime,
                 "ptdf_FI": round(float(ptdf_FI[i]), 5),
                 "ptdf_FI_FS": round(float(ptdf_FI_FS[i]), 5),
                 "ptdf_FI_EL": round(float(ptdf_FI_EL[i]), 5),
-                "ptdf_NO3": round(float(ptdf_NO3_base + rng.normal(0, 0.005)), 5),
-                "ptdf_NO4": round(float(rng.uniform(0.10, 0.20)), 5),
-                "ptdf_SE1": round(float(rng.uniform(0.05, 0.15)), 5),
-                "ptdf_SE2": round(float(rng.uniform(0.02, 0.08)), 5),
-                "ptdf_SE3": round(float(rng.uniform(0.01, 0.05)), 5),
+                "ptdf_NO3": round(float(ptdf_NO3[i]), 5),
+                "ptdf_NO4": round(float(ptdf_NO4[i]), 5),
+                "ptdf_SE1": round(float(ptdf_SE1[i]), 5),
+                "ptdf_SE2": round(float(ptdf_SE2[i]), 5),
+                "ptdf_SE3": round(float(ptdf_SE3[i]), 5),
+                "netpos_FI":  round(float(netpos_by_zone["FI"][i]), 2),
+                "netpos_NO3": round(float(netpos_by_zone["NO3"][i]), 2),
+                "netpos_NO4": round(float(netpos_by_zone["NO4"][i]), 2),
+                "netpos_SE1": round(float(netpos_by_zone["SE1"][i]), 2),
+                "netpos_SE2": round(float(netpos_by_zone["SE2"][i]), 2),
+                "netpos_SE3": round(float(netpos_by_zone["SE3"][i]), 2),
             })
 
     df = pd.DataFrame(rows)
