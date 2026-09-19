@@ -287,6 +287,23 @@ def generate_jao_csv(start: datetime, end: datetime,
             netpos_by_zone[_zone] = _npzone
             fall_netpos_term += _ptdf_base * _npzone
 
+        # CNEC-specific base-case level: previously an arbitrary constant
+        # added directly to 'fall' with no physical explanation, and
+        # invisible to _its_ptdf_flow() (propagation.py), which only ever
+        # looks at netpos_<ZONE>, never 'fall' itself -- an unexplained
+        # bias it structurally could never correct for, unlike a direct
+        # forecast fit on 'fall' (seasonal_naive/catboost), which trivially
+        # absorbs any constant level via its own hour/dow mean. Folded into
+        # netpos_NO3's own per-CNEC mean level instead -- NO3 has the
+        # largest PTDF magnitude of the six zones (always in [0.20, 0.40],
+        # comfortably away from zero), so dividing by it here is safe. Same
+        # rng draw and same net effect on 'fall' as before, but now
+        # genuinely reconstructible from net position like the rest of the
+        # netpos-driven term.
+        _fall_bias = rng.uniform(-30, 30)
+        netpos_by_zone["NO3"] = netpos_by_zone["NO3"] + _fall_bias / ptdf_NO3_base
+        fall_netpos_term += _fall_bias
+
         # fall (F_allReference): the reference flow that actually enters the RAM
         # formula (see CLAUDE.md / METHODOLOGY.md) — this is where outage effects
         # belong, as an INDEPENDENT simulated quantity. It used to be computed
@@ -301,7 +318,6 @@ def generate_jao_csv(start: datetime, end: datetime,
               + effect_scale * 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
               + effect_scale * 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
               + effect_scale * 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
-        fall += rng.uniform(-30, 30)  # CNEC-specific bias
 
         # PTDF_FI shifts only during AC line outages (small magnitude)
         ptdf_FI = ptdf_FI_base + effect_scale * 0.025 * is_ac * np.sign(ptdf_FI_base) * (-1) \
