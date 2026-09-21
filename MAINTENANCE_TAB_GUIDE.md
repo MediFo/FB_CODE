@@ -169,7 +169,19 @@ have.
 **Price Spread pane (optional, added after the rest of this tab).**
 Shows how much ONE CNEC's contribution to a TARGET zone's price has
 moved, at one timestamp the user picks, relative to what it would have
-been without the outage:
+been without the outage. The timestamp is picked as two separate
+**Date (CET):** / **Time (CET):** comboboxes — same convention and layout
+as Tab 2's own filter row — rather than one combined UTC string; picking a
+date repopulates the time list from that date's actual rows
+(`_ma_refresh_spread_timestamps`/`_ma_refresh_spread_times_for_date`
+build/read a CET-date → CET-times map from the event's own
+pre/during/post window). `_ma_run_price_spread` converts the picked CET
+date+time back to UTC via `propagation.cet_input_to_utc` before calling
+`estimate_cnec_price_impact` (which still matches rows in UTC
+internally), and the result panel echoes both the matched timestamp and
+the pre-period cutoff back in CET via `propagation.utc_to_cet_str` — the
+same two conversion points every other CET input/output in this app goes
+through:
 
 ```
 impact = (shadowPrice_actual × PTDF_target_actual)

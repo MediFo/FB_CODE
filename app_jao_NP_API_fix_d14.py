@@ -2720,8 +2720,9 @@ class App:
         self._ma_fig_decomp.clear(); self._ma_canvas_decomp.draw()
         self._ma_spread_cnec.config(values=[]); self._ma_spread_cnec.set('')
         self._ma_spread_tgt_zone.config(values=[]); self._ma_spread_tgt_zone.set('')
-        self._ma_spread_ts.config(values=[]); self._ma_spread_ts.set('')
-        self._ma_spread_all_ts_values = []
+        self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
+        self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
+        self._ma_spread_dates_to_times = {}
         self._ma_spread_result_txt.config(state='normal')
         self._ma_spread_result_txt.delete('1.0', tk.END)
         self._ma_spread_result_txt.config(state='disabled')
@@ -3851,13 +3852,24 @@ class App:
         self._ma_spread_tgt_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
         self._ma_spread_tgt_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
 
-        ttk.Label(ctrl5, text="Timestamp (UTC):").grid(row=2, column=0, sticky='w', pady=(6, 0))
-        self._ma_spread_all_ts_values = []
-        self._ma_spread_ts = ttk.Combobox(ctrl5, width=28)
-        self._ma_spread_ts.grid(row=2, column=1, columnspan=2, sticky='w', padx=6, pady=(6, 0))
-        self._ma_spread_ts.bind('<KeyRelease>', self._ma_filter_spread_ts)
+        # Date + Time as two separate fields, both CET -- same layout/label
+        # convention as Tab 2's "Date (CET):" / "Time (CET):" filter row,
+        # rather than one combined UTC ISO string. self._ma_spread_dates_to_times
+        # maps each available CET date -> sorted CET "HH:MM" times for that
+        # date (built in _ma_refresh_spread_timestamps from this event's own
+        # pre/during/post window); picking a date repopulates the time list.
+        self._ma_spread_dates_to_times = {}
+        ttk.Label(ctrl5, text="Date (CET):").grid(row=2, column=0, sticky='w', pady=(6, 0))
+        self._ma_spread_date = ttk.Combobox(ctrl5, width=12)
+        self._ma_spread_date.grid(row=2, column=1, sticky='w', padx=6, pady=(6, 0))
+        self._ma_spread_date.bind('<<ComboboxSelected>>', self._ma_refresh_spread_times_for_date)
+
+        ttk.Label(ctrl5, text="Time (CET):").grid(row=2, column=2, sticky='w', padx=(12, 0), pady=(6, 0))
+        self._ma_spread_time = ttk.Combobox(ctrl5, width=10)
+        self._ma_spread_time.grid(row=2, column=3, sticky='w', padx=6, pady=(6, 0))
+        self._ma_spread_time.bind('<KeyRelease>', self._ma_filter_spread_time)
         ttk.Label(ctrl5, text="(from this event's pre/during/post window; type to search)",
-                  style='Muted.TLabel').grid(row=2, column=3, sticky='w', pady=(6, 0))
+                  style='Muted.TLabel').grid(row=2, column=4, sticky='w', padx=(8, 0), pady=(6, 0))
 
         ttk.Button(ctrl5, text="Estimate Impact", style='Accent.TButton',
                    command=self._ma_run_price_spread).grid(
@@ -3909,47 +3921,76 @@ class App:
         self._ma_refresh_spread_timestamps()
 
     def _ma_refresh_spread_timestamps(self):
-        """(Re)populate the timestamp combobox for whichever CNEC is
+        """(Re)populate the Date/Time comboboxes for whichever CNEC is
         currently selected, scoped to the analysed event's own
         pre/during/post window (derived from the 'its' DataFrame's own
         timestamp range, which already spans that window for whichever
-        columns were computed) rather than that CNEC's entire history."""
-        self._ma_spread_all_ts_values = []
+        columns were computed) rather than that CNEC's entire history.
+        Values are the underlying rows' dateTimeUtc converted to CET/CEST
+        wall-clock (propagation.utc_to_cet_str) -- this pane is a
+        human-facing picker, and CET is this app's stated convention for
+        anything a person types or reads, everywhere else (Tab 2's own
+        Date (CET):/Time (CET): filter, the ENTSO-E fetch range, Tab 8's
+        MTU (CET): selector). _ma_run_price_spread converts the picked
+        CET date+time back to UTC via propagation.cet_input_to_utc before
+        calling estimate_cnec_price_impact, which still matches rows in
+        UTC internally."""
+        self._ma_spread_dates_to_times = {}
         res = getattr(self, '_ma_single_res', None)
         cnec = self._ma_spread_cnec.get().strip()
         if (not res or not cnec or self._ma_jao_df is None
-                or 'cneName' not in self._ma_jao_df.columns):
-            self._ma_spread_ts.config(values=[])
+                or 'cneName' not in self._ma_jao_df.columns or not self._prop):
+            self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
+            self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
             return
         its = res.get('its')
         if its is None or its.empty or 'dateTimeUtc' not in its.columns:
-            self._ma_spread_ts.config(values=[])
+            self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
+            self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
             return
         t0, t1 = its['dateTimeUtc'].min(), its['dateTimeUtc'].max()
         sub = self._ma_jao_df[
             (self._ma_jao_df['cneName'] == cnec) &
             (self._ma_jao_df['dateTimeUtc'] >= t0) &
             (self._ma_jao_df['dateTimeUtc'] <= t1)]
-        values = sorted(ts.isoformat() for ts in sub['dateTimeUtc'].dropna().unique())
-        self._ma_spread_all_ts_values = values
-        self._ma_spread_ts.config(values=values)
-        if values:
-            self._ma_spread_ts.set(values[0])
+        dates_to_times = {}
+        for ts in sorted(sub['dateTimeUtc'].dropna().unique()):
+            d = self._prop.utc_to_cet_str(ts, "%Y-%m-%d")
+            t = self._prop.utc_to_cet_str(ts, "%H:%M")
+            dates_to_times.setdefault(d, []).append(t)
+        self._ma_spread_dates_to_times = dates_to_times
+        dates = sorted(dates_to_times)
+        self._ma_spread_date.config(values=dates)
+        if dates:
+            self._ma_spread_date.set(dates[0])
+        else:
+            self._ma_spread_date.set('')
+        self._ma_refresh_spread_times_for_date()
 
-    def _ma_filter_spread_ts(self, event=None):
-        """Type-to-filter for the timestamp combobox, same pattern as
-        _ma_filter_target_cnec."""
+    def _ma_refresh_spread_times_for_date(self, event=None):
+        """Repopulate the Time (CET) combobox for whichever Date (CET) is
+        currently picked, from the per-date map built in
+        _ma_refresh_spread_timestamps."""
+        d = self._ma_spread_date.get().strip()
+        times = sorted(self._ma_spread_dates_to_times.get(d, []))
+        self._ma_spread_time.config(values=times)
+        self._ma_spread_time.set(times[0] if times else '')
+
+    def _ma_filter_spread_time(self, event=None):
+        """Type-to-filter for the Time (CET) combobox, scoped to the
+        currently picked date -- same pattern as _ma_filter_target_cnec."""
         if event is not None and event.keysym in (
                 'Up', 'Down', 'Left', 'Right', 'Return', 'KP_Enter',
                 'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R'):
             return
-        typed = self._ma_spread_ts.get().strip().lower()
-        all_values = self._ma_spread_all_ts_values
+        d = self._ma_spread_date.get().strip()
+        all_values = sorted(self._ma_spread_dates_to_times.get(d, []))
+        typed = self._ma_spread_time.get().strip().lower()
         filtered = all_values if not typed else [v for v in all_values if typed in v.lower()]
-        self._ma_spread_ts['values'] = filtered
+        self._ma_spread_time['values'] = filtered
         if filtered:
             try:
-                self._ma_spread_ts.event_generate('<Down>')
+                self._ma_spread_time.event_generate('<Down>')
             except tk.TclError:
                 pass
 
@@ -3969,18 +4010,27 @@ class App:
             return
         cnec = self._ma_spread_cnec.get().strip()
         tgt_zone = self._ma_spread_tgt_zone.get().strip()
-        ts_raw = self._ma_spread_ts.get().strip()
-        if not (cnec and tgt_zone and ts_raw):
+        date_raw = self._ma_spread_date.get().strip()
+        time_raw = self._ma_spread_time.get().strip()
+        if not (cnec and tgt_zone and date_raw and time_raw):
             messagebox.showwarning(
                 "Price Spread",
-                "Select a CNEC, target zone, and timestamp (run Single "
+                "Select a CNEC, target zone, and date/time (run Single "
                 "Event analysis first to populate these).")
             return
+        # Date and Time are entered/picked as CET/CEST wall-clock -- this
+        # app's convention for anything a person types or reads (see Tab 2's
+        # own Date (CET):/Time (CET): fields) -- then converted to UTC via
+        # propagation.cet_input_to_utc, the same conversion point every
+        # other CET input in this app goes through, so a DST edge case is
+        # handled identically everywhere rather than reimplemented here.
         import pandas as pd
         try:
-            ts = pd.Timestamp(ts_raw)
+            ts = self._prop.cet_input_to_utc(f"{date_raw} {time_raw}")
         except (ValueError, TypeError):
-            messagebox.showerror("Price Spread", f"Could not parse timestamp: {ts_raw!r}")
+            messagebox.showerror(
+                "Price Spread",
+                f"Could not parse date/time: {date_raw!r} {time_raw!r}")
             return
         try:
             pre_end = pd.Timestamp(res['summary']['start_utc'])
@@ -4009,12 +4059,14 @@ class App:
             self._ma_spread_result_txt.insert(tk.END, f"Could not estimate: {r['error']}")
         else:
             sign = "+" if r['impact'] >= 0 else ""
+            matched_cet = self._prop.utc_to_cet_str(r['matched_timestamp'], "%Y-%m-%d %H:%M")
+            pre_end_cet = self._prop.utc_to_cet_str(pre_end, "%Y-%m-%d %H:%M")
             lines = [
                 f"CNEC:               {r['cnec']}",
                 f"Target zone:        {r['tgt_zone']}",
-                f"Matched timestamp:  {r['matched_timestamp']}",
+                f"Matched timestamp:  {matched_cet} CET",
                 f"Counterfactual model: {r['its_method']}"
-                f"  (pre-period ends at this event's outage start, {pre_end})",
+                f"  (pre-period ends at this event's outage start, {pre_end_cet} CET)",
                 "",
                 f"{'':22s}{'Actual':>14s}{'Counterfactual':>18s}",
                 f"Shadow price:       {r['shadow_price_actual']:>14.4f}{r['shadow_price_cf']:>18.4f}",
