@@ -1,6 +1,7 @@
 import bisect
 import csv
 import json
+import math
 import os
 import re
 import subprocess
@@ -2329,30 +2330,14 @@ class App:
         self.canvas8 = FigureCanvasTkAgg(self.fig8, main)
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # ── External interconnector flows (Nordic → Core/Baltic/other) ──
-        # The background map only depicts the 12 Nordic bidding zones, so
-        # an interconnector to a non-Nordic zone (Germany, Poland, the
-        # Netherlands, Great Britain, Estonia, Lithuania, ...) has nowhere
-        # to draw an arrow TO -- shown as a table instead of forcing a
-        # guessed position onto a map that doesn't depict that territory.
-        # Entirely data-driven: whatever non-Nordic counterpart areas
-        # Nord Pool's own flow response reports for a Nordic zone show up
-        # here, nothing is hardcoded to a fixed interconnector list, so a
-        # link this app doesn't already know about still appears if the
-        # API reports it, and one that stops clearing quietly disappears.
-        ext_f = ttk.LabelFrame(main, text=" External Interconnector Flows (Nordic → Core / Baltic / Other) ", padding=(6, 4))
-        ext_f.pack(fill=tk.X, pady=(4, 0))
-        ext_cols = ('from', 'to', 'mw', 'direction')
-        self._t8_ext_tree = ttk.Treeview(
-            ext_f, columns=ext_cols, show='headings', height=3)
-        for col, lbl, w in (('from', 'Nordic Zone', 100), ('to', 'External Zone', 110),
-                            ('mw', 'MW', 90), ('direction', 'Direction', 160)):
-            self._t8_ext_tree.heading(col, text=lbl)
-            self._t8_ext_tree.column(col, width=w, anchor='center')
-        self._t8_ext_tree.pack(fill=tk.X)
-        self._t8_ext_status = ttk.Label(ext_f, text="No external flow data yet.",
-                                        style='Muted.TLabel')
-        self._t8_ext_status.pack(anchor='w', pady=(2, 0))
+        # External interconnector flows (Nordic → Core/Baltic/other) are
+        # drawn directly on the map as short outward arrows from their
+        # Nordic anchor zone, tagged with the external zone's code + MW --
+        # see _draw_tab8_map's own "External flow arrows" section. No
+        # separate panel here: the background image only depicts the 12
+        # Nordic zones, so there's no real position to draw TO and no
+        # price to show a color for, just the flow and which zone it's
+        # going to.
 
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
         diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
@@ -2508,12 +2493,11 @@ class App:
     def _t8_show_slot(self, slot_label):
         """Draw one slot ("YYYY-MM-DD HH:MM") from the current period cache
         -- shared by the single-shot cache-hit path and each playback
-        frame -- and refresh the external-flows table alongside it."""
+        frame."""
         prices    = self._t8_period_cache["prices"].get(slot_label, {})
         flows     = self._t8_period_cache["flows"].get(slot_label, {})
         ext_flows = self._t8_period_cache["external_flows"].get(slot_label, {})
-        self._draw_tab8_map(prices, flows, slot_label)
-        self._update_t8_external_tree(ext_flows)
+        self._draw_tab8_map(prices, flows, slot_label, ext_flows)
 
     def _t8_play_step(self):
         if not self._t8_playing or self._t8_play_idx >= len(self._t8_play_mtus):
@@ -2549,23 +2533,6 @@ class App:
         if was_playing:
             self._t8_status.config(text="Stopped.", foreground=C_MUTED)
             self._add_toolbar(self.canvas8, self.toolbar_f8)
-
-    def _update_t8_external_tree(self, ext_flows):
-        """Refresh the External Interconnector Flows table for the
-        currently-shown slot. `ext_flows` is {(nordic_zone, other_zone): mw}
-        -- positive means exporting FROM the Nordic zone TO the external
-        one, matching the same sign convention _draw_tab8_map's own arrows
-        use for Nordic-internal flows."""
-        self._t8_ext_tree.delete(*self._t8_ext_tree.get_children())
-        if not ext_flows:
-            self._t8_ext_status.config(
-                text="No external (Core/Baltic/other) flows reported for this slot.")
-            return
-        self._t8_ext_status.config(
-            text=f"{len(ext_flows)} external link(s) reported by Nord Pool for this slot.")
-        for (nordic, other), mw in sorted(ext_flows.items(), key=lambda kv: -abs(kv[1])):
-            direction = f"{nordic} → {other}" if mw >= 0 else f"{other} → {nordic}"
-            self._t8_ext_tree.insert('', tk.END, values=(nordic, other, f"{abs(mw):.0f}", direction))
 
     def _fetch_tab8_one_day(self, date_str, hdrs, areas_params, _diag):
         """Fetch NordPool DA prices + scheduled physical flows for ONE
@@ -2829,14 +2796,15 @@ class App:
         self._t8_show_slot(self._t8_fetch_target_slot)
         self._add_toolbar(self.canvas8, self.toolbar_f8)
 
-    def _draw_tab8_map(self, prices, net_flows, slot_label):
-        """Render one frame (one slot's prices + Nordic-internal net flows)
-        onto fig8. Called both for a single "Fetch & Plot" snapshot and once
-        per frame during "Play" animation. `slot_label` is the full
-        "YYYY-MM-DD HH:MM" CET slot -- external (Core/Baltic/other) flows
-        are shown in the separate table below the map, not here, since this
-        background image only depicts the 12 Nordic zones (see
-        _update_t8_external_tree)."""
+    def _draw_tab8_map(self, prices, net_flows, slot_label, ext_flows=None):
+        """Render one frame (one slot's prices + flows) onto fig8. Called
+        both for a single "Fetch & Plot" snapshot and once per frame during
+        "Play" animation. `slot_label` is the full "YYYY-MM-DD HH:MM" CET
+        slot. `ext_flows` ({(nordic_zone, other_zone): mw}) are drawn as
+        short outward arrows from their Nordic anchor zone -- see
+        "External flow arrows" below -- since the background image only
+        depicts the 12 Nordic zones, there's no real position to point TO
+        and no price there to color by, just the zone name and MW."""
         self.fig8.clear()
         ax = self.fig8.add_subplot(111)
 
@@ -2917,6 +2885,52 @@ class App:
                     bbox=dict(facecolor='white', edgecolor='none',
                               alpha=0.75, pad=1.2))
 
+        # ── External flow arrows (Nordic → Core/Baltic/other) ───────────
+        # No position on this map to point TO (it only depicts the 12
+        # Nordic zones) and no price there to color by -- each arrow just
+        # points OUTWARD from its Nordic anchor zone (away from the
+        # Nordic-zone centroid, a direction-agnostic "leaving the Nordic
+        # area" heuristic that needs no per-zone geography), tagged with
+        # the external zone's own code and the MW. Grouped by anchor zone
+        # and fanned out by angle so a zone with several external links
+        # (e.g. NO2: NordLink→DE, NorNed→NL, North Sea Link→GB) doesn't
+        # draw them stacked on top of each other.
+        has_external = False
+        if ext_flows:
+            has_external = True
+            cx = sum(nx for nx, ny in ZONE_POS_NORM.values()) / len(ZONE_POS_NORM)
+            cy = sum(ny for nx, ny in ZONE_POS_NORM.values()) / len(ZONE_POS_NORM)
+            by_anchor = {}
+            for (nordic, other), mw in ext_flows.items():
+                by_anchor.setdefault(nordic, []).append((other, mw))
+            ext_len_px = 0.115 * img_w
+            fan_spread = math.radians(30)
+            for nordic, links in sorted(by_anchor.items()):
+                if nordic not in ZONE_POS_NORM:
+                    continue
+                nx0, ny0 = ZONE_POS_NORM[nordic]
+                x0, y0 = nx0 * img_w, ny0 * img_h
+                base_angle = math.atan2(y0 - cy * img_h, x0 - cx * img_w)
+                links.sort(key=lambda t: t[0])
+                n = len(links)
+                for i, (other, mw) in enumerate(links):
+                    angle = base_angle if n == 1 else (
+                        base_angle - fan_spread / 2 + fan_spread * i / (n - 1))
+                    xs = x0 + pad_px * math.cos(angle)
+                    ys = y0 + pad_px * math.sin(angle)
+                    xe = x0 + ext_len_px * math.cos(angle)
+                    ye = y0 + ext_len_px * math.sin(angle)
+                    ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
+                                arrowprops=dict(arrowstyle='->', color=C_PURPLE,
+                                                lw=1.5, mutation_scale=9,
+                                                linestyle=(0, (4, 2))))
+                    arrow = "→" if mw >= 0 else "←"
+                    ax.text(xe, ye, f"{arrow} {other}\n{abs(mw):.0f} MW",
+                            fontsize=5.5, ha='center', va='center', zorder=6,
+                            color=C_PURPLE, fontweight='bold',
+                            bbox=dict(facecolor='white', edgecolor=C_PURPLE,
+                                      linewidth=0.7, alpha=0.88, pad=1.4))
+
         # Flow legend
         legend_handles = [
             Line2D([0], [0], color=C_PRIMARY, lw=2,
@@ -2926,6 +2940,10 @@ class App:
             legend_handles.append(
                 Line2D([0], [0], color=C_RED, lw=2,
                        label="Counter-intuitive (expensive → cheap)"))
+        if has_external:
+            legend_handles.append(
+                Line2D([0], [0], color=C_PURPLE, lw=2, linestyle=(0, (4, 2)),
+                       label="External flow (→ Core / Baltic / other)"))
         ax.legend(handles=legend_handles, loc='lower right', fontsize=7,
                   framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL,
                   labelcolor=C_TEXT)
