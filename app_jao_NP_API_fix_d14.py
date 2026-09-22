@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -540,7 +541,7 @@ class App:
                 "package (numpy, etc.) — check the import error above.")
             root.destroy()
             raise SystemExit(1)
-        self.root.title("JAO & Nordpool Analytics")
+        self.root.title("Flow-Based Market Analyser")
         self.root.geometry("1280x980")
         self.root.configure(bg=C_BG)
         self.root.minsize(900, 700)
@@ -594,10 +595,10 @@ class App:
 
         title_box = tk.Frame(hdr, bg=C_PANEL)
         title_box.pack(side=tk.LEFT, padx=24)
-        tk.Label(title_box, text="JAO & Nordpool Analytics",
+        tk.Label(title_box, text="Flow-Based Market Analyser",
                  bg=C_PANEL, fg=C_TEXT, font=FONT_TITLE, anchor='w'
                  ).pack(anchor='w')
-        tk.Label(title_box, text="Energy Market Intelligence Platform",
+        tk.Label(title_box, text="Developed by Mehdi Foroughi, Market Integration Team",
                  bg=C_PANEL, fg=C_MUTED, font=FONT_SUBTITLE, anchor='w'
                  ).pack(anchor='w')
 
@@ -756,6 +757,22 @@ class App:
         ax.title.set_fontweight('bold')
         ax.grid(True, color=C_BORDER_LO, linewidth=0.7, linestyle='-', alpha=0.9)
         ax.set_axisbelow(True)
+        # These charts plot an integer index on x (0, 1, 2, ...) and only
+        # relabel the visible TICKS with `labels` (see every call site: x
+        # data is `range(len(xs))`, `ax.set_xticklabels(xs)` only touches
+        # what's drawn at each tick) -- so without this, the mouse-position
+        # readout in the toolbar's bottom-left corner shows the raw index
+        # ("x=42.31"), never the actual date/time or CNEC name it stands
+        # for. Overriding format_coord to look the hovered x back up in the
+        # same `labels` list fixes the readout wherever this helper is
+        # already called with real labels, no per-chart change needed.
+        if labels:
+            _labels_snapshot = list(labels)
+            def _fmt_coord(x, y, _labels=_labels_snapshot):
+                idx = int(round(x))
+                xs = _labels[idx] if 0 <= idx < len(_labels) else f"{x:.2f}"
+                return f"x={xs}   y={y:,.3f}"
+            ax.format_coord = _fmt_coord
 
     def _style_twin(self, ax, color):
         ax.tick_params(axis='y', colors=color, labelsize=7.5)
@@ -840,6 +857,103 @@ class App:
                 pass
         tb.update()
         canvas.draw()
+
+    def _make_scrollable_pane(self, parent):
+        """Wrap arbitrary content in a vertically-scrollable pane -- same
+        pattern Single Event's ITS sub-tab already used (a tk.Canvas
+        viewport + inner Frame + scrollbar + mousewheel binding), factored
+        out so ΔRAM decomposition and Price Spread can have it too, instead
+        of clipping their content on a short window.
+
+        Returns (outer, inner): place OUTER yourself (grid/pack, matching
+        whatever geometry manager the rest of `parent`'s children already
+        use -- this method never places it, since mixing pack and grid on
+        the same parent raises a TclError), and build content into INNER.
+        The canvas auto-tracks the inner frame's size (scrollregion) and
+        keeps the inner frame's width pinned to the viewport's own width,
+        so nothing scrolls horizontally by accident."""
+        outer = ttk.Frame(parent, style='Card.TFrame')
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        vsb = ttk.Scrollbar(outer, orient='vertical')
+        vsb.grid(row=0, column=1, sticky='ns')
+        viewport = tk.Canvas(outer, bg=C_PANEL, yscrollcommand=vsb.set,
+                              highlightthickness=0)
+        viewport.grid(row=0, column=0, sticky='nsew')
+        vsb.config(command=viewport.yview)
+        inner = ttk.Frame(viewport, style='Card.TFrame')
+        win_id = viewport.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_configure(_event=None):
+            viewport.configure(scrollregion=viewport.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_viewport_configure(event):
+            viewport.itemconfigure(win_id, width=event.width)
+        viewport.bind("<Configure>", _on_viewport_configure)
+
+        def _on_scroll(event):
+            viewport.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        viewport.bind("<MouseWheel>", _on_scroll)
+        inner.bind("<MouseWheel>", _on_scroll)
+
+        return outer, inner
+
+    def _open_figure_fullscreen(self, fig, title="Full Screen"):
+        """Pop a snapshot of `fig` open in its own large, resizable window --
+        a static image (fig.savefig -> tk.PhotoImage), not a second live
+        embedding of the same Figure: reparenting a matplotlib Figure across
+        two simultaneous Tk canvases risks the next in-place redraw (fig.clear()
+        + rebuild, which every chart here does on its next run) fighting over
+        which canvas owns it. A snapshot has none of that risk, and this is a
+        read-only "look closer" view, not a second interactive chart -- the
+        original embedded chart keeps its own zoom/pan toolbar as before.
+        Sized to ~92% of the screen so it's dramatically bigger than any
+        embedded pane without covering taskbars/menu bars entirely."""
+        if fig is None:
+            return
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            fig.savefig(tmp.name, dpi=140,
+                        facecolor=fig.get_facecolor(), bbox_inches='tight')
+            photo = tk.PhotoImage(file=tmp.name)
+        except Exception as e:
+            messagebox.showerror("Full Screen", f"Could not render full-screen view: {e}")
+            return
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=C_PANEL)
+        top.image = photo  # keep a reference alive for the widget's lifetime
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        w, h = min(photo.width() + 40, int(sw * 0.92)), min(photo.height() + 80, int(sh * 0.92))
+        top.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+
+        bar = ttk.Frame(top, style='Card.TFrame')
+        bar.pack(fill=tk.X, padx=8, pady=(8, 0))
+        ttk.Button(bar, text="Close  (Esc)", command=top.destroy).pack(side=tk.RIGHT)
+
+        vsb = ttk.Scrollbar(top, orient='vertical')
+        hsb = ttk.Scrollbar(top, orient='horizontal')
+        canvas = tk.Canvas(top, bg=C_PANEL, highlightthickness=0,
+                            yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=canvas.yview)
+        hsb.config(command=canvas.xview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        canvas.create_image(0, 0, anchor='nw', image=photo)
+        canvas.configure(scrollregion=(0, 0, photo.width(), photo.height()))
+
+        top.bind("<Escape>", lambda e: top.destroy())
+        top.transient(self.root)
+        top.focus_set()
 
     # ------------------------------------------------------------------
     #  TAB 1 – Fetch / Upload  (two-column layout)
@@ -2720,9 +2834,8 @@ class App:
         self._ma_fig_decomp.clear(); self._ma_canvas_decomp.draw()
         self._ma_spread_cnec.config(values=[]); self._ma_spread_cnec.set('')
         self._ma_spread_tgt_zone.config(values=[]); self._ma_spread_tgt_zone.set('')
-        self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
-        self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
-        self._ma_spread_dates_to_times = {}
+        self._ma_spread_date.delete(0, tk.END)
+        self._ma_spread_time.delete(0, tk.END)
         self._ma_spread_result_txt.config(state='normal')
         self._ma_spread_result_txt.delete('1.0', tk.END)
         self._ma_spread_result_txt.config(state='disabled')
@@ -3552,10 +3665,19 @@ class App:
                     ax.set_title(f"{label} — not available"); continue
                 agg = cov.groupby("dateTimeUtc")[col].mean().reset_index()
                 agg = agg.sort_values("dateTimeUtc")
-                ax.plot(range(len(agg)), agg[col], color=color, linewidth=0.9)
-                ax.fill_between(range(len(agg)), agg[col], alpha=0.08, color=color)
+                x_idx = range(len(agg))
+                # CET-formatted tick labels, same convention (and same
+                # index+labels pattern _setup_ax expects) as every other
+                # dated chart in this file -- was previously plotted on a
+                # bare index with no date shown anywhere, on the ticks OR
+                # on hover, since _setup_ax(ax, []) got an empty label list.
+                xs = ([self._prop.utc_to_cet_str(ts, "%m-%d %H:%M") for ts in agg["dateTimeUtc"]]
+                      if self._prop else [str(ts) for ts in agg["dateTimeUtc"]])
+                ax.plot(x_idx, agg[col], color=color, linewidth=0.9)
+                ax.fill_between(x_idx, agg[col], alpha=0.08, color=color)
                 ax.set_title(label, fontsize=8.5, color=C_ACCENT)
-                self._setup_ax(ax, [])
+                ax.set_xticks(list(x_idx)); ax.set_xticklabels(xs)
+                self._setup_ax(ax, xs)
 
         elif "violin" in ptype.lower() or "PTDF" in ptype:
             ax = self._ma_fig_plots.add_subplot(111)
@@ -3742,8 +3864,18 @@ class App:
         sf1 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf1, text='  ITS — before/after trend  ')
         sf1.columnconfigure(0, weight=1); sf1.rowconfigure(2, weight=1)
+        # Full Screen button lives in its OWN column, as a sibling of the
+        # toolbar frame, not a child of it -- _add_toolbar() destroys every
+        # child of the frame it's given (to rebuild NavigationToolbar2Tk on
+        # each analysis run), so a button placed INSIDE that frame would
+        # vanish the moment a second event is analysed.
+        sf1.columnconfigure(1, weight=0)
         self._ma_toolbar_its = ttk.Frame(sf1, style='Card.TFrame')
         self._ma_toolbar_its.grid(row=0, column=0, sticky='ew')
+        ttk.Button(sf1, text="⛶ Full Screen",
+                   command=lambda: self._open_figure_fullscreen(
+                       self._ma_fig_single, "ITS — Before/After Trend")
+                   ).grid(row=0, column=1, sticky='e', padx=4, pady=2)
         # Legend row — populated dynamically in _ma_single_done
         self._ma_its_legend_bar = ttk.Frame(sf1, style='Card.TFrame', padding=(8, 3))
         self._ma_its_legend_bar.grid(row=1, column=0, sticky='ew')
@@ -3769,16 +3901,28 @@ class App:
         self._ma_canvas_single = None
         self._ma_its_win_id    = None
 
-        # RAM Decomposition tab
+        # RAM Decomposition tab -- wrapped in a scrollable pane (same
+        # helper as Price Spread below) so the chart is never clipped on a
+        # short window, plus a Full Screen popout for a closer look.
         sf2 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf2, text='  ΔRAM decomposition  ')
         sf2.columnconfigure(0, weight=1); sf2.rowconfigure(1, weight=1)
+        # Full Screen button is a SIBLING of the toolbar frame (column 1),
+        # not a child of it -- _add_toolbar() destroys every child of the
+        # frame it's given, so a button placed inside it would vanish after
+        # the first analysis run (same reasoning as the ITS tab above).
         self._ma_toolbar_decomp = ttk.Frame(sf2, style='Card.TFrame')
         self._ma_toolbar_decomp.grid(row=0, column=0, sticky='ew')
+        ttk.Button(sf2, text="⛶ Full Screen",
+                   command=lambda: self._open_figure_fullscreen(
+                       self._ma_fig_decomp, "ΔRAM Decomposition")
+                   ).grid(row=0, column=1, sticky='e', padx=4, pady=2)
+        sf2_outer, sf2_inner = self._make_scrollable_pane(sf2)
+        sf2_outer.grid(row=1, column=0, sticky='nsew')
         self._ma_fig_decomp = Figure(figsize=(11, 5), dpi=90)
         self._style_figure(self._ma_fig_decomp)
-        self._ma_canvas_decomp = FigureCanvasTkAgg(self._ma_fig_decomp, sf2)
-        self._ma_canvas_decomp.get_tk_widget().grid(row=1, column=0, sticky='nsew')
+        self._ma_canvas_decomp = FigureCanvasTkAgg(self._ma_fig_decomp, sf2_inner)
+        self._ma_canvas_decomp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # DiD text tab
         sf3 = ttk.Frame(snb, style='Card.TFrame')
@@ -3832,12 +3976,21 @@ class App:
         # choices come from this event's own window, and the counterfactual
         # method reuses whatever's picked in the "Counterfactual model"
         # selector above) -- see MAINTENANCE_TAB_GUIDE.md.
+        # The whole pane (controls + results) is wrapped in a scrollable
+        # pane -- previously ctrl5 (5 rows of pickers) and det5 (the result
+        # text) both fought for a short window's fixed vertical space, with
+        # no way to reach det5's content once ctrl5 ate the visible area.
+        # Now everything is reachable by scrolling regardless of window size.
         sf5 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf5, text='  Price Spread  ')
         sf5.columnconfigure(0, weight=1)
+        sf5.rowconfigure(0, weight=1)
+        sf5_outer, sf5_inner = self._make_scrollable_pane(sf5)
+        sf5_outer.grid(row=0, column=0, sticky='nsew')
+        sf5_inner.columnconfigure(0, weight=1)
 
         ctrl5 = ttk.LabelFrame(
-            sf5, text=" This CNEC's price impact on a target zone "
+            sf5_inner, text=" This CNEC's price impact on a target zone "
                       "(actual vs. counterfactual) ", padding=10)
         ctrl5.grid(row=0, column=0, sticky='ew', padx=8, pady=8)
         ctrl5.columnconfigure(1, weight=1)
@@ -3852,23 +4005,23 @@ class App:
         self._ma_spread_tgt_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
         self._ma_spread_tgt_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
 
-        # Date + Time as two separate fields, both CET -- same layout/label
-        # convention as Tab 2's "Date (CET):" / "Time (CET):" filter row,
-        # rather than one combined UTC ISO string. self._ma_spread_dates_to_times
-        # maps each available CET date -> sorted CET "HH:MM" times for that
-        # date (built in _ma_refresh_spread_timestamps from this event's own
-        # pre/during/post window); picking a date repopulates the time list.
-        self._ma_spread_dates_to_times = {}
+        # Date + Time as two separate, plain TYPED fields (ttk.Entry), both
+        # CET -- matching Tab 2's own "Date (CET):" / "Time (CET):" filter
+        # row exactly: the user types over a pre-filled default rather than
+        # picking from a dropdown. Auto-filled with this event's own outage
+        # start time in CET (see _ma_refresh_spread_timestamps) every time a
+        # new event is analysed or the CNEC changes -- same "never leave it
+        # blank if a default is derivable" philosophy as Setup's own
+        # auto-filled Target CNEC field, just via a typed default instead of
+        # a selected one.
         ttk.Label(ctrl5, text="Date (CET):").grid(row=2, column=0, sticky='w', pady=(6, 0))
-        self._ma_spread_date = ttk.Combobox(ctrl5, width=12)
+        self._ma_spread_date = ttk.Entry(ctrl5, width=12)
         self._ma_spread_date.grid(row=2, column=1, sticky='w', padx=6, pady=(6, 0))
-        self._ma_spread_date.bind('<<ComboboxSelected>>', self._ma_refresh_spread_times_for_date)
 
         ttk.Label(ctrl5, text="Time (CET):").grid(row=2, column=2, sticky='w', padx=(12, 0), pady=(6, 0))
-        self._ma_spread_time = ttk.Combobox(ctrl5, width=10)
+        self._ma_spread_time = ttk.Entry(ctrl5, width=10)
         self._ma_spread_time.grid(row=2, column=3, sticky='w', padx=6, pady=(6, 0))
-        self._ma_spread_time.bind('<KeyRelease>', self._ma_filter_spread_time)
-        ttk.Label(ctrl5, text="(from this event's pre/during/post window; type to search)",
+        ttk.Label(ctrl5, text="(auto-filled from this event's outage start; type to change, format YYYY-MM-DD / HH:MM)",
                   style='Muted.TLabel').grid(row=2, column=4, sticky='w', padx=(8, 0), pady=(6, 0))
 
         ttk.Button(ctrl5, text="Estimate Impact", style='Accent.TButton',
@@ -3880,15 +4033,23 @@ class App:
                   style='Muted.TLabel').grid(
             row=3, column=1, columnspan=3, sticky='w', pady=(10, 0))
 
-        det5 = tk.Frame(sf5, bg=C_INK)
+        det5 = tk.Frame(sf5_inner, bg=C_INK)
         det5.grid(row=1, column=0, sticky='nsew', padx=8, pady=(0, 8))
-        sf5.rowconfigure(1, weight=1)
+        sf5_inner.rowconfigure(1, weight=1)
         self._ma_spread_result_txt = tk.Text(
             det5, font=FONT_MONO, background=C_INK, foreground=C_TINT,
-            relief='flat', borderwidth=0, padx=10, pady=8, height=12, state='disabled')
-        sb5 = tk.Scrollbar(det5, command=self._ma_spread_result_txt.yview, bg='#18181B')
-        self._ma_spread_result_txt.config(yscrollcommand=sb5.set)
-        sb5.pack(side=tk.RIGHT, fill=tk.Y)
+            relief='flat', borderwidth=0, padx=10, pady=8, height=18,
+            wrap='none', state='disabled')
+        sb5v = tk.Scrollbar(det5, command=self._ma_spread_result_txt.yview, bg='#18181B')
+        # Horizontal scrollbar too -- the result panel's aligned-column table
+        # formatting (fixed-width f-strings) garbles if the Text widget ever
+        # wraps a line instead of letting it run off the side, so wrap='none'
+        # above is paired with this rather than reflowing those rows.
+        sb5h = tk.Scrollbar(det5, orient='horizontal',
+                             command=self._ma_spread_result_txt.xview, bg='#18181B')
+        self._ma_spread_result_txt.config(yscrollcommand=sb5v.set, xscrollcommand=sb5h.set)
+        sb5v.pack(side=tk.RIGHT, fill=tk.Y)
+        sb5h.pack(side=tk.BOTTOM, fill=tk.X)
         self._ma_spread_result_txt.pack(fill=tk.BOTH, expand=True)
 
     def _ma_refresh_spread_controls(self, res):
@@ -3921,78 +4082,50 @@ class App:
         self._ma_refresh_spread_timestamps()
 
     def _ma_refresh_spread_timestamps(self):
-        """(Re)populate the Date/Time comboboxes for whichever CNEC is
-        currently selected, scoped to the analysed event's own
-        pre/during/post window (derived from the 'its' DataFrame's own
-        timestamp range, which already spans that window for whichever
-        columns were computed) rather than that CNEC's entire history.
-        Values are the underlying rows' dateTimeUtc converted to CET/CEST
-        wall-clock (propagation.utc_to_cet_str) -- this pane is a
-        human-facing picker, and CET is this app's stated convention for
-        anything a person types or reads, everywhere else (Tab 2's own
-        Date (CET):/Time (CET): filter, the ENTSO-E fetch range, Tab 8's
-        MTU (CET): selector). _ma_run_price_spread converts the picked
-        CET date+time back to UTC via propagation.cet_input_to_utc before
-        calling estimate_cnec_price_impact, which still matches rows in
-        UTC internally."""
-        self._ma_spread_dates_to_times = {}
+        """Auto-fill the Date (CET) / Time (CET) entries with this event's
+        own outage start time -- the most meaningful single default instant
+        for "impact at the moment of the outage" -- converted to CET via
+        propagation.utc_to_cet_str (this app's convention for anything a
+        person reads). Falls back to the earliest timestamp in this CNEC's
+        own pre/during/post window if the outage's own start_utc is missing
+        or unparseable. Always overwrites current contents, the same
+        "reset to a sensible default" behavior Setup's own auto-filled
+        Target CNEC field already uses -- the fields stay freely typeable
+        afterward (ttk.Entry, not a restricted dropdown; see the widget
+        comment above), matching Tab 2's Date (CET):/Time (CET): fields.
+        _ma_run_price_spread converts whatever ends up in these fields
+        (default or hand-edited) back to UTC via propagation.cet_input_to_utc
+        before calling estimate_cnec_price_impact, which still matches rows
+        in UTC internally."""
         res = getattr(self, '_ma_single_res', None)
         cnec = self._ma_spread_cnec.get().strip()
-        if (not res or not cnec or self._ma_jao_df is None
-                or 'cneName' not in self._ma_jao_df.columns or not self._prop):
-            self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
-            self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
+        if not res or not cnec or self._ma_jao_df is None or not self._prop:
             return
-        its = res.get('its')
-        if its is None or its.empty or 'dateTimeUtc' not in its.columns:
-            self._ma_spread_date.config(values=[]); self._ma_spread_date.set('')
-            self._ma_spread_time.config(values=[]); self._ma_spread_time.set('')
-            return
-        t0, t1 = its['dateTimeUtc'].min(), its['dateTimeUtc'].max()
-        sub = self._ma_jao_df[
-            (self._ma_jao_df['cneName'] == cnec) &
-            (self._ma_jao_df['dateTimeUtc'] >= t0) &
-            (self._ma_jao_df['dateTimeUtc'] <= t1)]
-        dates_to_times = {}
-        for ts in sorted(sub['dateTimeUtc'].dropna().unique()):
-            d = self._prop.utc_to_cet_str(ts, "%Y-%m-%d")
-            t = self._prop.utc_to_cet_str(ts, "%H:%M")
-            dates_to_times.setdefault(d, []).append(t)
-        self._ma_spread_dates_to_times = dates_to_times
-        dates = sorted(dates_to_times)
-        self._ma_spread_date.config(values=dates)
-        if dates:
-            self._ma_spread_date.set(dates[0])
-        else:
-            self._ma_spread_date.set('')
-        self._ma_refresh_spread_times_for_date()
-
-    def _ma_refresh_spread_times_for_date(self, event=None):
-        """Repopulate the Time (CET) combobox for whichever Date (CET) is
-        currently picked, from the per-date map built in
-        _ma_refresh_spread_timestamps."""
-        d = self._ma_spread_date.get().strip()
-        times = sorted(self._ma_spread_dates_to_times.get(d, []))
-        self._ma_spread_time.config(values=times)
-        self._ma_spread_time.set(times[0] if times else '')
-
-    def _ma_filter_spread_time(self, event=None):
-        """Type-to-filter for the Time (CET) combobox, scoped to the
-        currently picked date -- same pattern as _ma_filter_target_cnec."""
-        if event is not None and event.keysym in (
-                'Up', 'Down', 'Left', 'Right', 'Return', 'KP_Enter',
-                'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R'):
-            return
-        d = self._ma_spread_date.get().strip()
-        all_values = sorted(self._ma_spread_dates_to_times.get(d, []))
-        typed = self._ma_spread_time.get().strip().lower()
-        filtered = all_values if not typed else [v for v in all_values if typed in v.lower()]
-        self._ma_spread_time['values'] = filtered
-        if filtered:
+        import pandas as pd
+        default_utc = None
+        start_utc = res.get('summary', {}).get('start_utc')
+        if start_utc:
             try:
-                self._ma_spread_time.event_generate('<Down>')
-            except tk.TclError:
-                pass
+                default_utc = pd.Timestamp(start_utc)
+            except (ValueError, TypeError):
+                default_utc = None
+        if default_utc is None and 'cneName' in self._ma_jao_df.columns:
+            its = res.get('its')
+            if its is not None and not its.empty and 'dateTimeUtc' in its.columns:
+                t0, t1 = its['dateTimeUtc'].min(), its['dateTimeUtc'].max()
+                sub = self._ma_jao_df[
+                    (self._ma_jao_df['cneName'] == cnec) &
+                    (self._ma_jao_df['dateTimeUtc'] >= t0) &
+                    (self._ma_jao_df['dateTimeUtc'] <= t1)]
+                ts_values = sorted(sub['dateTimeUtc'].dropna().unique())
+                if ts_values:
+                    default_utc = ts_values[0]
+        if default_utc is None:
+            return
+        date_str = self._prop.utc_to_cet_str(default_utc, "%Y-%m-%d")
+        time_str = self._prop.utc_to_cet_str(default_utc, "%H:%M")
+        self._ma_spread_date.delete(0, tk.END); self._ma_spread_date.insert(0, date_str)
+        self._ma_spread_time.delete(0, tk.END); self._ma_spread_time.insert(0, time_str)
 
     def _ma_run_price_spread(self):
         if not self._prop:
@@ -4333,6 +4466,20 @@ class App:
                         lbl.set_rotation(15); lbl.set_fontsize(7)
                 except Exception:
                     pass
+                # This chart plots real dateTimeUtc values directly (unlike
+                # _setup_ax's index+labels charts), so the mouse-position
+                # readout otherwise shows a raw matplotlib date float
+                # ("x=19692.34") -- convert it back to a CET wall-clock
+                # string instead, matching this app's convention that
+                # anything a person reads is CET, not UTC and not a float.
+                def _fmt_coord_dt(x, y):
+                    try:
+                        dt_cet = mdates.num2date(x).astimezone(_CET)
+                        xs = dt_cet.strftime("%Y-%m-%d %H:%M") + " CET"
+                    except (ValueError, OverflowError):
+                        xs = f"{x:.2f}"
+                    return f"x={xs}   y={y:,.3f}"
+                ax.format_coord = _fmt_coord_dt
         else:
             ax = self._ma_fig_single.add_subplot(1, 1, 1)
             ax.text(0.5, 0.5, 'No ITS data', ha='center', va='center',

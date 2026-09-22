@@ -166,22 +166,60 @@ before the call — a defensive fix for `sorted(cneName.unique())` crashing
 on a mixed float/str column, which is a real shape real JAO exports can
 have.
 
+**Scrolling and Full Screen.** ITS, ΔRAM decomposition, and Price Spread
+are each wrapped in a scrollable viewport (`_make_scrollable_pane` — a
+`tk.Canvas` + inner `Frame` + vertical scrollbar + mousewheel binding,
+factored out of ITS's own pre-existing pattern so ΔRAM decomposition and
+Price Spread got it too) rather than being clipped on a short window;
+Summary, DiD, and Per-CNEC table already had their own scrollbar
+(`Text`/`Treeview` built-in) and didn't need it. ITS and ΔRAM
+decomposition also carry a **⛶ Full Screen** button next to their
+toolbar — `_open_figure_fullscreen()` renders the current `Figure` to a
+temp PNG and opens it in its own large, scrollable `Toplevel` (Esc or
+Close to dismiss) rather than re-embedding the *same* `Figure` object in
+a second live canvas, which would risk the next in-place redraw
+(`fig.clear()` + rebuild, which both charts do on every re-analysis)
+fighting over which canvas owns it. **Both Full Screen buttons are
+gridded as a SIBLING of their toolbar frame, not a child of it** —
+`_add_toolbar()` destroys every child of the frame it's given to rebuild
+`NavigationToolbar2Tk` on each run, so a button placed inside that frame
+would vanish after the first analysis.
+
+**Hover coordinates.** Every chart built through `_setup_ax(ax, labels)`
+now overrides `ax.format_coord` to look the hovered x position up in
+`labels` (the same list already used to build `set_xticklabels`) instead
+of showing matplotlib's raw index float — this was already silently
+broken (`x=42.31`) everywhere `_setup_ax` is called with real labels, not
+just in this tab. The ITS chart plots real `dateTimeUtc` values directly
+rather than an index, so it gets its own `format_coord` converting the
+hovered matplotlib date float back to a CET string via
+`mdates.num2date(x).astimezone(_CET)` — this app's usual human-facing
+convention, not UTC and not a bare float.
+
 **Price Spread pane (optional, added after the rest of this tab).**
 Shows how much ONE CNEC's contribution to a TARGET zone's price has
 moved, at one timestamp the user picks, relative to what it would have
-been without the outage. The timestamp is picked as two separate
-**Date (CET):** / **Time (CET):** comboboxes — same convention and layout
-as Tab 2's own filter row — rather than one combined UTC string; picking a
-date repopulates the time list from that date's actual rows
-(`_ma_refresh_spread_timestamps`/`_ma_refresh_spread_times_for_date`
-build/read a CET-date → CET-times map from the event's own
-pre/during/post window). `_ma_run_price_spread` converts the picked CET
-date+time back to UTC via `propagation.cet_input_to_utc` before calling
-`estimate_cnec_price_impact` (which still matches rows in UTC
+been without the outage. The timestamp is entered as two separate,
+plain **Date (CET):** / **Time (CET):** `ttk.Entry` fields — typed, not
+selected from a dropdown, matching Tab 2's own filter row exactly (an
+earlier version used cascading comboboxes; the user asked for typed
+fields to match Tab 2's actual widget type, not just its label
+convention). `_ma_refresh_spread_timestamps` auto-fills both fields with
+this event's own outage `start_utc`, converted to CET — the most
+meaningful single default instant — falling back to the earliest
+timestamp in this CNEC's own pre/during/post window if `start_utc` is
+missing or unparseable; the fields stay freely typeable afterward.
+`_ma_run_price_spread` converts whatever ends up in them (default or
+hand-edited) back to UTC via `propagation.cet_input_to_utc` before
+calling `estimate_cnec_price_impact` (which still matches rows in UTC
 internally), and the result panel echoes both the matched timestamp and
 the pre-period cutoff back in CET via `propagation.utc_to_cet_str` — the
 same two conversion points every other CET input/output in this app goes
-through:
+through. The whole pane (controls + results) is wrapped in a scrollable
+viewport (`_make_scrollable_pane`, see below) so the result panel is
+never squeezed off-screen on a short window, and the result `Text`
+widget itself uses `wrap='none'` plus a horizontal scrollbar rather than
+reflowing its fixed-width aligned columns.
 
 ```
 impact = (shadowPrice_actual × PTDF_target_actual)
