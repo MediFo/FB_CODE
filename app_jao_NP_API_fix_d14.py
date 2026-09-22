@@ -767,14 +767,22 @@ class App:
         # same `labels` list fixes the readout wherever this helper is
         # already called with real labels, no per-chart change needed.
         if labels:
-            _labels_snapshot = list(labels)
-            def _fmt_coord(x, y, _labels=_labels_snapshot):
-                idx = int(round(x))
-                xs = _labels[idx] if 0 <= idx < len(_labels) else f"{x:.2f}"
-                return f"x={xs}   y={y:,.3f}"
-            ax.format_coord = _fmt_coord
+            ax.format_coord = self._index_format_coord(labels)
 
-    def _style_twin(self, ax, color):
+    def _index_format_coord(self, labels):
+        """Shared closure factory behind the hover-format fix in both
+        _setup_ax and _style_twin: given the same `labels` list already
+        used for a chart's x tick labels, returns a format_coord function
+        that looks the hovered x position up in it, instead of showing a
+        raw index float."""
+        _labels_snapshot = list(labels)
+        def _fmt_coord(x, y):
+            idx = int(round(x))
+            xs = _labels_snapshot[idx] if 0 <= idx < len(_labels_snapshot) else f"{x:.2f}"
+            return f"x={xs}   y={y:,.3f}"
+        return _fmt_coord
+
+    def _style_twin(self, ax, color, labels=None):
         ax.tick_params(axis='y', colors=color, labelsize=7.5)
         ax.yaxis.label.set_color(color)
         ax.yaxis.label.set_fontsize(8.5)
@@ -783,6 +791,22 @@ class App:
         ax.spines['right'].set_visible(True)
         ax.spines['right'].set_color(color)
         ax.spines['right'].set_linewidth(0.8)
+        # A twin axis needs this SAME hover fix as its primary axis, not a
+        # copy of the primary's own fix -- matplotlib's mouse-move handler
+        # only calls format_coord on `event.inaxes`, whichever of the two
+        # overlapping twins is topmost at that pixel (typically the twin,
+        # since it's created after the primary via ax.twinx()). Without
+        # this, hovering shows matplotlib's own DEFAULT twin-aware
+        # format_coord instead -- Axes.format_coord(), when an axes has
+        # twins, renders "(x, y) = (a, b) | (c, d)" by calling
+        # format_xdata()/format_ydata() on EACH twin, and format_xdata()
+        # comes back blank for any x not exactly on a tick once
+        # set_xticklabels() has replaced the axis's formatter with a
+        # FixedFormatter (fine for drawing ticks, useless for arbitrary
+        # continuous hover positions) -- producing exactly the broken
+        # "(x, y) = (, 453.) | (, 1093.)" readout this was fixed for.
+        if labels:
+            ax.format_coord = self._index_format_coord(labels)
 
     def _legend(self, ax, **kw):
         ax.legend(frameon=True, framealpha=0.95, fontsize=7.5,
@@ -834,7 +858,7 @@ class App:
         canvas.draw()
         self.root.update_idletasks()
 
-    def _plot_net_pos_twin(self, ax, x_idx, y_np):
+    def _plot_net_pos_twin(self, ax, x_idx, y_np, labels=None):
         """Add a net-position twin-axis: blue fill above zero, red below."""
         pos = [v >= 0 for v in y_np]
         neg = [v <  0 for v in y_np]
@@ -843,7 +867,7 @@ class App:
         ax.plot(x_idx, y_np, color=C_PRIMARY, linewidth=1.2, label="Net Position (MW)")
         ax.axhline(0, color=C_BORDER, linewidth=0.8, linestyle='--')
         ax.set_ylabel("Net Position (MW)", color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax, C_PRIMARY)
+        self._style_twin(ax, C_PRIMARY, labels)
 
     def _add_toolbar(self, canvas, frame):
         for w in frame.winfo_children():
@@ -1457,7 +1481,7 @@ class App:
         ax1b.step(x_idx, y_ram, color=C_PRIMARY, where='post', alpha=0.8, linewidth=1.5)
         ax1b.fill_between(x_idx, y_ram, alpha=0.06, color=C_PRIMARY, step='post')
         ax1b.set_ylabel("RAM (MW)", color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax1b, C_PRIMARY)
+        self._style_twin(ax1b, C_PRIMARY, xs)
         ax1.set_title(f"{cnec}  —  {dtype} ({area_label}) vs RAM")
         ax1.set_xticks(list(x_idx)); ax1.set_xticklabels(xs)
         self._setup_ax(ax1, xs); self._legend(ax1)
@@ -1470,7 +1494,7 @@ class App:
                   linewidth=1.2, label="Shadow Price")
         ax2b.fill_between(x_idx, y_sp, alpha=0.08, color=C_RED)
         ax2b.set_ylabel("Shadow Price (€/MWh)", color=C_RED, fontsize=8.5)
-        self._style_twin(ax2b, C_RED)
+        self._style_twin(ax2b, C_RED, xs)
         ax2.set_title(f"{dtype} ({area_label}) vs Shadow Price")
         ax2.set_xticks(list(x_idx)); ax2.set_xticklabels(xs)
         self._setup_ax(ax2, xs); self._legend(ax2)
@@ -1592,7 +1616,11 @@ class App:
 
         ax.set_title("Day-Ahead Market Price History")
         ax.set_ylabel("EUR / MWh", fontsize=8.5)
-        self._setup_ax(ax, [])
+        # unified_labels is the FULL per-index CET label list (only the
+        # visible TICKS are subsampled above, for readability) -- passing
+        # it here fixes hover on every index, not just the ones with a
+        # drawn tick, same as every other dated chart in this file.
+        self._setup_ax(ax, unified_labels)
         self.fig6.tight_layout(pad=2.0)
         self._add_toolbar(self.canvas6, self.toolbar_f6)
 
@@ -1781,7 +1809,7 @@ class App:
         ax1.fill_between(x_idx, y_prc, alpha=0.1, color=C_AMBER)
         ax1.set_ylabel("Price (€/MWh)", color=C_AMBER, fontsize=8.5)
         ax1.tick_params(axis='y', colors=C_AMBER, labelsize=7.5)
-        self._plot_net_pos_twin(ax1.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax1.twinx(), x_idx, y_np, xs)
         ax1.set_title("Day-Ahead Price vs Net Position")
         ax1.set_xticks(list(x_idx)); ax1.set_xticklabels(xs)
         self._setup_ax(ax1, xs); self._legend(ax1)
@@ -1792,7 +1820,7 @@ class App:
         ax2.fill_between(x_idx, y_ram, alpha=0.1, color=C_GREEN, step='post')
         ax2.set_ylabel("RAM (MW)", color=C_GREEN, fontsize=8.5)
         ax2.tick_params(axis='y', colors=C_GREEN, labelsize=7.5)
-        self._plot_net_pos_twin(ax2.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax2.twinx(), x_idx, y_np, xs)
         ax2.set_title("RAM vs Net Position")
         ax2.set_xticks(list(x_idx)); ax2.set_xticklabels(xs)
         self._setup_ax(ax2, xs); self._legend(ax2)
@@ -1803,7 +1831,7 @@ class App:
         ax3.fill_between(x_idx, y_sp, alpha=0.08, color=C_RED)
         ax3.set_ylabel("Shadow Price (€/MWh)", color=C_RED, fontsize=8.5)
         ax3.tick_params(axis='y', colors=C_RED, labelsize=7.5)
-        self._plot_net_pos_twin(ax3.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax3.twinx(), x_idx, y_np, xs)
         ax3.set_title("Shadow Price vs Net Position")
         ax3.set_xticks(list(x_idx)); ax3.set_xticklabels(xs)
         self._setup_ax(ax3, xs); self._legend(ax3)
@@ -2036,7 +2064,7 @@ class App:
         ax3b = ax3.twinx()
         ax3b.bar(x_idx, rams, color=C_PRIMARY, alpha=0.2, label='RAM', width=0.7)
         ax3b.set_ylabel('RAM (MW)', color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax3b, C_PRIMARY)
+        self._style_twin(ax3b, C_PRIMARY, xs)
         ax3.set_title(f"Shadow Price & RAM  —  {cnec}")
         ax3.set_xticks(list(x_idx))
         ax3.set_xticklabels(xs)
@@ -3715,13 +3743,13 @@ class App:
                         .apply(lambda s: (s > 0.01).mean() * 100)
                         .sort_values(ascending=False).head(20))
                 bars = ax.bar(range(len(freq)), freq.values, color=C_PRIMARY, alpha=0.8)
+                bar_labels = [c[:16] for c in freq.index]
                 ax.set_xticks(range(len(freq)))
-                ax.set_xticklabels([c[:16] for c in freq.index],
-                                   rotation=40, ha='right', fontsize=6)
+                ax.set_xticklabels(bar_labels, rotation=40, ha='right', fontsize=6)
                 ax.set_ylabel("Binding frequency (%)", fontsize=8.5)
                 ax.set_title("CNEC Binding Frequency (shadow price > 0)",
                              color=C_ACCENT)
-                self._setup_ax(ax, [])
+                self._setup_ax(ax, bar_labels)
 
         self._ma_fig_plots.tight_layout(pad=2.0)
         self._add_toolbar(self._ma_canvas_plots, self._ma_toolbar_f5)

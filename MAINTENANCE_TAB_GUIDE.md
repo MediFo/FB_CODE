@@ -185,16 +185,36 @@ gridded as a SIBLING of their toolbar frame, not a child of it** —
 `NavigationToolbar2Tk` on each run, so a button placed inside that frame
 would vanish after the first analysis.
 
-**Hover coordinates.** Every chart built through `_setup_ax(ax, labels)`
-now overrides `ax.format_coord` to look the hovered x position up in
-`labels` (the same list already used to build `set_xticklabels`) instead
-of showing matplotlib's raw index float — this was already silently
-broken (`x=42.31`) everywhere `_setup_ax` is called with real labels, not
-just in this tab. The ITS chart plots real `dateTimeUtc` values directly
-rather than an index, so it gets its own `format_coord` converting the
-hovered matplotlib date float back to a CET string via
-`mdates.num2date(x).astimezone(_CET)` — this app's usual human-facing
-convention, not UTC and not a bare float.
+**Hover coordinates (app-wide, not just this tab).** Every chart built
+through `_setup_ax(ax, labels)` overrides `ax.format_coord` to look the
+hovered x position up in `labels` (the same list already used to build
+`set_xticklabels`) instead of showing matplotlib's raw index float — this
+was silently broken (`x=42.31`) everywhere `_setup_ax` got real labels.
+**Twin axes need the identical fix applied SEPARATELY** — `_style_twin`
+now takes an optional `labels` argument too, and every `.twinx()` call
+site in the file (Tabs 5, 7, and the Shadow-Price-&-RAM chart) passes its
+own `xs` through. This isn't a cosmetic duplicate of the primary axis's
+fix: matplotlib's mouse-move handler calls `format_coord` on whichever of
+the two overlapping twins is `event.inaxes` (topmost at that pixel,
+typically the twin itself, since it's created after the primary via
+`ax.twinx()`) — fixing only the primary left the twin showing
+matplotlib's own default twin-aware `format_coord`, which renders
+`"(x, y) = (a, b) | (c, d)"` by calling each twin's `format_xdata()`, and
+that comes back BLANK for any x not exactly on a tick once
+`set_xticklabels()` has swapped in a `FixedFormatter` — producing exactly
+the broken `"(x, y) = (, 453.) | (, 1093.)"` this was fixed for (caught
+from a real screenshot of the Shadow Price & RAM twin chart). The ITS
+chart plots real `dateTimeUtc` values directly rather than an index, so
+it gets its own `format_coord` converting the hovered matplotlib date
+float back to a CET string via `mdates.num2date(x).astimezone(_CET)` —
+this app's usual human-facing convention, not UTC and not a bare float.
+Tab 6's Price History and Tab 9 Plots' Time Series / CNEC Binding
+Frequency charts previously passed `_setup_ax(ax, [])` — an empty label
+list — so they had no date/category shown anywhere, not on the ticks and
+not on hover; all three now pass their real label list through.
+`dashboard.py` (the other GUI) has the same underlying pattern in its own
+charts and has NOT been touched here — a known follow-up, not an
+oversight.
 
 **Price Spread pane (optional, added after the rest of this tab).**
 Shows how much ONE CNEC's contribution to a TARGET zone's price has
