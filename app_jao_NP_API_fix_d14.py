@@ -2903,12 +2903,11 @@ class App:
         #     (zone -> circle) when the Nordic zone is EXPORTING (mw >= 0,
         #     the sign convention _fetch_tab8_period_thread's own
         #     `bucket[(area, other)] = ... exp` already uses), inward
-        #     (circle -> zone) when it's IMPORTING (mw < 0);
-        #   - the CIRCLE is left unfilled (outline only) when exporting,
-        #     and filled solid when importing -- "energy is arriving" reads
-        #     as a filled/solid marker, "energy is leaving" as an open one
-        #     -- with the label switching to white so it stays readable on
-        #     the solid fill;
+        #     (circle -> zone) when it's IMPORTING (mw < 0). This is the
+        #     ONLY direction signal -- the circle itself always looks the
+        #     same (solid purple fill, white label) regardless of export
+        #     vs. import, rather than ALSO toggling solid-vs-outline, since
+        #     that doubled up on what the arrow direction already says;
         #   - the CIRCLE'S RADIUS scales with |mw| relative to the largest
         #     external flow in this slot, same "line width scales with
         #     volume" idea the Nordic-internal arrows above already use.
@@ -2951,14 +2950,12 @@ class App:
                                                 lw=lw, mutation_scale=9,
                                                 linestyle=(0, (4, 2))))
                     circle = Circle((cxp, cyp), r, zorder=5,
-                                     facecolor=(C_PURPLE if not exporting else 'white'),
-                                     edgecolor=C_PURPLE, linewidth=1.3,
-                                     alpha=1.0 if not exporting else 0.95)
+                                     facecolor=C_PURPLE, edgecolor=C_PURPLE,
+                                     linewidth=1.3)
                     ax.add_patch(circle)
-                    text_color = 'white' if not exporting else C_PURPLE
                     ax.text(cxp, cyp, f"{other}\n{abs(mw):.0f}",
                             fontsize=5.8, ha='center', va='center', zorder=6,
-                            color=text_color, fontweight='bold')
+                            color='white', fontweight='bold')
 
         # Flow legend
         legend_handles = [
@@ -2972,14 +2969,9 @@ class App:
         if has_external:
             legend_handles.append(
                 Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
-                       markerfacecolor='white', markeredgecolor=C_PURPLE,
-                       linestyle=(0, (4, 2)), lw=1.5,
-                       label="External, exporting (Nordic → Core/Baltic/other)"))
-            legend_handles.append(
-                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
                        markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
                        linestyle=(0, (4, 2)), lw=1.5,
-                       label="External, importing (Core/Baltic/other → Nordic)"))
+                       label="External (Core/Baltic/other) -- arrow shows direction"))
         ax.legend(handles=legend_handles, loc='lower right', fontsize=7,
                   framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL,
                   labelcolor=C_TEXT)
