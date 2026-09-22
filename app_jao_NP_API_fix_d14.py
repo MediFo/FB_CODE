@@ -2657,18 +2657,54 @@ class App:
                                      or conn.get('counterpart')
                                      or conn.get('toArea')
                                      or conn.get('deliveryAreaCode'))
+                            if not other:
+                                continue
+                            if conn_key_resolved and not getattr(self, '_t8_logged_conn_sample', False):
+                                self._t8_logged_conn_sample = True
+                                _diag(f"[FLOW {date_str}] first connection entry, full: {conn}")
+                            # Nordic-internal pairs came out net-correct before
+                            # this fix too, because we query BOTH sides of
+                            # those borders as delivery areas and net their
+                            # two independently-reported "export" figures
+                            # against each other (see below) -- that only
+                            # works by construction when both directions are
+                            # actually observed. For an EXTERNAL zone we
+                            # never request as its own delivery area, so we
+                            # only ever see ITS Nordic counterpart's side of
+                            # the connection; if that side reports export
+                            # and import as two separate, always-nonnegative
+                            # fields (a plausible "scheduled physical flow"
+                            # shape) rather than one already-signed value,
+                            # reading 'export' alone -- as this used to --
+                            # silently produces a value that is >= 0 on
+                            # every row, which is exactly why every external
+                            # arrow was rendering as "exporting" regardless
+                            # of the real direction. Reading both sides and
+                            # netting them fixes that case too, and is a
+                            # no-op (falls back to whichever single field is
+                            # actually populated) wherever the API really
+                            # does report one already-signed value.
                             exp_raw = (conn.get('export')
                                        or conn.get('exportFlow')
                                        or conn.get('scheduledExport')
-                                       or conn.get('value')
-                                       or 0)
-                            if not other:
-                                continue
+                                       or conn.get('export_mw'))
+                            imp_raw = (conn.get('import')
+                                       or conn.get('importFlow')
+                                       or conn.get('scheduledImport')
+                                       or conn.get('import_mw'))
+                            if exp_raw is None and imp_raw is None:
+                                exp_raw = (conn.get('value') or conn.get('flow')
+                                           or conn.get('netFlow') or 0)
                             try:
                                 exp = float(exp_raw or 0)
                             except (TypeError, ValueError):
                                 exp = 0.0
-                            bucket[(area, other)] = bucket.get((area, other), 0) + exp
+                            try:
+                                imp = float(imp_raw or 0)
+                            except (TypeError, ValueError):
+                                imp = 0.0
+                            net = exp - imp
+                            bucket[(area, other)] = bucket.get((area, other), 0) + net
 
                 _diag(f"[FLOW {date_str}] MTU slots with data: {len(day_flows_raw)}")
         except Exception as e:
