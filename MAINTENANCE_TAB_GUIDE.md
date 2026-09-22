@@ -174,16 +174,29 @@ Price Spread got it too) rather than being clipped on a short window;
 Summary, DiD, and Per-CNEC table already had their own scrollbar
 (`Text`/`Treeview` built-in) and didn't need it. ITS and ΔRAM
 decomposition also carry a **⛶ Full Screen** button next to their
-toolbar — `_open_figure_fullscreen()` renders the current `Figure` to a
-temp PNG and opens it in its own large, scrollable `Toplevel` (Esc or
-Close to dismiss) rather than re-embedding the *same* `Figure` object in
-a second live canvas, which would risk the next in-place redraw
+toolbar — `_open_figure_fullscreen()` renders the current `Figure` to an
+in-memory PNG (`fig.savefig` into an `io.BytesIO`, no temp file) at a
+fixed high resolution (dpi=200) and opens it in its own large `Toplevel`
+(Esc or Close to dismiss) rather than re-embedding the *same* `Figure`
+object in a second live canvas, which would risk the next in-place redraw
 (`fig.clear()` + rebuild, which both charts do on every re-analysis)
 fighting over which canvas owns it. **Both Full Screen buttons are
 gridded as a SIBLING of their toolbar frame, not a child of it** —
 `_add_toolbar()` destroys every child of the frame it's given to rebuild
 `NavigationToolbar2Tk` on each run, so a button placed inside that frame
-would vanish after the first analysis.
+would vanish after the first analysis. It opens already scaled to **Fit
+to Window** (computed from the popup's actual laid-out size via
+`top.after(50, _fit_to_window)` — `winfo_width()`/`winfo_height()` aren't
+real until the window is mapped) so the whole chart is visible with no
+forced scrolling, the original complaint; **Zoom In/Out/Reset** buttons
+(plus `+`/`-`/`0` keys and Ctrl+wheel) rescale that same fixed-dpi source
+image rather than the display-sized one, so zooming in stays sharp. This
+needs **Pillow** (optional dependency, `gui-zoom` extra /
+`requirements.txt`) for arbitrary-ratio scaling; without it, the popout
+falls back to a `tk.PhotoImage` pre-shrunk via `subsample()` (integer
+factors only, so it can undershoot the window slightly) with no zoom
+controls — still fixes "doesn't fit," just without the adjustable view,
+and says so in the popup (`"Install Pillow for zoom controls"`).
 
 **Hover coordinates (app-wide, not just this tab).** Every chart built
 through `_setup_ax(ax, labels)` overrides `ax.format_coord` to look the
@@ -240,6 +253,15 @@ viewport (`_make_scrollable_pane`, see below) so the result panel is
 never squeezed off-screen on a short window, and the result `Text`
 widget itself uses `wrap='none'` plus a horizontal scrollbar rather than
 reflowing its fixed-width aligned columns.
+
+`estimate_cnec_price_impact()`'s `timestamp_tol_minutes` (how close a
+typed timestamp must land to an actual row) defaults to `mtu_minutes`
+(15) rather than a fixed 1 minute — a 1-minute default rejected almost
+every real, human-typed timestamp against the data's actual 15-minute
+MTU grid, throwing `"No row for CNEC ... within 1.0 minute(s) of ..."`
+for a timestamp that was only a few minutes off a real row. Pass an
+explicit `timestamp_tol_minutes` to a caller of the propagation function
+directly to override this; the GUI doesn't expose it as its own field.
 
 ```
 impact = (shadowPrice_actual × PTDF_target_actual)

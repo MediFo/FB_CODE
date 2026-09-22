@@ -48,5 +48,11 @@ scikit-learn>=1.3
 #    exactly that reason (see CLAUDE.md). ──────────────────────────────────
 tbats>=1.1
 
+# ── Zoom/pan controls on app_jao_NP_API_fix_d14.py's Tab 9 "Full Screen"
+#    chart popout (arbitrary-ratio image scaling) -- optional: falls back
+#    to a fixed-size, still-fitted-to-window image with no zoom controls
+#    if not installed. ──────────────────────────────────────────────────
+Pillow>=10.0
+
 # ── Test suite ────────────────────────────────────────────────────────────
 pytest>=7.0

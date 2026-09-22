@@ -1271,6 +1271,20 @@ class TestEstimateCnecPriceImpact:
         assert r["ok"] is True
         assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[-1]
 
+    def test_default_tolerance_matches_mtu_minutes(self):
+        """A fixed 1-minute default tolerance rejected almost every real,
+        human-typed timestamp against the actual 15-minute MTU grid --
+        the default now scales with mtu_minutes (15 by default) instead,
+        so an offset well past 1 minute but still within one MTU period
+        must still match."""
+        df = self._df()
+        near_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(minutes=10)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       near_ts)
+        assert r["ok"] is True
+        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[-1]
+
     def test_naive_timestamps_treated_as_utc(self):
         df = self._df()
         r = estimate_cnec_price_impact(

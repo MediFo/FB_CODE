@@ -5133,7 +5133,7 @@ def estimate_cnec_price_impact(df: pd.DataFrame, cnec: str, tgt_zone: str,
                                pre_end, timestamp,
                                its_method: str = ITS_DEFAULT_METHOD,
                                mtu_minutes: int = 15,
-                               timestamp_tol_minutes: float = 1.0) -> dict:
+                               timestamp_tol_minutes: Optional[float] = None) -> dict:
     """
     Estimate how much ONE CNEC's contribution to ONE target zone's
     day-ahead price has moved, at ONE specific timestamp, relative to what
@@ -5176,12 +5176,23 @@ def estimate_cnec_price_impact(df: pd.DataFrame, cnec: str, tgt_zone: str,
     "validate before trusting the physics" posture `_its_ptdf_flow()`'s
     own correlation gate uses elsewhere in this file.
 
+    `timestamp_tol_minutes` defaults to `mtu_minutes` (the data's own MTU
+    grid spacing, 15 minutes for Nordic FBMC) rather than a fixed small
+    number: a caller's `timestamp` is a human-entered wall-clock value
+    (e.g. the app's Price Spread pane), so it needs to reach the row for
+    ITS OWN MTU, not just an exact-second match -- a 1-minute default
+    tolerance rejected almost every real timestamp a person could type,
+    since actual rows only exist every 15 minutes. Pass an explicit value
+    to tighten (or further loosen) this for a specific caller.
+
     Returns a dict, always carrying `ok`/`error`/`cnec`/`tgt_zone`/
     `its_method`; on success (`ok=True`) also carries
     `matched_timestamp`, `shadow_price_actual`, `shadow_price_cf`,
     `ptdf_target_actual`, `ptdf_target_cf`, `actual_contribution`,
     `counterfactual_contribution`, `impact`.
     """
+    if timestamp_tol_minutes is None:
+        timestamp_tol_minutes = mtu_minutes
     result = {"ok": False, "error": None, "cnec": cnec,
               "tgt_zone": tgt_zone, "its_method": its_method}
 

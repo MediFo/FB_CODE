@@ -4,7 +4,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -924,43 +923,54 @@ class App:
         return outer, inner
 
     def _open_figure_fullscreen(self, fig, title="Full Screen"):
-        """Pop a snapshot of `fig` open in its own large, resizable window --
-        a static image (fig.savefig -> tk.PhotoImage), not a second live
-        embedding of the same Figure: reparenting a matplotlib Figure across
-        two simultaneous Tk canvases risks the next in-place redraw (fig.clear()
-        + rebuild, which every chart here does on its next run) fighting over
-        which canvas owns it. A snapshot has none of that risk, and this is a
+        """Pop a snapshot of `fig` open in its own large window -- a static
+        image (fig.savefig), not a second live embedding of the same
+        Figure: reparenting a matplotlib Figure across two simultaneous Tk
+        canvases risks the next in-place redraw (fig.clear() + rebuild,
+        which every chart here does on its next run) fighting over which
+        canvas owns it. A snapshot has none of that risk, and this is a
         read-only "look closer" view, not a second interactive chart -- the
         original embedded chart keeps its own zoom/pan toolbar as before.
-        Sized to ~92% of the screen so it's dramatically bigger than any
-        embedded pane without covering taskbars/menu bars entirely."""
+
+        Rendered ONCE at a fixed high resolution (dpi=200, well above any
+        screen's pixel density) and then scaled for DISPLAY -- opens
+        already scaled to fit entirely inside the window (no forced
+        scrolling to see the rest of the chart, the original complaint),
+        with Zoom In/Out/Reset/Fit buttons that rescale that same
+        high-res source, so zooming in stays sharp rather than blurring a
+        screen-sized image blown up further. Needs Pillow for arbitrary
+        (non-integer) scaling; without it, falls back to a fixed-size,
+        already-fitted image with no zoom controls -- still fixes the
+        original "doesn't fit" complaint, just without the adjustable
+        view."""
         if fig is None:
             return
+        import io
+        buf = io.BytesIO()
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            tmp.close()
-            fig.savefig(tmp.name, dpi=140,
+            fig.savefig(buf, format='png', dpi=200,
                         facecolor=fig.get_facecolor(), bbox_inches='tight')
-            photo = tk.PhotoImage(file=tmp.name)
         except Exception as e:
             messagebox.showerror("Full Screen", f"Could not render full-screen view: {e}")
             return
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+        png_bytes = buf.getvalue()
+
+        try:
+            from PIL import Image, ImageTk
+            src_img = Image.open(io.BytesIO(png_bytes))
+            src_img.load()
+        except Exception:
+            src_img = None
 
         top = tk.Toplevel(self.root)
         top.title(title)
         top.configure(bg=C_PANEL)
-        top.image = photo  # keep a reference alive for the widget's lifetime
         sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
-        w, h = min(photo.width() + 40, int(sw * 0.92)), min(photo.height() + 80, int(sh * 0.92))
-        top.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        win_w, win_h = int(sw * 0.92), int(sh * 0.90)
+        top.geometry(f"{win_w}x{win_h}+{(sw - win_w) // 2}+{(sh - win_h) // 2}")
 
         bar = ttk.Frame(top, style='Card.TFrame')
-        bar.pack(fill=tk.X, padx=8, pady=(8, 0))
+        bar.pack(fill=tk.X, padx=8, pady=(8, 4))
         ttk.Button(bar, text="Close  (Esc)", command=top.destroy).pack(side=tk.RIGHT)
 
         vsb = ttk.Scrollbar(top, orient='vertical')
@@ -969,15 +979,95 @@ class App:
                             yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         vsb.config(command=canvas.yview)
         hsb.config(command=canvas.xview)
+
+        if src_img is None:
+            # No Pillow -- fall back to a plain tk.PhotoImage, pre-shrunk to
+            # fit the window via subsample() (integer factor only, so this
+            # can undershoot slightly, but that still beats not fitting at
+            # all). No zoom controls in this path.
+            import base64
+            photo = tk.PhotoImage(data=base64.b64encode(png_bytes).decode('ascii'))
+            fx = max(1, -(-photo.width() // max(1, win_w - 40)))
+            fy = max(1, -(-photo.height() // max(1, win_h - 90)))
+            f = max(fx, fy)
+            if f > 1:
+                photo = photo.subsample(f, f)
+            top.image = photo  # keep a reference alive for the widget's lifetime
+            ttk.Label(bar, text="Install Pillow for zoom controls",
+                      style='Muted.TLabel').pack(side=tk.LEFT)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            hsb.pack(side=tk.BOTTOM, fill=tk.X)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+            canvas.create_image(0, 0, anchor='nw', image=photo)
+            canvas.configure(scrollregion=(0, 0, photo.width(), photo.height()))
+            top.bind("<Escape>", lambda e: top.destroy())
+            top.transient(self.root)
+            top.focus_set()
+            return
+
+        # Pillow path: real "adjusting views" -- Fit to Window (default),
+        # Zoom In/Out, Reset to 100%, all rescaling the ONE high-res source
+        # image rather than the display-sized one, so zooming in doesn't
+        # blur. `state` is a plain dict (not instance attrs) since each
+        # popout is independent and short-lived.
+        state = {"scale": 1.0, "tk_img": None}
+
+        def _render():
+            w = max(1, int(src_img.width * state["scale"]))
+            h = max(1, int(src_img.height * state["scale"]))
+            resized = src_img.resize((w, h), Image.LANCZOS)
+            tkimg = ImageTk.PhotoImage(resized)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor='nw', image=tkimg)
+            canvas.configure(scrollregion=(0, 0, w, h))
+            state["tk_img"] = tkimg  # keep a reference alive -- Tk drops a PhotoImage with none
+            zoom_lbl.config(text=f"{int(state['scale'] * 100)}%")
+
+        def _fit_to_window():
+            avail_w = max(1, canvas.winfo_width() or (win_w - 40))
+            avail_h = max(1, canvas.winfo_height() or (win_h - 90))
+            state["scale"] = min(avail_w / src_img.width, avail_h / src_img.height)
+            _render()
+
+        def _zoom(factor):
+            state["scale"] = max(0.1, min(6.0, state["scale"] * factor))
+            _render()
+
+        def _reset():
+            state["scale"] = 1.0
+            _render()
+
+        ttk.Button(bar, text="Fit to Window", command=_fit_to_window).pack(side=tk.LEFT)
+        ttk.Button(bar, text="−", width=3, command=lambda: _zoom(0.8)).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="+", width=3, command=lambda: _zoom(1.25)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text="Reset (100%)", command=_reset).pack(side=tk.LEFT, padx=(8, 0))
+        zoom_lbl = ttk.Label(bar, text="100%", style='Muted.TLabel')
+        zoom_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
-        canvas.create_image(0, 0, anchor='nw', image=photo)
-        canvas.configure(scrollregion=(0, 0, photo.width(), photo.height()))
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        def _on_wheel(event):
+            if event.state & 0x4:  # Ctrl held -> zoom instead of scroll
+                _zoom(1.1 if event.delta > 0 else 0.9)
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _on_wheel)
+        canvas.bind("<Shift-MouseWheel>",
+                    lambda e: canvas.xview_scroll(int(-1 * (e.delta / 120)), "units"))
 
         top.bind("<Escape>", lambda e: top.destroy())
+        top.bind("+", lambda e: _zoom(1.25)); top.bind("=", lambda e: _zoom(1.25))
+        top.bind("-", lambda e: _zoom(0.8))
+        top.bind("0", lambda e: _reset())
         top.transient(self.root)
         top.focus_set()
+        # Fit-to-window needs the canvas's REAL size, which isn't known
+        # until the window has actually been mapped/laid out -- schedule
+        # it just after that, rather than computing against win_w/win_h
+        # (the requested geometry, not necessarily the actual one).
+        top.after(50, _fit_to_window)
 
     # ------------------------------------------------------------------
     #  TAB 1 – Fetch / Upload  (two-column layout)
