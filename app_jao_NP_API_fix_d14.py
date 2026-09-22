@@ -2263,10 +2263,21 @@ class App:
         ctrl = ttk.Frame(main, style='Card.TFrame')
         ctrl.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(ctrl, text="Date:").pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="From (CET):").pack(side=tk.LEFT)
         self._t8_date = ttk.Entry(ctrl, width=12)
         self._t8_date.insert(0, self.today_str)
-        self._t8_date.pack(side=tk.LEFT, padx=(4, 16))
+        self._t8_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        # "To" extends "From" into a PERIOD, for Play -- a single "Fetch &
+        # Plot" snapshot always uses From + the MTU dropdown below and
+        # ignores To entirely, so the single-shot behavior is unchanged
+        # when To is left equal to From (its default). Two independent
+        # plain Entries, no auto-sync between them, matching every other
+        # date-range field in this app (e.g. Tab 9's ENTSO-E Start/End).
+        ttk.Label(ctrl, text="To (CET):").pack(side=tk.LEFT)
+        self._t8_end_date = ttk.Entry(ctrl, width=12)
+        self._t8_end_date.insert(0, self.today_str)
+        self._t8_end_date.pack(side=tk.LEFT, padx=(4, 16))
 
         _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
         ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
@@ -2278,13 +2289,15 @@ class App:
                                   command=self._plot_tab8)
         self._t8_btn.pack(side=tk.LEFT)
 
-        # ── Slow-motion playback: steps through the day's MTU slots,
-        # redrawing price + flow on each one, so a flow reversal or price
-        # spike is watched happening rather than read off a static snapshot.
-        # Reuses the SAME fetch+parse as "Fetch & Plot" (see
-        # _fetch_tab8_day_thread) bucketed per MTU instead of narrowed to
-        # one, cached in self._t8_day_cache so switching between a single
-        # snapshot and playback for the same date never re-fetches.
+        # ── Slow-motion playback: steps through every MTU slot across the
+        # WHOLE [From, To] period (not just one day), redrawing price + flow
+        # on each one, so a flow reversal or price spike -- or a multi-day
+        # trend -- is watched happening rather than read off a static
+        # snapshot. Reuses the SAME fetch+parse as "Fetch & Plot" (see
+        # _fetch_tab8_period_thread), one Nord Pool request pair per
+        # calendar day in the period, cached in self._t8_period_cache so
+        # switching between a single snapshot and playback for the same
+        # range never re-fetches.
         self._t8_play_btn = ttk.Button(ctrl, text="▶ Play", command=self._t8_play)
         self._t8_play_btn.pack(side=tk.LEFT, padx=(12, 4))
         self._t8_stop_btn = ttk.Button(ctrl, text="⏹ Stop",
@@ -2300,9 +2313,10 @@ class App:
         self._t8_status.pack(side=tk.LEFT, padx=(10, 0))
 
         # Playback state
-        self._t8_day_cache      = None   # {"date","prices":{mtu:{zone:px}},"flows":{mtu:{(A,B):mw}}}
+        self._t8_period_cache   = None   # {"start","end","prices":{slot:{zone:px}},"flows":{slot:{(A,B):mw}},"external_flows":{slot:{(nordic,other):mw}}}
+                                          # slot = "YYYY-MM-DD HH:MM", one key format for both single-day and multi-day periods
         self._t8_fetch_mode     = "single"   # "single" | "play" -- which action the in-flight fetch is for
-        self._t8_fetch_target_mtu = None
+        self._t8_fetch_target_slot = None
         self._t8_play_mtus      = []
         self._t8_play_idx       = 0
         self._t8_playing        = False
@@ -2314,6 +2328,31 @@ class App:
         self._style_figure(self.fig8)
         self.canvas8 = FigureCanvasTkAgg(self.fig8, main)
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # ── External interconnector flows (Nordic → Core/Baltic/other) ──
+        # The background map only depicts the 12 Nordic bidding zones, so
+        # an interconnector to a non-Nordic zone (Germany, Poland, the
+        # Netherlands, Great Britain, Estonia, Lithuania, ...) has nowhere
+        # to draw an arrow TO -- shown as a table instead of forcing a
+        # guessed position onto a map that doesn't depict that territory.
+        # Entirely data-driven: whatever non-Nordic counterpart areas
+        # Nord Pool's own flow response reports for a Nordic zone show up
+        # here, nothing is hardcoded to a fixed interconnector list, so a
+        # link this app doesn't already know about still appears if the
+        # API reports it, and one that stops clearing quietly disappears.
+        ext_f = ttk.LabelFrame(main, text=" External Interconnector Flows (Nordic → Core / Baltic / Other) ", padding=(6, 4))
+        ext_f.pack(fill=tk.X, pady=(4, 0))
+        ext_cols = ('from', 'to', 'mw', 'direction')
+        self._t8_ext_tree = ttk.Treeview(
+            ext_f, columns=ext_cols, show='headings', height=3)
+        for col, lbl, w in (('from', 'Nordic Zone', 100), ('to', 'External Zone', 110),
+                            ('mw', 'MW', 90), ('direction', 'Direction', 160)):
+            self._t8_ext_tree.heading(col, text=lbl)
+            self._t8_ext_tree.column(col, width=w, anchor='center')
+        self._t8_ext_tree.pack(fill=tk.X)
+        self._t8_ext_status = ttk.Label(ext_f, text="No external flow data yet.",
+                                        style='Muted.TLabel')
+        self._t8_ext_status.pack(anchor='w', pady=(2, 0))
 
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
         diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
@@ -2329,29 +2368,60 @@ class App:
         sb8.pack(side=tk.RIGHT, fill=tk.Y)
         self._t8_diag.pack(fill=tk.X)
 
+    _T8_MAX_PERIOD_DAYS = 31   # soft cap -- one Nord Pool request pair per day, confirm before more
+
+    def _t8_parse_period(self):
+        """Read + validate the From/To fields. Returns (start_str, end_str,
+        n_days) or None (showing an error dialog) if invalid. To defaults
+        to From when blank or equal, so every existing single-day caller
+        keeps working unchanged."""
+        start_str = self._t8_date.get().strip()
+        end_str   = self._t8_end_date.get().strip() or start_str
+        try:
+            d0 = datetime.strptime(start_str, "%Y-%m-%d").date()
+            d1 = datetime.strptime(end_str, "%Y-%m-%d").date()
+        except ValueError:
+            messagebox.showerror("Nordic Map", "Enter From/To as YYYY-MM-DD.")
+            return None
+        if d1 < d0:
+            messagebox.showerror("Nordic Map", "To date is before From date.")
+            return None
+        n_days = (d1 - d0).days + 1
+        return start_str, end_str, n_days
+
     def _plot_tab8(self):
         self._t8_stop_play()   # a running animation shouldn't fight a fresh single-shot fetch
-        date_str = self._t8_date.get().strip()
-        mtu_str  = self._t8_mtu.get().strip()   # "HH:MM"
+        period = self._t8_parse_period()
+        if period is None:
+            return
+        start_str, end_str, n_days = period
+        mtu_str = self._t8_mtu.get().strip()   # "HH:MM"
         try:
             mtu_h, mtu_m = int(mtu_str[:2]), int(mtu_str[3:])
         except Exception:
             messagebox.showinfo("Info", "Select a valid MTU slot.")
             return
-        mtu_label = f"{mtu_h:02d}:{mtu_m:02d}"
+        # A single snapshot always targets the FROM date specifically --
+        # To only matters for Play (see _t8_parse_period's docstring).
+        slot_label = f"{start_str} {mtu_h:02d}:{mtu_m:02d}"
 
-        if self._t8_day_cache and self._t8_day_cache["date"] == date_str:
-            # Already fetched this day (e.g. from a previous Play) -- redraw
-            # immediately instead of re-querying Nord Pool for the same data.
-            prices = self._t8_day_cache["prices"].get(mtu_label, {})
-            flows  = self._t8_day_cache["flows"].get(mtu_label, {})
-            self._draw_tab8_map(prices, flows, date_str, mtu_label)
+        if (self._t8_period_cache and self._t8_period_cache["start"] == start_str
+                and self._t8_period_cache["end"] == end_str):
+            # Already fetched this exact range (e.g. from a previous Play)
+            # -- redraw immediately instead of re-querying Nord Pool.
+            self._t8_show_slot(slot_label)
             self._add_toolbar(self.canvas8, self.toolbar_f8)
             self._t8_status.config(text="(from cache)", foreground=C_MUTED)
             return
 
+        if n_days > 1 and not messagebox.askyesno(
+                "Nordic Map",
+                f"A single snapshot only needs the From date -- the To date "
+                f"({end_str}) only matters for Play. Fetch just {start_str}?"):
+            return
+
         self._t8_fetch_mode = "single"
-        self._t8_fetch_target_mtu = mtu_label
+        self._t8_fetch_target_slot = slot_label
         self._t8_btn.config(state=tk.DISABLED, text="Loading...")
         self._t8_play_btn.config(state=tk.DISABLED)
         self._t8_status.config(text="Fetching prices & flows...", foreground=C_MUTED)
@@ -2368,49 +2438,66 @@ class App:
         self.canvas8.draw()
         self.root.update_idletasks()
 
-        threading.Thread(target=self._fetch_tab8_day_thread,
-                         args=(date_str,), daemon=True).start()
+        # Single-shot only ever needs the From date's own data -- fetch
+        # just that one day, not the whole period, even if To is set.
+        threading.Thread(target=self._fetch_tab8_period_thread,
+                         args=(start_str, start_str), daemon=True).start()
 
     def _t8_play(self):
         """Start slow-motion playback: fetch (or reuse cached) prices/flows
-        for every MTU in the day, then step through them on a timer."""
+        for every MTU across the WHOLE [From, To] period, then step
+        through them on a timer."""
         if self._t8_playing:
             return
-        date_str = self._t8_date.get().strip()
-        if self._t8_day_cache and self._t8_day_cache["date"] == date_str:
-            self._t8_start_playback(date_str)
+        period = self._t8_parse_period()
+        if period is None:
+            return
+        start_str, end_str, n_days = period
+        if (self._t8_period_cache and self._t8_period_cache["start"] == start_str
+                and self._t8_period_cache["end"] == end_str):
+            self._t8_start_playback()
+            return
+
+        if n_days > self._T8_MAX_PERIOD_DAYS and not messagebox.askyesno(
+                "Nordic Map",
+                f"{n_days} days means {n_days} sequential Nord Pool request "
+                f"pairs -- this can take a while. Continue?"):
             return
 
         self._t8_fetch_mode = "play"
         self._t8_btn.config(state=tk.DISABLED)
         self._t8_play_btn.config(state=tk.DISABLED, text="Loading...")
-        self._t8_status.config(text="Fetching full day for playback...", foreground=C_MUTED)
+        self._t8_status.config(
+            text=f"Fetching {n_days} day(s) for playback..." if n_days > 1
+                 else "Fetching full day for playback...",
+            foreground=C_MUTED)
         self._t8_diag.config(state='normal')
         self._t8_diag.delete('1.0', tk.END)
         self._t8_diag.config(state='disabled')
 
-        threading.Thread(target=self._fetch_tab8_day_thread,
-                         args=(date_str,), daemon=True).start()
+        threading.Thread(target=self._fetch_tab8_period_thread,
+                         args=(start_str, end_str), daemon=True).start()
 
-    def _t8_start_playback(self, date_str):
-        all_prices = self._t8_day_cache["prices"]
-        all_flows  = self._t8_day_cache["flows"]
-        mtus = sorted(set(all_prices) | set(all_flows))
+    def _t8_start_playback(self):
+        all_prices = self._t8_period_cache["prices"]
+        all_flows  = self._t8_period_cache["flows"]
+        slots = sorted(set(all_prices) | set(all_flows))
         self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
-        if not mtus:
-            messagebox.showinfo("Play", "No price/flow data available for this date.")
+        if not slots:
+            messagebox.showinfo("Play", "No price/flow data available for this period.")
             return
 
-        # Always start from the beginning of the day. (Previously this
+        # Always start from the beginning of the period. (Previously this
         # started from whatever MTU was showing in the combobox -- but
-        # _t8_play_step() itself updates that combobox to the currently-
-        # playing MTU every frame, so after a full playback it's left on
-        # the LAST slot of the day; a second "Play" click would then
-        # "resume" one frame from the end and stop immediately, looking
-        # broken. Ignoring it and always starting at index 0 removes that
-        # accidental coupling between the display field and playback state.)
-        self._t8_play_mtus = mtus
+        # _t8_play_step() itself updates the displayed date/MTU to the
+        # currently-playing slot every frame, so after a full playback
+        # they're left on the LAST slot of the period; a second "Play"
+        # click would then "resume" one frame from the end and stop
+        # immediately, looking broken. Ignoring it and always starting at
+        # index 0 removes that accidental coupling between the display
+        # fields and playback state.)
+        self._t8_play_mtus = slots
         self._t8_play_idx  = 0
         self._t8_playing = True
         self._t8_btn.config(state=tk.DISABLED)
@@ -2418,21 +2505,30 @@ class App:
         self._t8_stop_btn.config(state=tk.NORMAL)
         self._t8_play_step()
 
+    def _t8_show_slot(self, slot_label):
+        """Draw one slot ("YYYY-MM-DD HH:MM") from the current period cache
+        -- shared by the single-shot cache-hit path and each playback
+        frame -- and refresh the external-flows table alongside it."""
+        prices    = self._t8_period_cache["prices"].get(slot_label, {})
+        flows     = self._t8_period_cache["flows"].get(slot_label, {})
+        ext_flows = self._t8_period_cache["external_flows"].get(slot_label, {})
+        self._draw_tab8_map(prices, flows, slot_label)
+        self._update_t8_external_tree(ext_flows)
+
     def _t8_play_step(self):
         if not self._t8_playing or self._t8_play_idx >= len(self._t8_play_mtus):
             self._t8_stop_play()
             return
-        date_str  = self._t8_day_cache["date"]
-        mtu_label = self._t8_play_mtus[self._t8_play_idx]
-        prices = self._t8_day_cache["prices"].get(mtu_label, {})
-        flows  = self._t8_day_cache["flows"].get(mtu_label, {})
-        self._draw_tab8_map(prices, flows, date_str, mtu_label)
+        slot_label = self._t8_play_mtus[self._t8_play_idx]
+        self._t8_show_slot(slot_label)
         # draw_idle() (not the toolbar-rebuilding _add_toolbar) -- cheap
         # enough to call every frame without visible lag or flicker.
         self.canvas8.draw_idle()
+        date_str, mtu_label = slot_label.split(" ", 1)
+        self._t8_date.delete(0, tk.END); self._t8_date.insert(0, date_str)
         self._t8_mtu.set(mtu_label)
         self._t8_status.config(
-            text=f"Playing {self._t8_play_idx + 1}/{len(self._t8_play_mtus)}: {mtu_label} CET",
+            text=f"Playing {self._t8_play_idx + 1}/{len(self._t8_play_mtus)}: {slot_label} CET",
             foreground=C_PRIMARY)
         self._t8_play_idx += 1
         interval_ms = self._T8_SPEED_MS.get(self._t8_speed.get(), 1200)
@@ -2454,46 +2550,48 @@ class App:
             self._t8_status.config(text="Stopped.", foreground=C_MUTED)
             self._add_toolbar(self.canvas8, self.toolbar_f8)
 
-    def _fetch_tab8_day_thread(self, date_str):
-        """Fetch NordPool DA prices + scheduled physical flows for the WHOLE
-        day, bucketed per MTU slot ("HH:MM" -> {...}). Both the single-
-        snapshot "Fetch & Plot" and the "Play" animation call this same
-        fetch+parse (picking one slot out afterward for the single-shot
-        case) so there is one place that understands the Nord Pool response
-        shape, instead of two copies that could silently drift apart."""
-        diag_lines = []
-
-        def _diag(msg):
-            diag_lines.append(msg)
-
-        token = get_np_access_token()
-        if not token:
-            self.root.after(0, self._tab8_day_fetch_done, {}, {}, date_str,
-                            "AUTH FAILED: could not obtain NordPool access token.",
-                            diag_lines)
+    def _update_t8_external_tree(self, ext_flows):
+        """Refresh the External Interconnector Flows table for the
+        currently-shown slot. `ext_flows` is {(nordic_zone, other_zone): mw}
+        -- positive means exporting FROM the Nordic zone TO the external
+        one, matching the same sign convention _draw_tab8_map's own arrows
+        use for Nordic-internal flows."""
+        self._t8_ext_tree.delete(*self._t8_ext_tree.get_children())
+        if not ext_flows:
+            self._t8_ext_status.config(
+                text="No external (Core/Baltic/other) flows reported for this slot.")
             return
+        self._t8_ext_status.config(
+            text=f"{len(ext_flows)} external link(s) reported by Nord Pool for this slot.")
+        for (nordic, other), mw in sorted(ext_flows.items(), key=lambda kv: -abs(kv[1])):
+            direction = f"{nordic} → {other}" if mw >= 0 else f"{other} → {nordic}"
+            self._t8_ext_tree.insert('', tk.END, values=(nordic, other, f"{abs(mw):.0f}", direction))
 
-        hdrs         = self._np_headers(token)
-        areas_params = [('areas', z) for z in NORDIC_ZONES]
-
-        # Prices, per MTU: {"HH:MM": {zone: price}}
-        all_prices  = {}
+    def _fetch_tab8_one_day(self, date_str, hdrs, areas_params, _diag):
+        """Fetch NordPool DA prices + scheduled physical flows for ONE
+        calendar day, bucketed per bare MTU slot ("HH:MM" -> {...}, no date
+        prefix -- the caller adds that). Returns (day_prices, day_flows_raw,
+        price_error, flow_error). Factored out of what used to be the
+        whole fetch thread so _fetch_tab8_period_thread can call it once
+        per day in a [From, To] range without duplicating the Nord Pool
+        response parsing."""
+        day_prices  = {}
         price_error = ""
         try:
             price_params = [('date', date_str), ('currency', 'EUR'),
                             ('market', 'DayAhead')] + areas_params
             rp = requests.get(NP_PRICE_URL, headers=hdrs,
                               params=price_params, timeout=20)
-            _diag(f"[PRICE] status={rp.status_code}  url={rp.url}")
+            _diag(f"[PRICE {date_str}] status={rp.status_code}  url={rp.url}")
             if rp.status_code != 200:
-                price_error = f"Price API HTTP {rp.status_code}: {rp.text[:200]}"
-                _diag(f"[PRICE] ERROR body: {rp.text[:400]}")
+                price_error = f"Price API HTTP {rp.status_code} ({date_str}): {rp.text[:200]}"
+                _diag(f"[PRICE {date_str}] ERROR body: {rp.text[:400]}")
             else:
                 raw_json = rp.json()
                 if raw_json and isinstance(raw_json, list):
-                    _diag(f"[PRICE] top-level keys: {list(raw_json[0].keys())}")
+                    _diag(f"[PRICE {date_str}] top-level keys: {list(raw_json[0].keys())}")
                     if raw_json[0].get('prices'):
-                        _diag(f"[PRICE] prices[0] keys: "
+                        _diag(f"[PRICE {date_str}] prices[0] keys: "
                               f"{list(raw_json[0]['prices'][0].keys())}")
                 for area_data in raw_json:
                     zone = area_data.get('deliveryArea')
@@ -2508,29 +2606,36 @@ class App:
                             if cet_dt.strftime('%Y-%m-%d') != date_str:
                                 continue
                             mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
-                            all_prices.setdefault(mtu_label, {})[zone] = p.get('price')
+                            day_prices.setdefault(mtu_label, {})[zone] = p.get('price')
                         except Exception as e:
-                            _diag(f"[PRICE] ts-parse error zone={zone} ts={ts!r}: {e}")
-                _diag(f"[PRICE] MTU slots with data: {len(all_prices)}")
+                            _diag(f"[PRICE {date_str}] ts-parse error zone={zone} ts={ts!r}: {e}")
+                _diag(f"[PRICE {date_str}] MTU slots with data: {len(day_prices)}")
         except Exception as e:
-            price_error = f"Price API exception: {e}"
-            _diag(f"[PRICE] EXCEPTION: {e}")
+            price_error = f"Price API exception ({date_str}): {e}"
+            _diag(f"[PRICE {date_str}] EXCEPTION: {e}")
 
-        # Scheduled Physical Flows, per MTU: {"HH:MM": {(area,other): MW}}
-        all_flows_raw = {}
+        # Scheduled Physical Flows, per MTU: {"HH:MM": {(area,other): MW}}.
+        # `other` is kept as whatever counterpart area code Nord Pool
+        # reports, WITHOUT filtering it to NORDIC_ZONES -- a Nordic area's
+        # own scheduled-flow response already reports every interconnector
+        # it clears on, Core/Baltic ones included, so no separate request
+        # or area list is needed to surface those; only the final
+        # aggregation below (net flows vs. external flows) decides what to
+        # do with a non-Nordic counterpart.
+        day_flows_raw = {}
         flow_error    = ""
         try:
             flow_params = [('date', date_str), ('market', 'DayAhead')] + areas_params
             rf = requests.get(NP_FLOW_URL, headers=hdrs,
                               params=flow_params, timeout=20)
-            _diag(f"[FLOW] status={rf.status_code}  url={rf.url}")
+            _diag(f"[FLOW {date_str}] status={rf.status_code}  url={rf.url}")
             if rf.status_code != 200:
-                flow_error = f"Flow API HTTP {rf.status_code}: {rf.text[:200]}"
-                _diag(f"[FLOW] ERROR body: {rf.text[:400]}")
+                flow_error = f"Flow API HTTP {rf.status_code} ({date_str}): {rf.text[:200]}"
+                _diag(f"[FLOW {date_str}] ERROR body: {rf.text[:400]}")
             else:
                 raw_flow = rf.json()
                 if raw_flow and isinstance(raw_flow, list):
-                    _diag(f"[FLOW] top-level keys: {list(raw_flow[0].keys())}")
+                    _diag(f"[FLOW {date_str}] top-level keys: {list(raw_flow[0].keys())}")
 
                 def _get_flow_list(ad):
                     for k in ('flows', 'scheduledFlows', 'entries', 'values'):
@@ -2548,7 +2653,7 @@ class App:
                         continue
                     fl_key, flow_list = _get_flow_list(area_data)
                     if fl_key and conn_key_resolved is None:
-                        _diag(f"[FLOW] flow-list key: '{fl_key}'. "
+                        _diag(f"[FLOW {date_str}] flow-list key: '{fl_key}'. "
                               f"Sample slot keys: {list(flow_list[0].keys())}")
 
                     for fl in flow_list:
@@ -2558,7 +2663,7 @@ class App:
                         try:
                             cet_dt = _utc_to_cet(ts)
                         except Exception as e:
-                            _diag(f"[FLOW] ts-parse error area={area} ts={ts!r}: {e}")
+                            _diag(f"[FLOW {date_str}] ts-parse error area={area} ts={ts!r}: {e}")
                             continue
                         if cet_dt.strftime('%Y-%m-%d') != date_str:
                             continue
@@ -2571,13 +2676,13 @@ class App:
                             if isinstance(connections, list) and connections:
                                 if conn_key_resolved != ck:
                                     conn_key_resolved = ck
-                                    _diag(f"[FLOW] connection-list key: '{ck}'. "
+                                    _diag(f"[FLOW {date_str}] connection-list key: '{ck}'. "
                                           f"Sample: {list(connections[0].keys())}")
                                 break
                         if not connections:
                             continue
 
-                        bucket = all_flows_raw.setdefault(mtu_label, {})
+                        bucket = day_flows_raw.setdefault(mtu_label, {})
                         for conn in connections:
                             other = (conn.get('area')
                                      or conn.get('deliveryArea')
@@ -2597,31 +2702,102 @@ class App:
                                 exp = 0.0
                             bucket[(area, other)] = bucket.get((area, other), 0) + exp
 
-                _diag(f"[FLOW] MTU slots with data: {len(all_flows_raw)}")
+                _diag(f"[FLOW {date_str}] MTU slots with data: {len(day_flows_raw)}")
         except Exception as e:
-            flow_error = f"Flow API exception: {e}"
-            _diag(f"[FLOW] EXCEPTION: {e}")
+            flow_error = f"Flow API exception ({date_str}): {e}"
+            _diag(f"[FLOW {date_str}] EXCEPTION: {e}")
 
-        # Net flow per canonical border pair (positive = A→B), per MTU
+        return day_prices, day_flows_raw, price_error, flow_error
+
+    def _fetch_tab8_period_thread(self, start_str, end_str):
+        """Fetch NordPool DA prices + scheduled physical flows across every
+        calendar day in [start_str, end_str] (inclusive), one request pair
+        per day (Nord Pool's own API is day-scoped), merged into ONE set of
+        dicts keyed by the full slot label "YYYY-MM-DD HH:MM" -- a single
+        key format that works identically whether the caller asked for one
+        day or many, so the rest of Tab 8 (cache, playback stepping,
+        drawing) never needs to branch on "is this a period or a day."""
+        diag_lines = []
+
+        def _diag(msg):
+            diag_lines.append(msg)
+
+        token = get_np_access_token()
+        if not token:
+            self.root.after(0, self._tab8_period_fetch_done, {}, {}, {},
+                            start_str, end_str,
+                            "AUTH FAILED: could not obtain NordPool access token.",
+                            diag_lines)
+            return
+
+        hdrs         = self._np_headers(token)
+        areas_params = [('areas', z) for z in NORDIC_ZONES]
+
+        d0 = datetime.strptime(start_str, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end_str, "%Y-%m-%d").date()
+        n_days = (d1 - d0).days + 1
+
+        all_prices    = {}   # {"YYYY-MM-DD HH:MM": {zone: price}}
+        all_flows_raw = {}   # {"YYYY-MM-DD HH:MM": {(area,other): MW}}
+        price_errors, flow_errors = [], []
+        for i in range(n_days):
+            date_str = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+            if n_days > 1:
+                self.root.after(0, self._t8_status.config,
+                                {"text": f"Fetching day {i + 1}/{n_days} ({date_str})...",
+                                 "foreground": C_MUTED})
+            day_prices, day_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
+                date_str, hdrs, areas_params, _diag)
+            for mtu_label, zone_prices in day_prices.items():
+                all_prices[f"{date_str} {mtu_label}"] = zone_prices
+            for mtu_label, flows_raw in day_flows_raw.items():
+                all_flows_raw[f"{date_str} {mtu_label}"] = flows_raw
+            if price_err:
+                price_errors.append(price_err)
+            if flow_err:
+                flow_errors.append(flow_err)
+
+        # Net flow per canonical Nordic-internal border pair (positive =
+        # A→B), per slot.
         all_net_flows = {}
-        for mtu_label, flows_raw in all_flows_raw.items():
+        # External flows: any (Nordic zone, non-Nordic counterpart) pair
+        # Nord Pool reported -- Core (Germany, Poland, the Netherlands,
+        # Great Britain, ...), Baltic (Estonia, Lithuania, ...), or
+        # anything else, entirely as returned by the API (see
+        # _fetch_tab8_one_day's own comment on why `other` isn't filtered
+        # there). Only ONE direction's report is available (we only ever
+        # request the Nordic side as `areas`), unlike Nordic-internal pairs
+        # where both sides are requested and netted against each other --
+        # so this is that Nordic zone's own reported export, not a
+        # two-sided net.
+        all_external_flows = {}
+        for slot_label, flows_raw in all_flows_raw.items():
             net_flows = {}
             for A, B in ZONE_CONNECTIONS:
                 net = flows_raw.get((A, B), 0) - flows_raw.get((B, A), 0)
                 if abs(net) >= 1:
                     net_flows[(A, B)] = net
             if net_flows:
-                all_net_flows[mtu_label] = net_flows
+                all_net_flows[slot_label] = net_flows
 
-        _diag(f"[RESULT] {len(all_prices)} MTU slot(s) with prices, "
-              f"{len(all_net_flows)} MTU slot(s) with flows")
+            ext_flows = {}
+            for (area, other), mw in flows_raw.items():
+                if area in NORDIC_ZONES and other not in NORDIC_ZONES and abs(mw) >= 1:
+                    ext_flows[(area, other)] = mw
+            if ext_flows:
+                all_external_flows[slot_label] = ext_flows
 
-        combined_error = "  |  ".join(filter(None, [price_error, flow_error]))
-        self.root.after(0, self._tab8_day_fetch_done, all_prices, all_net_flows,
-                        date_str, combined_error or None, diag_lines)
+        _diag(f"[RESULT] {n_days} day(s), {len(all_prices)} slot(s) with prices, "
+              f"{len(all_net_flows)} slot(s) with Nordic-internal flows, "
+              f"{len(all_external_flows)} slot(s) with external flows")
 
-    def _tab8_day_fetch_done(self, all_prices, all_net_flows, date_str,
-                             error=None, diag_lines=None):
+        combined_error = "  |  ".join(price_errors + flow_errors)
+        self.root.after(0, self._tab8_period_fetch_done, all_prices, all_net_flows,
+                        all_external_flows, start_str, end_str,
+                        combined_error or None, diag_lines)
+
+    def _tab8_period_fetch_done(self, all_prices, all_net_flows, all_external_flows,
+                                start_str, end_str, error=None, diag_lines=None):
         # ── Write diagnostic lines to the log pane ────────────────────
         if diag_lines:
             self._t8_diag.config(state='normal')
@@ -2637,27 +2813,30 @@ class App:
             messagebox.showerror("Tab 8 Error", error)
             return
 
-        self._t8_day_cache = {"date": date_str, "prices": all_prices, "flows": all_net_flows}
+        self._t8_period_cache = {"start": start_str, "end": end_str,
+                                 "prices": all_prices, "flows": all_net_flows,
+                                 "external_flows": all_external_flows}
         self._t8_status.config(
             text=f"⚠ {error}" if error else "", foreground=C_RED if error else C_MUTED)
 
         if self._t8_fetch_mode == "play":
-            self._t8_start_playback(date_str)
+            self._t8_start_playback()
             return
 
         # single-shot
         self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         self._t8_play_btn.config(state=tk.NORMAL)
-        mtu_label = self._t8_fetch_target_mtu
-        prices = all_prices.get(mtu_label, {})
-        flows  = all_net_flows.get(mtu_label, {})
-        self._draw_tab8_map(prices, flows, date_str, mtu_label)
+        self._t8_show_slot(self._t8_fetch_target_slot)
         self._add_toolbar(self.canvas8, self.toolbar_f8)
 
-    def _draw_tab8_map(self, prices, net_flows, date_str, mtu_label):
-        """Render one frame (one MTU's prices + net flows) onto fig8. Called
-        both for a single "Fetch & Plot" snapshot and once per frame during
-        "Play" animation."""
+    def _draw_tab8_map(self, prices, net_flows, slot_label):
+        """Render one frame (one slot's prices + Nordic-internal net flows)
+        onto fig8. Called both for a single "Fetch & Plot" snapshot and once
+        per frame during "Play" animation. `slot_label` is the full
+        "YYYY-MM-DD HH:MM" CET slot -- external (Core/Baltic/other) flows
+        are shown in the separate table below the map, not here, since this
+        background image only depicts the 12 Nordic zones (see
+        _update_t8_external_tree)."""
         self.fig8.clear()
         ax = self.fig8.add_subplot(111)
 
@@ -2766,7 +2945,7 @@ class App:
 
         ax.axis('off')
         ax.set_title(
-            f"Nordic Map  —  {date_str}  {mtu_label} CET  |  "
+            f"Nordic Map  —  {slot_label} CET  |  "
             f"Price (DayAhead, EUR/MWh) + Flow (MW)",
             fontsize=9.5, fontweight='bold', color=C_ACCENT, pad=8)
         self.fig8.tight_layout(pad=1.5)
