@@ -21,6 +21,7 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Circle
     MATPLOTLIB_OK = True
     MATPLOTLIB_IMPORT_ERROR = None
 except ImportError as _mpl_exc:
@@ -2800,11 +2801,12 @@ class App:
         """Render one frame (one slot's prices + flows) onto fig8. Called
         both for a single "Fetch & Plot" snapshot and once per frame during
         "Play" animation. `slot_label` is the full "YYYY-MM-DD HH:MM" CET
-        slot. `ext_flows` ({(nordic_zone, other_zone): mw}) are drawn as
-        short outward arrows from their Nordic anchor zone -- see
-        "External flow arrows" below -- since the background image only
-        depicts the 12 Nordic zones, there's no real position to point TO
-        and no price there to color by, just the zone name and MW."""
+        slot. `ext_flows` ({(nordic_zone, other_zone): mw}) are drawn as a
+        volume-sized circle per external link, planted out from its Nordic
+        anchor zone -- see "External flow arrows" below for the direction/
+        fill/size encoding -- since the background image only depicts the
+        12 Nordic zones, there's no real position to point TO and no price
+        there to color by, just the zone name and MW."""
         self.fig8.clear()
         ax = self.fig8.add_subplot(111)
 
@@ -2887,14 +2889,29 @@ class App:
 
         # ── External flow arrows (Nordic → Core/Baltic/other) ───────────
         # No position on this map to point TO (it only depicts the 12
-        # Nordic zones) and no price there to color by -- each arrow just
-        # points OUTWARD from its Nordic anchor zone (away from the
-        # Nordic-zone centroid, a direction-agnostic "leaving the Nordic
-        # area" heuristic that needs no per-zone geography), tagged with
-        # the external zone's own code and the MW. Grouped by anchor zone
-        # and fanned out by angle so a zone with several external links
-        # (e.g. NO2: NordLink→DE, NorNed→NL, North Sea Link→GB) doesn't
-        # draw them stacked on top of each other.
+        # Nordic zones) and no price there to color by -- each link is a
+        # small circle tagged with the external zone's code + MW, planted
+        # OUTWARD from its Nordic anchor zone (away from the Nordic-zone
+        # centroid, a direction-agnostic "leaving the Nordic area"
+        # heuristic that needs no per-zone geography). Grouped by anchor
+        # zone and fanned out by angle so a zone with several external
+        # links (e.g. NO2: NordLink→DE, NorNed→NL, North Sea Link→GB)
+        # doesn't draw them stacked on top of each other.
+        #
+        # Direction and volume are both encoded, not just labelled:
+        #   - the ARROW points the way the energy actually flows -- outward
+        #     (zone -> circle) when the Nordic zone is EXPORTING (mw >= 0,
+        #     the sign convention _fetch_tab8_period_thread's own
+        #     `bucket[(area, other)] = ... exp` already uses), inward
+        #     (circle -> zone) when it's IMPORTING (mw < 0);
+        #   - the CIRCLE is left unfilled (outline only) when exporting,
+        #     and filled solid when importing -- "energy is arriving" reads
+        #     as a filled/solid marker, "energy is leaving" as an open one
+        #     -- with the label switching to white so it stays readable on
+        #     the solid fill;
+        #   - the CIRCLE'S RADIUS scales with |mw| relative to the largest
+        #     external flow in this slot, same "line width scales with
+        #     volume" idea the Nordic-internal arrows above already use.
         has_external = False
         if ext_flows:
             has_external = True
@@ -2903,8 +2920,10 @@ class App:
             by_anchor = {}
             for (nordic, other), mw in ext_flows.items():
                 by_anchor.setdefault(nordic, []).append((other, mw))
-            ext_len_px = 0.115 * img_w
-            fan_spread = math.radians(30)
+            max_ext = max((abs(mw) for mw in ext_flows.values()), default=1) or 1
+            ext_len_px  = 0.125 * img_w
+            r_min, r_max = 0.020 * img_w, 0.052 * img_w
+            fan_spread = math.radians(32)
             for nordic, links in sorted(by_anchor.items()):
                 if nordic not in ZONE_POS_NORM:
                     continue
@@ -2916,20 +2935,30 @@ class App:
                 for i, (other, mw) in enumerate(links):
                     angle = base_angle if n == 1 else (
                         base_angle - fan_spread / 2 + fan_spread * i / (n - 1))
-                    xs = x0 + pad_px * math.cos(angle)
-                    ys = y0 + pad_px * math.sin(angle)
-                    xe = x0 + ext_len_px * math.cos(angle)
-                    ye = y0 + ext_len_px * math.sin(angle)
-                    ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
+                    ca, sa = math.cos(angle), math.sin(angle)
+                    r = r_min + (r_max - r_min) * (abs(mw) / max_ext)
+                    cxp, cyp = x0 + ext_len_px * ca, y0 + ext_len_px * sa   # circle center
+                    near_x, near_y = x0 + pad_px * ca, y0 + pad_px * sa     # just off the zone box
+                    edge_x, edge_y = cxp - r * ca, cyp - r * sa             # circle edge nearest the zone
+                    exporting = mw >= 0
+                    if exporting:
+                        arrow_from, arrow_to = (near_x, near_y), (edge_x, edge_y)
+                    else:
+                        arrow_from, arrow_to = (edge_x, edge_y), (near_x, near_y)
+                    lw = 0.8 + 2.2 * (abs(mw) / max_ext)
+                    ax.annotate("", xy=arrow_to, xytext=arrow_from, zorder=4,
                                 arrowprops=dict(arrowstyle='->', color=C_PURPLE,
-                                                lw=1.5, mutation_scale=9,
+                                                lw=lw, mutation_scale=9,
                                                 linestyle=(0, (4, 2))))
-                    arrow = "→" if mw >= 0 else "←"
-                    ax.text(xe, ye, f"{arrow} {other}\n{abs(mw):.0f} MW",
-                            fontsize=5.5, ha='center', va='center', zorder=6,
-                            color=C_PURPLE, fontweight='bold',
-                            bbox=dict(facecolor='white', edgecolor=C_PURPLE,
-                                      linewidth=0.7, alpha=0.88, pad=1.4))
+                    circle = Circle((cxp, cyp), r, zorder=5,
+                                     facecolor=(C_PURPLE if not exporting else 'white'),
+                                     edgecolor=C_PURPLE, linewidth=1.3,
+                                     alpha=1.0 if not exporting else 0.95)
+                    ax.add_patch(circle)
+                    text_color = 'white' if not exporting else C_PURPLE
+                    ax.text(cxp, cyp, f"{other}\n{abs(mw):.0f}",
+                            fontsize=5.8, ha='center', va='center', zorder=6,
+                            color=text_color, fontweight='bold')
 
         # Flow legend
         legend_handles = [
@@ -2942,8 +2971,15 @@ class App:
                        label="Counter-intuitive (expensive → cheap)"))
         if has_external:
             legend_handles.append(
-                Line2D([0], [0], color=C_PURPLE, lw=2, linestyle=(0, (4, 2)),
-                       label="External flow (→ Core / Baltic / other)"))
+                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
+                       markerfacecolor='white', markeredgecolor=C_PURPLE,
+                       linestyle=(0, (4, 2)), lw=1.5,
+                       label="External, exporting (Nordic → Core/Baltic/other)"))
+            legend_handles.append(
+                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
+                       markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
+                       linestyle=(0, (4, 2)), lw=1.5,
+                       label="External, importing (Core/Baltic/other → Nordic)"))
         ax.legend(handles=legend_handles, loc='lower right', fontsize=7,
                   framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL,
                   labelcolor=C_TEXT)
