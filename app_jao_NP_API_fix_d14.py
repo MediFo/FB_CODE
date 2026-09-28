@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -275,10 +276,16 @@ _PS_PROCESS_TIMEOUT_S = _PS_HTTP_TIMEOUT_S + 30  # margin over the PS script's o
 # version -- the connection can hang well past it, which is exactly what the
 # _PS_PROCESS_TIMEOUT_S kill above exists to bound. That means a single "did
 # not exit within Ns" is often a one-off transient stall (a flaky VPN/proxy
-# hiccup), not a permanent failure, so retrying once before giving up on the
-# page recovers most of these automatically instead of failing the whole day
-# for a hiccup that would have succeeded on the next attempt.
-_PS_MAX_RETRIES = 1
+# hiccup), not a permanent failure. The goal of a multi-day fetch is to come
+# back with every requested day, not to fail fast, so this retries several
+# times with a growing backoff (giving a VPN reconnect / proxy hiccup real
+# time to clear, instead of immediately re-hitting whatever just failed)
+# before giving up on the page. Deliberately bounded, not infinite --
+# there's no cancel button on this fetch (see Tab 8's Stop button for
+# contrast), so an unbounded retry loop against a genuinely unreachable API
+# would hang the fetch forever with no way for the user to get out of it.
+_PS_MAX_RETRIES = 3
+_PS_RETRY_BACKOFF_S = [5, 15, 30]  # delay before retry 1, 2, 3 respectively
 
 
 def _fetch_one_page(api_url, log_func):
@@ -398,9 +405,13 @@ def fetch_day_via_powershell(date_str, log_func, source_tz="UTC"):
             page_rows, err = _fetch_one_page(api_url, log_func)
             retries_left = _PS_MAX_RETRIES
             while page_rows is None and retries_left > 0:
+                attempt_num = _PS_MAX_RETRIES - retries_left
+                backoff_s = _PS_RETRY_BACKOFF_S[min(attempt_num, len(_PS_RETRY_BACKOFF_S) - 1)]
                 retries_left -= 1
                 log_func(f"  {date_str}: page {page + 1} failed ({err}) -- "
-                         f"retrying ({_PS_MAX_RETRIES - retries_left}/{_PS_MAX_RETRIES})...")
+                         f"retrying in {backoff_s}s "
+                         f"({_PS_MAX_RETRIES - retries_left}/{_PS_MAX_RETRIES})...")
+                time.sleep(backoff_s)
                 page_rows, err = _fetch_one_page(api_url, log_func)
             if page_rows is None:
                 if all_rows:
@@ -465,6 +476,7 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
     all_data = []
     total_days = len(date_list)
     failed_dates = []
+    hard_failed_dates = []  # batch is None -- zero records for that day, eligible for the resweep below
 
     for idx, d_str in enumerate(date_list):
         day_num = idx + 1
@@ -481,6 +493,7 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
         batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
         if batch is None:
             failed_dates.append(d_str)
+            hard_failed_dates.append(d_str)
             if status_cb:
                 status_cb(f"  Failed: {d_str} ({err})")
         else:
@@ -494,6 +507,34 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
                     status_cb(f"  ⚠ PARTIAL: {d_str} ({len(batch)} records, {err})")
             elif status_cb:
                 status_cb(f"  OK: {d_str} ({len(batch)} records)")
+
+    # Second-chance sweep: a day that came back with zero records after
+    # exhausting fetch_day_via_powershell's own per-page retries gets one
+    # more full attempt now, after the rest of the range has already been
+    # fetched. The goal here is to come back with every requested day, not
+    # to fail fast -- a stall that outlasted even those retries (a longer
+    # VPN reconnect, a proxy hiccup) has had the time the rest of the range
+    # took to fetch to clear, so retrying now has a materially better shot
+    # than another attempt immediately back-to-back with the ones that just
+    # failed. Only covers hard failures (0 records) -- a "partial" day
+    # already holds most of its data in all_data, and re-running it here
+    # would double-count those rows rather than replace them.
+    if hard_failed_dates:
+        _log(f"Retry sweep: re-attempting {len(hard_failed_dates)} day(s) that "
+             f"returned 0 records ({', '.join(hard_failed_dates)})...")
+        for d_str in hard_failed_dates:
+            _log(f"  Retry sweep: {d_str}...")
+            batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
+            if batch is not None:
+                all_data.extend(batch)
+                failed_dates.remove(d_str)
+                if err:
+                    failed_dates.append(f"{d_str} (partial: {err})")
+                    _log(f"  ⚠ Retry sweep PARTIAL: {d_str} ({len(batch)} records, {err})")
+                else:
+                    _log(f"  Retry sweep OK: {d_str} ({len(batch)} records)")
+            else:
+                _log(f"  Retry sweep still failed: {d_str} ({err})")
 
     if params.get('shadow_price_filter') == 'positive':
         def _sp_positive(d):
