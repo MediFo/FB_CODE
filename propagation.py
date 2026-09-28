@@ -1419,10 +1419,29 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     # produces "no lagged value available" (falls back to 0.0, same as
     # before) rather than silently pulling in the wrong point in time.
     jao = jao.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
+    _lag_key_idx = pd.MultiIndex.from_arrays(
+        [jao["cneName"].to_numpy(), jao["dateTimeUtc"].to_numpy()])
+    # A real JAO export can carry more than one row for the same
+    # (cneName, dateTimeUtc) pair (e.g. distinct contingency-scenario rows
+    # sharing the same CNEC label and MTU timestamp). Series.reindex()
+    # requires a unique index and raises "cannot handle a non-unique
+    # multi-index!" otherwise -- keep the first occurrence of each pair for
+    # this lookup rather than crashing. Safe to do: every column here is an
+    # outage-active/dose covariate keyed off source-country-level outage
+    # overlap, not anything row-specific, so duplicate (CNEC, timestamp)
+    # rows already share the same value.
+    _lag_dedup_mask = None
+    if _lag_key_idx.has_duplicates:
+        n_dupe = int(_lag_key_idx.duplicated().sum())
+        log_cb(f"  ⚠ {n_dupe} duplicate (CNEC, timestamp) row(s) in JAO data — "
+               f"keeping the first occurrence of each for lag-feature lookups")
+        _lag_dedup_mask = ~_lag_key_idx.duplicated(keep="first")
     for col in bin_cols + (f"{p}_gen_outage_mw_lost",):
-        _series = pd.Series(jao[col].to_numpy(),
-                            index=pd.MultiIndex.from_arrays(
-                                [jao["cneName"].to_numpy(), jao["dateTimeUtc"].to_numpy()]))
+        if _lag_dedup_mask is not None:
+            _series = pd.Series(jao[col].to_numpy()[_lag_dedup_mask],
+                                index=_lag_key_idx[_lag_dedup_mask])
+        else:
+            _series = pd.Series(jao[col].to_numpy(), index=_lag_key_idx)
         for _label, _delta in (("lag1h", pd.Timedelta(hours=1)),
                                ("lag24h", pd.Timedelta(hours=24))):
             _target_idx = pd.MultiIndex.from_arrays(

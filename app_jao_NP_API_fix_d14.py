@@ -3843,8 +3843,16 @@ class App:
                 return
 
             log("Building covariates…")
+            # build_covariates() defaults src="fi" -- without passing the
+            # user's actual "Outage source country" selection through here,
+            # covariates (outage filtering, dose variables) were always
+            # built for FI regardless of what was picked in Setup, even
+            # though every _reg(...) call below already correctly used
+            # src.lower() for the regression spec/column selection. That
+            # mismatch is exactly why selecting SE still logged "Filtered
+            # outages to FI source" and "Building covariates ... (src=FI)".
             cov_df = self._prop.build_covariates(no3_df, self._ma_outages_df,
-                                                  log_cb=log)
+                                                  log_cb=log, src=src.lower())
             self._ma_covariates = cov_df
             log(f"  Covariates built: {len(cov_df):,} rows")
 
