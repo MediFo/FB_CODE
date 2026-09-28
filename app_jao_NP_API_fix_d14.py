@@ -270,6 +270,15 @@ _JAO_PAGE_SIZE = 15000
 _JAO_MAX_PAGES = 20  # 20 x 15000 = 300k rows/day -- far beyond any plausible day
 _PS_HTTP_TIMEOUT_S = 60
 _PS_PROCESS_TIMEOUT_S = _PS_HTTP_TIMEOUT_S + 30  # margin over the PS script's own HTTP timeout
+# Invoke-WebRequest's own -TimeoutSec is documented to not reliably cover a
+# stalled DNS lookup / TLS handshake / proxy negotiation on every PowerShell
+# version -- the connection can hang well past it, which is exactly what the
+# _PS_PROCESS_TIMEOUT_S kill above exists to bound. That means a single "did
+# not exit within Ns" is often a one-off transient stall (a flaky VPN/proxy
+# hiccup), not a permanent failure, so retrying once before giving up on the
+# page recovers most of these automatically instead of failing the whole day
+# for a hiccup that would have succeeded on the next attempt.
+_PS_MAX_RETRIES = 1
 
 
 def _fetch_one_page(api_url, log_func):
@@ -387,6 +396,12 @@ def fetch_day_via_powershell(date_str, log_func, source_tz="UTC"):
                      (f" (page {page + 1}, skip={skip})" if page else ""))
 
             page_rows, err = _fetch_one_page(api_url, log_func)
+            retries_left = _PS_MAX_RETRIES
+            while page_rows is None and retries_left > 0:
+                retries_left -= 1
+                log_func(f"  {date_str}: page {page + 1} failed ({err}) -- "
+                         f"retrying ({_PS_MAX_RETRIES - retries_left}/{_PS_MAX_RETRIES})...")
+                page_rows, err = _fetch_one_page(api_url, log_func)
             if page_rows is None:
                 if all_rows:
                     # Earlier pages already succeeded -- surface the error
