@@ -562,7 +562,16 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
                 return float(v) > 0
             except (TypeError, ValueError):
                 return False
+        _n_before_sp_filter = len(all_data)
         all_data = [d for d in all_data if _sp_positive(d)]
+        # "Shadow Price > 0 only" discards every non-binding row -- most
+        # Nordic CNECs are non-binding most of the time, so this can (and
+        # routinely does) cut a fetch down by >99%. Without this line the
+        # final "FETCH COMPLETE. Records: N" summary gave no hint that the
+        # small N was this filter's doing rather than a fetch problem.
+        _log(f"Shadow-price filter: kept {len(all_data):,}/{_n_before_sp_filter:,} "
+             f"row(s) with shadow price > 0 "
+             f"({_n_before_sp_filter - len(all_data):,} excluded)")
 
     for entry in all_data:
         if entry.get('dateTimeUtc'):
@@ -1198,9 +1207,22 @@ class App:
         settings_row.pack(fill=tk.X)
         settings_row.columnconfigure(1, weight=1)
 
-        self.shadow_price_filter_var = tk.StringVar(value="positive")
-        ttk.Radiobutton(settings_row, text="Shadow Price > 0",
-                        variable=self.shadow_price_filter_var, value="positive"
+        # Was a ttk.Radiobutton bound to a StringVar defaulting to
+        # "positive" -- with no sibling Radiobutton in the group, it had
+        # no "off" state to switch to: every live/CSV fetch silently
+        # discarded every non-binding row (shadow price <= 0) with no way
+        # to turn that off from the UI, and no log line even said it had
+        # happened -- "FETCH COMPLETE. Records: 834" after a genuinely
+        # successful 128,656-row day fetch, with nothing connecting the
+        # two numbers. Most of this pipeline's covariates (fall, PTDF,
+        # RAM) don't depend on shadow price at all, so defaulting to
+        # fetching only binding rows silently starved every other
+        # analysis of >99% of its real data. Now a real Checkbutton,
+        # off by default (fetch everything), with the filter itself
+        # logging what it actually removed when turned on.
+        self.shadow_price_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_row, text="Shadow Price > 0 only",
+                        variable=self.shadow_price_filter_var
                         ).grid(row=0, column=0, sticky='w')
 
         tz_f = ttk.Frame(settings_row, style='Card.TFrame')
@@ -2290,7 +2312,7 @@ class App:
             'start_cet':           f"{self.start_date_entry.get()}T00:00:00",
             'end_cet':             f"{self.end_date_entry.get()}T00:00:00",
             'output_file':         os.path.join(self.save_folder, self.filename_entry.get()),
-            'shadow_price_filter': self.shadow_price_filter_var.get(),
+            'shadow_price_filter': 'positive' if self.shadow_price_filter_var.get() else None,
             'jao_timestamp_zone':  self.jao_timestamp_zone_var.get(),
         }
         self.run_button.config(state=tk.DISABLED, text="⏳  Fetching…")
