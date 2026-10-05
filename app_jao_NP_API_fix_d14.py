@@ -473,10 +473,16 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
     jao_timestamp_zone = params.get('jao_timestamp_zone', 'UTC')
     _log = status_cb if status_cb else (lambda m: None)
 
-    all_data = []
+    # Keyed by date rather than a flat list so the resweep below can
+    # REPLACE a day's rows outright (a day that failed partway through
+    # pagination -- e.g. a page-7-of-N HTTP 500 after 90,000 rows already
+    # came back -- already holds real rows in all_data; re-fetching it
+    # without a way to discard the old partial rows first would double
+    # them up in the final dataset instead of completing it).
+    all_data_by_date = {}
     total_days = len(date_list)
     failed_dates = []
-    hard_failed_dates = []  # batch is None -- zero records for that day, eligible for the resweep below
+    retry_eligible_dates = []  # 0-record OR partial days -- eligible for the resweep below
 
     for idx, d_str in enumerate(date_list):
         day_num = idx + 1
@@ -492,49 +498,60 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
         # actually reach the user to be of any use.
         batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
         if batch is None:
+            all_data_by_date[d_str] = []
             failed_dates.append(d_str)
-            hard_failed_dates.append(d_str)
+            retry_eligible_dates.append(d_str)
             if status_cb:
                 status_cb(f"  Failed: {d_str} ({err})")
         else:
-            all_data.extend(batch)
+            all_data_by_date[d_str] = batch
             if err:
                 # Partial success: some pages came back before a failure or
                 # the page-count cap was hit. Don't report this the same as
                 # a clean "OK" -- the day's data may be incomplete.
                 failed_dates.append(f"{d_str} (partial: {err})")
+                retry_eligible_dates.append(d_str)
                 if status_cb:
                     status_cb(f"  ⚠ PARTIAL: {d_str} ({len(batch)} records, {err})")
             elif status_cb:
                 status_cb(f"  OK: {d_str} ({len(batch)} records)")
 
-    # Second-chance sweep: a day that came back with zero records after
-    # exhausting fetch_day_via_powershell's own per-page retries gets one
-    # more full attempt now, after the rest of the range has already been
-    # fetched. The goal here is to come back with every requested day, not
-    # to fail fast -- a stall that outlasted even those retries (a longer
-    # VPN reconnect, a proxy hiccup) has had the time the rest of the range
-    # took to fetch to clear, so retrying now has a materially better shot
-    # than another attempt immediately back-to-back with the ones that just
-    # failed. Only covers hard failures (0 records) -- a "partial" day
-    # already holds most of its data in all_data, and re-running it here
-    # would double-count those rows rather than replace them.
-    if hard_failed_dates:
-        _log(f"Retry sweep: re-attempting {len(hard_failed_dates)} day(s) that "
-             f"returned 0 records ({', '.join(hard_failed_dates)})...")
-        for d_str in hard_failed_dates:
+    # Second-chance sweep: any day that didn't come back clean -- zero
+    # records, OR a partial page-pagination failure like an HTTP 500 mid-
+    # day -- gets one more full attempt now, after the rest of the range
+    # has already been fetched. The goal here is to come back with every
+    # requested day complete, not to fail fast -- a stall/error that
+    # outlasted fetch_day_via_powershell's own per-page retries (a longer
+    # VPN reconnect, a proxy hiccup, a transient server-side 500) has had
+    # the time the rest of the range took to fetch to clear, so retrying
+    # now has a materially better shot than another attempt immediately
+    # back-to-back with the one that just failed. A resweep result only
+    # REPLACES what's already held for that day when it's at least as
+    # good (a clean success, or a partial with at least as many rows) --
+    # never regresses a day to fewer rows than it already had.
+    if retry_eligible_dates:
+        _log(f"Retry sweep: re-attempting {len(retry_eligible_dates)} day(s) with "
+             f"incomplete data ({', '.join(retry_eligible_dates)})...")
+        for d_str in retry_eligible_dates:
             _log(f"  Retry sweep: {d_str}...")
             batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
-            if batch is not None:
-                all_data.extend(batch)
-                failed_dates.remove(d_str)
+            held_n = len(all_data_by_date.get(d_str, []))
+            if batch is not None and (err is None or len(batch) >= held_n):
+                all_data_by_date[d_str] = batch
+                failed_dates = [fd for fd in failed_dates
+                               if fd != d_str and not fd.startswith(f"{d_str} (partial:")]
                 if err:
                     failed_dates.append(f"{d_str} (partial: {err})")
                     _log(f"  ⚠ Retry sweep PARTIAL: {d_str} ({len(batch)} records, {err})")
                 else:
                     _log(f"  Retry sweep OK: {d_str} ({len(batch)} records)")
+            elif batch is not None:
+                _log(f"  Retry sweep for {d_str} returned fewer rows ({len(batch)}) than "
+                     f"already held ({held_n}) -- keeping the original data")
             else:
                 _log(f"  Retry sweep still failed: {d_str} ({err})")
+
+    all_data = [row for d in date_list for row in all_data_by_date.get(d, [])]
 
     if params.get('shadow_price_filter') == 'positive':
         def _sp_positive(d):
