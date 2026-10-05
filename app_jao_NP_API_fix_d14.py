@@ -267,9 +267,27 @@ def get_np_access_token():
 
 API_URL = "https://publicationtool.jao.eu/nordic/api/data/fbDomainShadowPrice"
 
-_JAO_PAGE_SIZE = 15000
-_JAO_MAX_PAGES = 20  # 20 x 15000 = 300k rows/day -- far beyond any plausible day
-_PS_HTTP_TIMEOUT_S = 60
+_JAO_PAGE_SIZE = 30000
+_JAO_MAX_PAGES = 20  # 20 x 30000 = 600k rows/day -- far beyond any plausible day
+# A real high-volume day (the full unfiltered Nordic+neighboring FB domain's
+# CNEC x MTU grid for the day, not just one zone -- the API's own `filter`
+# param is sent as "{}", so filtering down to specific CNECs only happens
+# client-side afterward) can need 100k+ rows, i.e. several pages at the
+# original 15000. A live run's own log showed per-page latency climbing
+# with page depth even on SUCCESSFUL pages (page 1 ~14s, pages 2-8 each
+# ~29-39s, not flat) -- consistent with the JAO server's own pagination
+# being OFFSET-based (it has to scan-and-discard everything before `skip`
+# on every request, so cost grows with depth), which a bigger page can't
+# fix outright but DOES reduce: fewer, larger jumps mean fewer total
+# "scan up to here" operations server-side for the same total row count,
+# and fewer PowerShell-process-launch/TLS-handshake round trips client-
+# side. _PS_HTTP_TIMEOUT_S is raised to match -- a single request now
+# transfers/parses roughly 2x the rows AND can land at a deeper offset.
+# This is a best-effort tuning based on that one log's evidence, not
+# verified against the live API from this sandbox (no JAO/Windows access
+# here) -- if 30000 turns out to exceed some undocumented server-side
+# `take` cap, lower this back toward 15000 rather than raising it further.
+_PS_HTTP_TIMEOUT_S = 100
 _PS_PROCESS_TIMEOUT_S = _PS_HTTP_TIMEOUT_S + 30  # margin over the PS script's own HTTP timeout
 # Invoke-WebRequest's own -TimeoutSec is documented to not reliably cover a
 # stalled DNS lookup / TLS handshake / proxy negotiation on every PowerShell
