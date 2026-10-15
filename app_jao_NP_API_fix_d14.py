@@ -22,7 +22,7 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Circle
+    from matplotlib.patches import Circle, FancyBboxPatch
     MATPLOTLIB_OK = True
     MATPLOTLIB_IMPORT_ERROR = None
 except ImportError as _mpl_exc:
@@ -97,21 +97,28 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # time (see _schematic_circle_positions) rather than pixel-measured
 # against an image, since no such image exists in this repo (see
 # CLAUDE.md on ZONE_POS_NORM only ever covering the 12 Nordic zones).
-CORE_ZONES = ["AT", "BE", "CZ", "DE_LU", "FR", "HR", "HU", "NL", "PL", "RO", "SI", "SK"]
+#
+# Germany/Luxembourg is "GER" here, NOT the ISO-style "DE_LU" -- verified
+# LIVE: "DE_LU" is a real, different, genuinely inaccessible code on this
+# account (403), while "GER" returns real price data (and matches Nord
+# Pool's own web UI, which groups AT/BE/FR/GER/NL/PL together as "CWE" --
+# exactly the set of Core zones this account can actually reach, which is
+# presumably why: CWE access, not full Core CCR access).
+CORE_ZONES = ["AT", "BE", "CZ", "GER", "FR", "HR", "HU", "NL", "PL", "RO", "SI", "SK"]
 BALTIC_ZONES = ["EE", "LV", "LT"]
 
 # Verified LIVE against this account's actual Nord Pool subscription
-# (2026-10-15): price data is available for all of BALTIC_ZONES, but only
-# AT/BE/FR/NL/PL of CORE_ZONES -- DE_LU/CZ/HU/RO/SI/SK/HR come back
-# "Missing access for area(s) ..." (403) on the SAME combined request,
-# which Nord Pool's API rejects in full the moment ANY requested area is
-# inaccessible (not just omitting that area from the response). This list
-# is NOT hardcoded into the fetch path -- _np_request_with_access_fallback
-# parses the 403 body itself and retries with whatever subset IS
-# accessible, so a future change to this account's subscription is picked
-# up automatically without a code change; it's recorded here only as the
-# known state at the time this was built.
-_KNOWN_INACCESSIBLE_CORE_ZONES = ["DE_LU", "CZ", "HU", "RO", "SI", "SK", "HR"]
+# (2026-10-15): price data is available for all of BALTIC_ZONES, and for
+# AT/BE/FR/GER/NL/PL of CORE_ZONES (Nord Pool's own "CWE" grouping) --
+# CZ/HU/RO/SI/SK/HR come back "Missing access for area(s) ..." (403) on
+# the SAME combined request, which Nord Pool's API rejects in full the
+# moment ANY requested area is inaccessible (not just omitting that area
+# from the response). This list is NOT hardcoded into the fetch path --
+# _np_request_with_access_fallback parses the 403 body itself and retries
+# with whatever subset IS accessible, so a future subscription change
+# (e.g. gaining full Core CCR access) is picked up automatically without
+# a code change; it's recorded here only as the known state at build time.
+_KNOWN_INACCESSIBLE_CORE_ZONES = ["CZ", "HU", "RO", "SI", "SK", "HR"]
 
 # Real bidding-zone borders within Core CCR, for drawing static reference
 # topology only -- NOT flow arrows. Verified LIVE (2026-10-15): Nord
@@ -124,8 +131,8 @@ _KNOWN_INACCESSIBLE_CORE_ZONES = ["DE_LU", "CZ", "HU", "RO", "SI", "SK", "HR"]
 # when the truth is "no data source" -- so Core/Baltic-internal borders
 # are drawn as plain unlabeled reference lines, never arrows.
 CORE_CONNECTIONS = [
-    ("DE_LU", "FR"), ("DE_LU", "BE"), ("DE_LU", "NL"), ("DE_LU", "AT"),
-    ("DE_LU", "CZ"), ("DE_LU", "PL"),
+    ("GER", "FR"), ("GER", "BE"), ("GER", "NL"), ("GER", "AT"),
+    ("GER", "CZ"), ("GER", "PL"),
     ("FR", "BE"), ("BE", "NL"),
     ("AT", "CZ"), ("AT", "SI"), ("AT", "HU"),
     ("CZ", "SK"), ("CZ", "PL"),
@@ -135,16 +142,14 @@ CORE_CONNECTIONS = [
 ]
 BALTIC_CONNECTIONS = [("EE", "LV"), ("LV", "LT")]
 
-# Nord Pool's flow endpoint sometimes uses a different code for the same
-# zone than its price endpoint -- verified LIVE: a Nordic zone's own flow
-# report lists a Germany/Luxembourg counterpart as "GER", never "DE_LU"
-# (the code the price endpoint actually accepts). Every OTHER non-Nordic
-# counterpart code observed across all 12 Nordic zones' live flow reports
-# that date (EE, LT, NL, PL) already matched CORE_ZONES/BALTIC_ZONES
-# as-is. Anything seen that maps to neither a known zone nor this table
-# (e.g. "DK1_VL", an internal/metering counterpart, also observed live)
-# is simply not a real external zone and is dropped, not guessed at.
-_FLOW_COUNTERPART_TO_ZONE = {"GER": "DE_LU"}
+# Every non-Nordic counterpart code observed live across all 12 Nordic
+# zones' own flow reports (EE, GER, LT, NL, PL) already matches
+# CORE_ZONES/BALTIC_ZONES as-is now that CORE_ZONES itself uses "GER" --
+# no code-mapping table needed between the two endpoints. Anything seen
+# that matches neither (e.g. "DK1_VL", an internal/metering counterpart,
+# also observed live) is simply not a real external zone and is dropped
+# by the "mapped not in known_cb" check at the cross-flow call site, not
+# guessed at.
 
 # ----------------------------------------------------------------------
 #  DESIGN TOKENS
@@ -359,6 +364,45 @@ def _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle=-90):
         angle = math.radians(start_angle + 360 * i / n)
         pos[z] = (cx + rx * math.cos(angle), cy + ry * math.sin(angle))
     return pos
+
+
+def _schematic_hub_positions(zones, connections, cx, cy, rx, ry, start_angle=-90):
+    """Like _schematic_circle_positions, but when one zone in `zones` is
+    connected (per `connections`) to at least half of the others, that
+    zone is placed at the CENTER and the rest around it, instead of
+    everyone on the circle. A plain circle puts every edge on a chord, so
+    a hub zone with many neighbours (e.g. GER within Core CCR, bordering
+    nearly every other visible Core zone most days) produces a dense
+    crossing star purely from the layout, not from the underlying
+    topology -- hub-and-spoke uses short, largely non-crossing spokes
+    instead for exactly that case, and falls back to a plain circle
+    (below 4 zones, or when no single zone dominates) rather than risk a
+    worse layout on a more balanced subgraph."""
+    n = len(zones)
+    if n < 4:
+        return _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle)
+    zone_set = set(zones)
+    degree = {z: 0 for z in zones}
+    for A, B in connections:
+        if A in zone_set and B in zone_set:
+            degree[A] += 1
+            degree[B] += 1
+    hub = max(zones, key=lambda z: degree[z])
+    if degree[hub] < (n - 1) / 2:
+        return _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle)
+    rest = [z for z in zones if z != hub]
+    pos = {hub: (cx, cy)}
+    pos.update(_schematic_circle_positions(rest, cx, cy, rx, ry, start_angle))
+    return pos
+
+
+def _draw_group_label(ax, text, x, y):
+    """Small, faint caption (e.g. "NORDIC") marking a zone cluster on the
+    Whole tab's shared canvas -- purely a readability aid, same visual
+    weight on every group so none reads as more "primary" than another."""
+    ax.text(x, y, text, fontsize=7, fontweight='bold', color=C_MUTED,
+            alpha=0.55, ha='left', va='top', zorder=1,
+            family='sans-serif')
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -3309,13 +3353,16 @@ class App:
         self._t8c_status.pack(side=tk.LEFT, padx=(10, 0))
 
         ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
-                  text=("Prices only -- Nord Pool's flow endpoint reports no scheduled "
-                        "physical flow data for Core zones (status=\"Missing\" on every "
+                  text=("Nord Pool's flow endpoint reports no scheduled physical flow "
+                        "data for Core zones themselves (status=\"Missing\" on every "
                         "date tried), so CCR-internal borders are shown as plain "
-                        "reference lines, not flow arrows. Not every Core CCR zone may "
-                        "be on this account's Nord Pool subscription -- a zone shown "
-                        "\"N/A (no access)\" means the API itself refused it, not a "
-                        "fetch failure.")
+                        "reference lines, not flow arrows. Import/export to OUTSIDE "
+                        "Core (Nordic for now) is shown the same way as the Nordic "
+                        "tab's own external arrows -- sourced from the Nordic side's "
+                        "OWN report, the only side that publishes it. Not every Core "
+                        "CCR zone may be on this account's Nord Pool subscription -- a "
+                        "zone with no access or no published price this slot is simply "
+                        "left off the map, not shown as a gray or N/A box.")
                   ).pack(fill=tk.X, pady=(0, 6))
 
         self.toolbar_f8c = ttk.Frame(main, style='Card.TFrame')
@@ -3360,7 +3407,7 @@ class App:
             self.root.after(0, self._t8c_log, msg)
         token = get_np_access_token()
         if not token:
-            self.root.after(0, self._tab8_core_fetch_done, None, None, date_str, mtu_label,
+            self.root.after(0, self._tab8_core_fetch_done, None, None, None, date_str, mtu_label,
                             "AUTH FAILED: could not obtain NordPool access token.")
             return
         hdrs = self._np_headers(token)
@@ -3368,7 +3415,7 @@ class App:
         r, accessible, missing = _np_request_with_access_fallback(
             NP_PRICE_URL, CORE_ZONES, price_params, hdrs, _diag)
         if r is None:
-            self.root.after(0, self._tab8_core_fetch_done, None, missing, date_str, mtu_label,
+            self.root.after(0, self._tab8_core_fetch_done, None, None, missing, date_str, mtu_label,
                             "Price API: no accessible Core zone returned data "
                             f"({', '.join(missing) if missing else 'unknown error'}).")
             return
@@ -3389,15 +3436,46 @@ class App:
                     continue
                 if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
                     prices[zone] = p.get('price')
-        self.root.after(0, self._tab8_core_fetch_done, prices, missing, date_str, mtu_label, None)
 
-    def _tab8_core_fetch_done(self, prices, missing_zones, date_str, mtu_label, error):
+        # Core zones' OWN flow report is always empty (status="Missing" --
+        # see CORE_CONNECTIONS' own comment on why), so the only way to
+        # show a Core zone's import/export to "outside" is the same
+        # workaround _fetch_tab8_whole_thread's cross_flows already uses:
+        # fetch the NORDIC side's own report, which does carry each
+        # Nordic zone's cleared interconnector flow to its Core
+        # counterpart. Mirrors the original Nordic tab's own external-
+        # flow treatment, just anchored on the Core zone instead of the
+        # Nordic one. Core<->Baltic isn't included here -- neither side
+        # publishes that one (Baltic's own report is empty too, the same
+        # as Core's), so there's no source for it at all, not just a
+        # missing one.
+        nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
+        _, nordic_flows_raw, _, flow_err = self._fetch_tab8_one_day(
+            date_str, hdrs, nordic_areas_params, _diag)
+        if flow_err:
+            _diag(f"[CORE] Nordic flow fetch (for external arrows) error: {flow_err}")
+        raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
+        ext_flows = {}
+        for (area, other), mw in raw_at_mtu.items():
+            if area not in NORDIC_ZONES or other not in CORE_ZONES or abs(mw) < 1:
+                continue
+            # Flip sign: the raw value is the NORDIC zone's own reported
+            # export (positive = Nordic exporting TO this Core zone), so
+            # the Core zone's own export on that same link is the
+            # negative of that.
+            ext_flows[(other, area)] = ext_flows.get((other, area), 0.0) - mw
+
+        self.root.after(0, self._tab8_core_fetch_done, prices, ext_flows, missing,
+                        date_str, mtu_label, None)
+
+    def _tab8_core_fetch_done(self, prices, ext_flows, missing_zones, date_str, mtu_label, error):
         self._t8c_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         if error:
             self._t8c_status.config(text=f"⚠ {error}", foreground=C_RED)
             messagebox.showerror("Core Map", error)
             return
-        self._draw_tab8_core_map(prices or {}, missing_zones or [], f"{date_str} {mtu_label}")
+        self._draw_tab8_core_map(prices or {}, missing_zones or [], f"{date_str} {mtu_label}",
+                                 ext_flows or {})
         self.canvas8c.draw()
         self._add_toolbar(self.canvas8c, self.toolbar_f8c)
         n_na = len(missing_zones or [])
@@ -3405,55 +3483,156 @@ class App:
             text=f"Done. {n_na} zone(s) unavailable (no API access)." if n_na else "Done.",
             foreground=C_MUTED)
 
-    def _draw_tab8_core_map(self, prices, missing_zones, slot_label):
+    def _draw_tab8_core_map(self, prices, missing_zones, slot_label, ext_flows=None):
         self.fig8c.clear()
         ax = self.fig8c.add_subplot(111)
-        ax.set_xlim(0, 1); ax.set_ylim(1, 0)
+        # A bit of margin beyond [0,1] -- the external-flow circles below
+        # are planted OUTWARD from their anchor zone, which can push a
+        # zone near the edge of the main circle (e.g. the zone opposite
+        # the hub) past a flush [0,1] limit and get clipped.
+        ax.set_xlim(-0.08, 1.08); ax.set_ylim(1.08, -0.08)
         ax.set_facecolor('#F3F2EE')
 
-        pos = _schematic_circle_positions(CORE_ZONES, cx=0.5, cy=0.5, rx=0.40, ry=0.40)
+        # A zone is drawn only if it has a REAL price this slot -- no API
+        # access and "accessible but no price published yet" both result
+        # in the zone (and any reference line touching it) being left off
+        # the chart entirely, rather than shown as a gray or "NaN" box.
+        visible_zones = [z for z in CORE_ZONES
+                         if z not in missing_zones and prices.get(z) is not None]
+        if not visible_zones:
+            ax.text(0.5, 0.5, "No Core zone has usable price data for this "
+                    "slot (no API access, or not published yet).",
+                    ha='center', va='center', fontsize=10, color=C_MUTED,
+                    transform=ax.transAxes, wrap=True)
+            ax.axis('off')
+            ax.set_title(f"Core CCR  —  {slot_label} CET", fontsize=9,
+                         fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+            self.fig8c.tight_layout(pad=1.5)
+            return
+
+        # Hub-and-spoke rather than a plain circle: Core CCR's real
+        # topology has GER bordering nearly every other zone, which on a
+        # plain circle draws as a dense crossing star for no reason other
+        # than the layout -- see _schematic_hub_positions' own comment.
+        pos = _schematic_hub_positions(visible_zones, CORE_CONNECTIONS,
+                                       cx=0.46, cy=0.48, rx=0.35, ry=0.33)
 
         # Reference topology only -- never a flow arrow, see this tab's
-        # own on-screen note and CORE_CONNECTIONS' comment on why.
+        # own on-screen note and CORE_CONNECTIONS' comment on why. Kept
+        # light and low-zorder so it recedes behind the zone boxes rather
+        # than competing with them.
         for A, B in CORE_CONNECTIONS:
             if A not in pos or B not in pos:
                 continue
             xA, yA = pos[A]; xB, yB = pos[B]
-            ax.plot([xA, xB], [yA, yB], color='#B8B6AE', linewidth=1.0,
-                    linestyle='-', zorder=2, solid_capstyle='round')
+            ax.plot([xA, xB], [yA, yB], color='#D5D3C9', linewidth=0.9,
+                    linestyle='-', zorder=1, alpha=0.8, solid_capstyle='round')
 
-        valid_prices = [v for v in prices.values() if v is not None]
-        p_min = min(valid_prices) if valid_prices else 0
-        p_max = max(valid_prices) if valid_prices else 100
+        valid_prices = [prices[z] for z in visible_zones]
+        p_min = min(valid_prices)
+        p_max = max(valid_prices)
         p_span = max(p_max - p_min, 1.0)
         cmap = mpl.colormaps['RdYlGn_r']
 
-        for zone in CORE_ZONES:
+        for zone in visible_zones:
             x, y = pos[zone]
-            if zone in missing_zones:
-                fc = (0.6, 0.6, 0.6, 0.5)
-                price_str = "N/A (no access)"
-            else:
-                price = prices.get(zone)
-                if price is not None:
-                    fc = cmap((price - p_min) / p_span)
-                    price_str = f"{price:.1f} EUR"
-                else:
-                    fc = (0.45, 0.45, 0.45, 0.88)
-                    price_str = "N/A"
-            ax.text(x, y, f"{zone}\n{price_str}", ha='center', va='center',
+            price = prices[zone]
+            fc = cmap((price - p_min) / p_span)
+            ax.text(x, y, f"{zone}\n{price:.1f} EUR", ha='center', va='center',
                     fontsize=7.5, fontweight='bold', color='white', zorder=5,
-                    bbox=dict(boxstyle='round,pad=0.35', facecolor=fc,
-                             edgecolor='white', linewidth=1.3, alpha=0.93))
+                    bbox=dict(boxstyle='round,pad=0.4,rounding_size=0.5', facecolor=fc,
+                             edgecolor='white', linewidth=1.4, alpha=0.95))
 
-        if valid_prices:
-            sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
-            sm.set_array([])
-            cbar = self.fig8c.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
-            cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
-            cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
-            for lbl in cbar.ax.yaxis.get_ticklabels():
-                lbl.set_color(C_MUTED)
+        # ── External flow arrows (Core → Nordic/outside) ────────────────
+        # Same device the Nordic tab uses for its own external links (see
+        # _draw_tab8_map's "External flow arrows" comment): no position on
+        # THIS chart to point to (only Core zones have one here) and no
+        # price on the other end to color by, so each link is a small
+        # circle tagged with the other zone's code + MW, planted outward
+        # from its Core anchor zone, fanned by angle when a zone has more
+        # than one external link. `ext_flows` is already keyed/signed from
+        # the CORE zone's own perspective (positive = that Core zone
+        # exporting) -- see _fetch_tab8_core_thread's own comment on the
+        # sign flip this required, since the underlying API only ever
+        # reports the Nordic side's own value.
+        ext_flows = ext_flows or {}
+        has_external = False
+        if ext_flows:
+            has_external = True
+            by_anchor = {}
+            for (core_zone, other), mw in ext_flows.items():
+                if core_zone not in pos:
+                    continue
+                by_anchor.setdefault(core_zone, []).append((other, mw))
+            max_ext = max((abs(mw) for mw in ext_flows.values()), default=1) or 1
+            cx0 = sum(x for x, y in pos.values()) / len(pos)
+            cy0 = sum(y for x, y in pos.values()) / len(pos)
+            ext_len = 0.17
+            r_min, r_max = 0.024, 0.052
+            for core_zone, links in sorted(by_anchor.items()):
+                x0, y0 = pos[core_zone]
+                dx0, dy0 = x0 - cx0, y0 - cy0
+                # The hub zone sits AT the centroid by construction (see
+                # _schematic_hub_positions), so "direction away from the
+                # centroid" is undefined for it -- pick a fixed reference
+                # direction (straight up) instead of an arbitrary/unstable
+                # atan2(~0, ~0).
+                if (dx0 ** 2 + dy0 ** 2) ** 0.5 < 0.01:
+                    base_angle = -math.pi / 2
+                else:
+                    base_angle = math.atan2(dy0, dx0)
+                links.sort(key=lambda t: t[0])
+                n = len(links)
+                # Scales with the number of links on this one anchor --
+                # a fixed 32° spread (fine for 2 links) put 3+ links' MW
+                # circles close enough to visibly overlap at this radius.
+                fan_spread = math.radians(min(340, 55 * max(1, n - 1)))
+                for i, (other, mw) in enumerate(links):
+                    angle = base_angle if n == 1 else (
+                        base_angle - fan_spread / 2 + fan_spread * i / (n - 1))
+                    ca, sa = math.cos(angle), math.sin(angle)
+                    r = r_min + (r_max - r_min) * (abs(mw) / max_ext)
+                    cxp, cyp = x0 + ext_len * ca, y0 + ext_len * sa
+                    near_x, near_y = x0 + 0.045 * ca, y0 + 0.045 * sa
+                    edge_x, edge_y = cxp - r * ca, cyp - r * sa
+                    exporting = mw >= 0
+                    if exporting:
+                        arrow_from, arrow_to = (near_x, near_y), (edge_x, edge_y)
+                    else:
+                        arrow_from, arrow_to = (edge_x, edge_y), (near_x, near_y)
+                    lw = 0.8 + 2.2 * (abs(mw) / max_ext)
+                    ax.annotate("", xy=arrow_to, xytext=arrow_from, zorder=4,
+                                arrowprops=dict(arrowstyle='->', color=C_PURPLE,
+                                                lw=lw, mutation_scale=9,
+                                                linestyle=(0, (4, 2))))
+                    circle = Circle((cxp, cyp), r, zorder=5,
+                                     facecolor=C_PURPLE, edgecolor=C_PURPLE,
+                                     linewidth=1.3)
+                    ax.add_patch(circle)
+                    ax.text(cxp, cyp, f"{other}\n{abs(mw):.0f}",
+                            fontsize=5.8, ha='center', va='center', zorder=6,
+                            color='white', fontweight='bold')
+
+        legend_handles = [
+            Line2D([0], [0], color='#B8B6AE', lw=1.5,
+                   label="Core-internal border (no flow data)"),
+        ]
+        if has_external:
+            legend_handles.append(
+                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
+                       markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
+                       linestyle=(0, (4, 2)), lw=1.5,
+                       label="Import/export to outside Core (Nordic) -- arrow shows direction"))
+        ax.legend(handles=legend_handles, loc='lower right', fontsize=6.3,
+                  framealpha=0.9, edgecolor=C_BORDER, facecolor=C_PANEL, labelcolor=C_TEXT)
+
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
+        sm.set_array([])
+        cbar = self.fig8c.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
+        cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
+        cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
+        for lbl in cbar.ax.yaxis.get_ticklabels():
+            lbl.set_color(C_MUTED)
 
         ax.axis('off')
         # loc='left' (not the default centered) -- a long title at this
@@ -3600,20 +3779,21 @@ class App:
 
         # Cross-region flows: the ONLY source for these is the Nordic
         # zones' own flow report (Core/Baltic's own report is always
-        # empty -- see CORE_CONNECTIONS' own comment). Map the
-        # counterpart code (e.g. "GER" -> "DE_LU") and keep only pairs
-        # that land on a known Core/Baltic zone -- anything else (an
-        # internal/metering counterpart like "DK1_VL", or a region
-        # outside this tab's scope like GB) is dropped, not guessed at.
+        # empty -- see CORE_CONNECTIONS' own comment). Every counterpart
+        # code this endpoint actually uses now matches CORE_ZONES/
+        # BALTIC_ZONES directly (including "GER" -- see CORE_ZONES' own
+        # comment), so no code-mapping is needed; anything that still
+        # doesn't match a known zone (an internal/metering counterpart
+        # like "DK1_VL", or a region outside this tab's scope like GB) is
+        # dropped, not guessed at.
         known_cb = set(CORE_ZONES) | set(BALTIC_ZONES)
         cross_flows = {}
         for (area, other), mw in raw_at_mtu.items():
             if area not in NORDIC_ZONES or abs(mw) < 1:
                 continue
-            mapped = _FLOW_COUNTERPART_TO_ZONE.get(other, other)
-            if mapped not in known_cb:
+            if other not in known_cb:
                 continue
-            cross_flows[(area, mapped)] = cross_flows.get((area, mapped), 0.0) + mw
+            cross_flows[(area, other)] = cross_flows.get((area, other), 0.0) + mw
 
         missing_core = [z for z in missing if z in CORE_ZONES]
         self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
@@ -3647,50 +3827,83 @@ class App:
         # relative to Nordic); Core is a circle in the lower band. None
         # of this is pixel-accurate geography (see CORE_ZONES' own
         # comment on why), just a readable, consistently-grouped layout.
+        # A zone is included only if it has a REAL price this slot -- no
+        # API access, or accessible but not published yet, both result in
+        # the zone (and any reference line/flow arrow touching it) being
+        # left off the chart entirely, not shown as a gray or "NaN" box.
+        # Applies uniformly across all three groups so the chart doesn't
+        # mix "missing zones excluded" for Core with "missing zones shown
+        # blank" for Nordic/Baltic.
+        visible_nordic = [z for z in ZONE_POS_NORM if prices.get(z) is not None]
+        visible_baltic = [z for z in BALTIC_ZONES if prices.get(z) is not None]
+        visible_core = [z for z in CORE_ZONES
+                        if z not in missing_core and prices.get(z) is not None]
+        if not (visible_nordic or visible_baltic or visible_core):
+            ax.text(0.5, 0.5, "No zone has usable price data for this slot.",
+                    ha='center', va='center', fontsize=10, color=C_MUTED,
+                    transform=ax.transAxes, wrap=True)
+            ax.axis('off')
+            ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET", fontsize=9,
+                         fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+            self.fig8w.tight_layout(pad=1.5)
+            return
+
+        # Nordic's own band is widened vs an earlier version of this chart
+        # (was 0.62x0.42 of the canvas) -- at the old scale its own
+        # closely-spaced zones (NO5/NO1/NO2 in particular, see
+        # ZONE_POS_NORM) crowded into overlapping labels; Core/Baltic are
+        # sized to leave a clear vertical gap below Nordic's own band
+        # rather than touching it.
         pos = {}
-        for z, (nx, ny) in ZONE_POS_NORM.items():
-            pos[z] = (0.12 + nx * 0.62, 0.06 + ny * 0.42)
-        baltic_pos = _schematic_circle_positions(BALTIC_ZONES, cx=0.85, cy=0.22,
-                                                  rx=0.10, ry=0.12, start_angle=0)
-        pos.update(baltic_pos)
-        core_pos = _schematic_circle_positions(CORE_ZONES, cx=0.5, cy=0.76, rx=0.40, ry=0.19)
-        pos.update(core_pos)
+        for z in visible_nordic:
+            nx, ny = ZONE_POS_NORM[z]
+            pos[z] = (0.05 + nx * 0.66, 0.045 + ny * 0.50)
+        pos.update(_schematic_circle_positions(visible_baltic, cx=0.87, cy=0.20,
+                                               rx=0.09, ry=0.11, start_angle=0))
+        # Hub-and-spoke for the same reason as the standalone Core tab --
+        # see _schematic_hub_positions' own comment.
+        pos.update(_schematic_hub_positions(visible_core, CORE_CONNECTIONS,
+                                            cx=0.5, cy=0.80, rx=0.40, ry=0.15))
 
         # ── Reference topology (no flow data) ───────────────────────────
+        # Light and low-zorder so it recedes behind the zone boxes and
+        # flow arrows rather than competing with them.
         for A, B in CORE_CONNECTIONS + BALTIC_CONNECTIONS:
             if A not in pos or B not in pos:
                 continue
             xA, yA = pos[A]; xB, yB = pos[B]
-            ax.plot([xA, xB], [yA, yB], color='#B8B6AE', linewidth=1.0,
-                    linestyle='-', zorder=2, solid_capstyle='round')
+            ax.plot([xA, xB], [yA, yB], color='#D5D3C9', linewidth=0.8,
+                    linestyle='-', zorder=1, alpha=0.75, solid_capstyle='round')
 
-        valid_prices = [v for v in prices.values() if v is not None]
-        p_min = min(valid_prices) if valid_prices else 0
-        p_max = max(valid_prices) if valid_prices else 100
+        # ── Faint group captions -- purely a readability aid ────────────
+        if visible_nordic:
+            _draw_group_label(ax, "NORDIC", 0.01, 0.015)
+        if visible_baltic:
+            _draw_group_label(ax, "BALTIC", 0.78, 0.015)
+        if visible_core:
+            _draw_group_label(ax, "CORE CCR", 0.01, 0.635)
+
+        valid_prices = [prices[z] for z in (visible_nordic + visible_baltic + visible_core)]
+        p_min = min(valid_prices)
+        p_max = max(valid_prices)
         p_span = max(p_max - p_min, 1.0)
         cmap = mpl.colormaps['RdYlGn_r']
 
-        def _zone_box(zone, no_access=False):
+        def _zone_box(zone):
             x, y = pos[zone]
-            if no_access:
-                fc, price_str = (0.6, 0.6, 0.6, 0.5), "N/A (no access)"
-            else:
-                price = prices.get(zone)
-                if price is not None:
-                    fc, price_str = cmap((price - p_min) / p_span), f"{price:.1f}"
-                else:
-                    fc, price_str = (0.45, 0.45, 0.45, 0.88), "N/A"
-            ax.text(x, y, f"{zone}\n{price_str}", ha='center', va='center',
-                    fontsize=6.3, fontweight='bold', color='white', zorder=5,
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor=fc,
-                             edgecolor='white', linewidth=1.1, alpha=0.93))
+            price = prices[zone]
+            fc = cmap((price - p_min) / p_span)
+            ax.text(x, y, f"{zone}\n{price:.1f}", ha='center', va='center',
+                    fontsize=6.1, fontweight='bold', color='white', zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.3,rounding_size=0.4', facecolor=fc,
+                             edgecolor='white', linewidth=1.1, alpha=0.95))
 
-        for zone in ZONE_POS_NORM:
+        for zone in visible_nordic:
             _zone_box(zone)
-        for zone in BALTIC_ZONES:
+        for zone in visible_baltic:
             _zone_box(zone)
-        for zone in CORE_ZONES:
-            _zone_box(zone, no_access=(zone in missing_core))
+        for zone in visible_core:
+            _zone_box(zone)
 
         # ── Flow arrows: Nordic-internal + cross-region (both real) ─────
         all_flow_mags = [abs(v) for v in net_flows.values()] + [abs(v) for v in cross_flows.values()]
@@ -3731,17 +3944,21 @@ class App:
         legend_handles.append(
             Line2D([0], [0], color='#B8B6AE', lw=1.5,
                    label="Core/Baltic-internal border (no flow data)"))
-        ax.legend(handles=legend_handles, loc='lower right', fontsize=6.5,
-                  framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL, labelcolor=C_TEXT)
+        # Centered below the chart rather than inside it -- an in-axes
+        # corner legend risked sitting on top of a zone box once the Core
+        # cluster was widened to fill more of the lower band.
+        self.fig8w.legend(handles=legend_handles, loc='lower center', ncol=3,
+                          fontsize=6.3, framealpha=0.92, edgecolor=C_BORDER,
+                          facecolor=C_PANEL, labelcolor=C_TEXT,
+                          bbox_to_anchor=(0.46, -0.01))
 
-        if valid_prices:
-            sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
-            sm.set_array([])
-            cbar = self.fig8w.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
-            cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
-            cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
-            for lbl in cbar.ax.yaxis.get_ticklabels():
-                lbl.set_color(C_MUTED)
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
+        sm.set_array([])
+        cbar = self.fig8w.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
+        cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
+        cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
+        for lbl in cbar.ax.yaxis.get_ticklabels():
+            lbl.set_color(C_MUTED)
 
         ax.axis('off')
         # loc='left' -- see _draw_tab8_core_map's identical comment on why.
