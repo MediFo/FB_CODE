@@ -89,6 +89,64 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "energies-13-01930-g001.png")
 
 # ----------------------------------------------------------------------
+#  CORE / BALTIC ZONES — Tab 8's "Core" and "Whole" sub-tabs
+# ----------------------------------------------------------------------
+# Core CCR (Core Capacity Calculation Region), the standard FBMC domain
+# definition. Unlike NORDIC_ZONES there is no background map image or
+# hand-placed ZONE_POS_NORM for these -- positions are computed at draw
+# time (see _schematic_circle_positions) rather than pixel-measured
+# against an image, since no such image exists in this repo (see
+# CLAUDE.md on ZONE_POS_NORM only ever covering the 12 Nordic zones).
+CORE_ZONES = ["AT", "BE", "CZ", "DE_LU", "FR", "HR", "HU", "NL", "PL", "RO", "SI", "SK"]
+BALTIC_ZONES = ["EE", "LV", "LT"]
+
+# Verified LIVE against this account's actual Nord Pool subscription
+# (2026-10-15): price data is available for all of BALTIC_ZONES, but only
+# AT/BE/FR/NL/PL of CORE_ZONES -- DE_LU/CZ/HU/RO/SI/SK/HR come back
+# "Missing access for area(s) ..." (403) on the SAME combined request,
+# which Nord Pool's API rejects in full the moment ANY requested area is
+# inaccessible (not just omitting that area from the response). This list
+# is NOT hardcoded into the fetch path -- _np_request_with_access_fallback
+# parses the 403 body itself and retries with whatever subset IS
+# accessible, so a future change to this account's subscription is picked
+# up automatically without a code change; it's recorded here only as the
+# known state at the time this was built.
+_KNOWN_INACCESSIBLE_CORE_ZONES = ["DE_LU", "CZ", "HU", "RO", "SI", "SK", "HR"]
+
+# Real bidding-zone borders within Core CCR, for drawing static reference
+# topology only -- NOT flow arrows. Verified LIVE (2026-10-15): Nord
+# Pool's ScheduledPhysicalFlows/ByAreas endpoint returns status="Missing"
+# with an empty flows list for EVERY Core zone on every date tried
+# (several months apart), unlike Nordic zones which reliably return
+# status="Final" with 96 real rows -- Core-internal flow data simply
+# isn't published through this API, price auctions aside. Drawing a
+# fabricated or zero flow arrow here would misreport that as "zero flow"
+# when the truth is "no data source" -- so Core/Baltic-internal borders
+# are drawn as plain unlabeled reference lines, never arrows.
+CORE_CONNECTIONS = [
+    ("DE_LU", "FR"), ("DE_LU", "BE"), ("DE_LU", "NL"), ("DE_LU", "AT"),
+    ("DE_LU", "CZ"), ("DE_LU", "PL"),
+    ("FR", "BE"), ("BE", "NL"),
+    ("AT", "CZ"), ("AT", "SI"), ("AT", "HU"),
+    ("CZ", "SK"), ("CZ", "PL"),
+    ("SK", "HU"), ("SK", "PL"),
+    ("HU", "HR"), ("HU", "RO"),
+    ("SI", "HR"),
+]
+BALTIC_CONNECTIONS = [("EE", "LV"), ("LV", "LT")]
+
+# Nord Pool's flow endpoint sometimes uses a different code for the same
+# zone than its price endpoint -- verified LIVE: a Nordic zone's own flow
+# report lists a Germany/Luxembourg counterpart as "GER", never "DE_LU"
+# (the code the price endpoint actually accepts). Every OTHER non-Nordic
+# counterpart code observed across all 12 Nordic zones' live flow reports
+# that date (EE, LT, NL, PL) already matched CORE_ZONES/BALTIC_ZONES
+# as-is. Anything seen that maps to neither a known zone nor this table
+# (e.g. "DK1_VL", an internal/metering counterpart, also observed live)
+# is simply not a real external zone and is dropped, not guessed at.
+_FLOW_COUNTERPART_TO_ZONE = {"GER": "DE_LU"}
+
+# ----------------------------------------------------------------------
 #  DESIGN TOKENS
 # ----------------------------------------------------------------------
 C_BG        = '#FFFFFF'
@@ -253,6 +311,54 @@ def get_np_access_token():
         return r.json().get("access_token")
     except Exception:
         return None
+
+
+def _np_request_with_access_fallback(url, zones, extra_params, hdrs, log_func=lambda m: None):
+    """GET `url` for `zones`; Nord Pool rejects a COMBINED request in
+    full (403) the moment any one requested area isn't on this account's
+    subscription, rather than just omitting that area from the response
+    -- verified live against Core CCR zones (see CORE_ZONES' own comment).
+    Parses the "Missing access for area(s) X, Y, ..." body and retries
+    with just the accessible subset, so a partial-access zone list still
+    returns whatever it can rather than failing outright. Adaptive, not
+    hardcoded to today's known-missing list -- a future subscription
+    change is picked up automatically.
+    Returns (requests.Response_or_None, accessible_zones, missing_zones).
+    """
+    params = extra_params + [('areas', z) for z in zones]
+    r = requests.get(url, headers=hdrs, params=params, timeout=20)
+    if r.status_code == 200:
+        return r, list(zones), []
+    if r.status_code == 403 and 'Missing access' in r.text:
+        m = re.search(r'Missing access for area\(s\)\s*([A-Za-z0-9_,\s]+)', r.text)
+        missing = [s.strip() for s in m.group(1).split(',')] if m else []
+        missing = [z for z in missing if z in zones]
+        accessible = [z for z in zones if z not in missing]
+        log_func(f"  Access: {len(missing)}/{len(zones)} zone(s) not on this "
+                 f"account's subscription ({', '.join(missing)}) -- retrying "
+                 f"with the remaining {len(accessible)}.")
+        if not accessible:
+            return None, [], missing
+        params2 = extra_params + [('areas', z) for z in accessible]
+        r2 = requests.get(url, headers=hdrs, params=params2, timeout=20)
+        if r2.status_code == 200:
+            return r2, accessible, missing
+        return None, [], zones
+    return None, [], []
+
+
+def _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle=-90):
+    """Evenly spaces `zones` around an ellipse centered at (cx, cy) with
+    radii (rx, ry), all normalized [0,1] figure coordinates -- used for
+    Core/Baltic zones, which have no real background-map position (see
+    CORE_ZONES' own comment: no map image exists for them in this repo).
+    start_angle in degrees, -90 = 12 o'clock, going clockwise."""
+    n = len(zones)
+    pos = {}
+    for i, z in enumerate(zones):
+        angle = math.radians(start_angle + 360 * i / n)
+        pos[z] = (cx + rx * math.cos(angle), cy + ry * math.sin(angle))
+    return pos
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -2372,7 +2478,36 @@ class App:
     _T8_SPEED_MS = {"Slow": 1200, "Medium": 600, "Fast": 250}
 
     def _create_tab8_widgets(self):
-        main = ttk.Frame(self.tab8, style='Card.TFrame', padding=12)
+        """Tab 8 is itself a sub-notebook of three panes: Nordic (the
+        original map, unchanged -- real background image + hand-placed
+        positions, full period/playback support), Core (Core CCR zones,
+        schematic layout -- see CORE_ZONES' own comment on why there's no
+        real map image/positions, and why Core-internal borders are
+        plain reference lines rather than flow arrows: Nord Pool simply
+        doesn't publish Core flow data through this API), and Whole
+        (Nordic + Core + Baltic together, cross-region arrows sourced
+        from the NORDIC zones' own flow reports -- the only place this
+        API actually reports a cross-region flow, since neither Core nor
+        Baltic's own report ever does). Core and Whole are single-
+        snapshot "Fetch & Plot" only, not full period/playback like
+        Nordic -- a reasonable follow-up, not built here to keep this
+        addition scoped and verifiable."""
+        outer_nb = ttk.Notebook(self.tab8)
+        outer_nb.pack(fill=tk.BOTH, expand=True)
+
+        nordic_pane = ttk.Frame(outer_nb, style='Card.TFrame')
+        core_pane   = ttk.Frame(outer_nb, style='Card.TFrame')
+        whole_pane  = ttk.Frame(outer_nb, style='Card.TFrame')
+        outer_nb.add(nordic_pane, text='  Nordic  ')
+        outer_nb.add(core_pane,   text='  Core  ')
+        outer_nb.add(whole_pane,  text='  Whole (Nordic + Core + Baltic)  ')
+
+        self._create_tab8_nordic_widgets(nordic_pane)
+        self._create_tab8_core_widgets(core_pane)
+        self._create_tab8_whole_widgets(whole_pane)
+
+    def _create_tab8_nordic_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
         ctrl = ttk.Frame(main, style='Card.TFrame')
@@ -3144,6 +3279,475 @@ class App:
             f"Price (DayAhead, EUR/MWh) + Flow (MW)",
             fontsize=9.5, fontweight='bold', color=C_ACCENT, pad=8)
         self.fig8.tight_layout(pad=1.5)
+
+    # ------------------------------------------------------------------
+    #  TAB 8b – Core (schematic, single snapshot)
+    # ------------------------------------------------------------------
+    def _create_tab8_core_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ctrl = ttk.Frame(main, style='Card.TFrame')
+        ctrl.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(ctrl, text="Date (CET):").pack(side=tk.LEFT)
+        self._t8c_date = ttk.Entry(ctrl, width=12)
+        self._t8c_date.insert(0, self.today_str)
+        self._t8c_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+        ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
+        self._t8c_mtu = ttk.Combobox(ctrl, values=_mtu_slots, width=7, state='readonly')
+        self._t8c_mtu.set("12:00")
+        self._t8c_mtu.pack(side=tk.LEFT, padx=(4, 16))
+
+        self._t8c_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
+                                   command=self._plot_tab8_core)
+        self._t8c_btn.pack(side=tk.LEFT)
+
+        self._t8c_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
+        self._t8c_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
+                  text=("Prices only -- Nord Pool's flow endpoint reports no scheduled "
+                        "physical flow data for Core zones (status=\"Missing\" on every "
+                        "date tried), so CCR-internal borders are shown as plain "
+                        "reference lines, not flow arrows. Not every Core CCR zone may "
+                        "be on this account's Nord Pool subscription -- a zone shown "
+                        "\"N/A (no access)\" means the API itself refused it, not a "
+                        "fetch failure.")
+                  ).pack(fill=tk.X, pady=(0, 6))
+
+        self.toolbar_f8c = ttk.Frame(main, style='Card.TFrame')
+        self.toolbar_f8c.pack(fill=tk.X)
+        self.fig8c = Figure(figsize=(8, 8), dpi=95)
+        self._style_figure(self.fig8c)
+        self.canvas8c = FigureCanvasTkAgg(self.fig8c, main)
+        self.canvas8c.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
+        diag_f.pack(fill=tk.X, pady=(4, 0))
+        self._t8c_diag = tk.Text(
+            diag_f, font=('Consolas', 8), background=C_INK, foreground=C_TINT,
+            height=4, relief='flat', borderwidth=0, padx=8, pady=4, state='disabled')
+        sb = tk.Scrollbar(diag_f, command=self._t8c_diag.yview, bg='#18181B')
+        self._t8c_diag.config(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._t8c_diag.pack(fill=tk.X)
+
+    def _t8c_log(self, msg):
+        self._t8c_diag.config(state='normal')
+        self._t8c_diag.insert(tk.END, msg + "\n")
+        self._t8c_diag.see(tk.END)
+        self._t8c_diag.config(state='disabled')
+
+    def _plot_tab8_core(self):
+        date_str = self._t8c_date.get().strip()
+        mtu_label = self._t8c_mtu.get().strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Core Map", "Enter Date as YYYY-MM-DD.")
+            return
+        self._t8c_btn.config(state=tk.DISABLED, text="Fetching…")
+        self._t8c_status.config(text="Fetching prices…", foreground=C_MUTED)
+        self._show_chart_loading(self.fig8c, self.canvas8c)
+        threading.Thread(target=self._fetch_tab8_core_thread,
+                         args=(date_str, mtu_label), daemon=True).start()
+
+    def _fetch_tab8_core_thread(self, date_str, mtu_label):
+        def _diag(msg):
+            self.root.after(0, self._t8c_log, msg)
+        token = get_np_access_token()
+        if not token:
+            self.root.after(0, self._tab8_core_fetch_done, None, None, date_str, mtu_label,
+                            "AUTH FAILED: could not obtain NordPool access token.")
+            return
+        hdrs = self._np_headers(token)
+        price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
+        r, accessible, missing = _np_request_with_access_fallback(
+            NP_PRICE_URL, CORE_ZONES, price_params, hdrs, _diag)
+        if r is None:
+            self.root.after(0, self._tab8_core_fetch_done, None, missing, date_str, mtu_label,
+                            "Price API: no accessible Core zone returned data "
+                            f"({', '.join(missing) if missing else 'unknown error'}).")
+            return
+        prices = {}
+        for area_data in r.json():
+            zone = area_data.get('deliveryArea')
+            if zone not in CORE_ZONES:
+                continue
+            for p in area_data.get('prices', []):
+                ts = p.get('deliveryStart', '')
+                if not ts:
+                    continue
+                try:
+                    cet_dt = _utc_to_cet(ts)
+                except Exception:
+                    continue
+                if cet_dt.strftime('%Y-%m-%d') != date_str:
+                    continue
+                if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
+                    prices[zone] = p.get('price')
+        self.root.after(0, self._tab8_core_fetch_done, prices, missing, date_str, mtu_label, None)
+
+    def _tab8_core_fetch_done(self, prices, missing_zones, date_str, mtu_label, error):
+        self._t8c_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        if error:
+            self._t8c_status.config(text=f"⚠ {error}", foreground=C_RED)
+            messagebox.showerror("Core Map", error)
+            return
+        self._draw_tab8_core_map(prices or {}, missing_zones or [], f"{date_str} {mtu_label}")
+        self.canvas8c.draw()
+        self._add_toolbar(self.canvas8c, self.toolbar_f8c)
+        n_na = len(missing_zones or [])
+        self._t8c_status.config(
+            text=f"Done. {n_na} zone(s) unavailable (no API access)." if n_na else "Done.",
+            foreground=C_MUTED)
+
+    def _draw_tab8_core_map(self, prices, missing_zones, slot_label):
+        self.fig8c.clear()
+        ax = self.fig8c.add_subplot(111)
+        ax.set_xlim(0, 1); ax.set_ylim(1, 0)
+        ax.set_facecolor('#F3F2EE')
+
+        pos = _schematic_circle_positions(CORE_ZONES, cx=0.5, cy=0.5, rx=0.40, ry=0.40)
+
+        # Reference topology only -- never a flow arrow, see this tab's
+        # own on-screen note and CORE_CONNECTIONS' comment on why.
+        for A, B in CORE_CONNECTIONS:
+            if A not in pos or B not in pos:
+                continue
+            xA, yA = pos[A]; xB, yB = pos[B]
+            ax.plot([xA, xB], [yA, yB], color='#B8B6AE', linewidth=1.0,
+                    linestyle='-', zorder=2, solid_capstyle='round')
+
+        valid_prices = [v for v in prices.values() if v is not None]
+        p_min = min(valid_prices) if valid_prices else 0
+        p_max = max(valid_prices) if valid_prices else 100
+        p_span = max(p_max - p_min, 1.0)
+        cmap = mpl.colormaps['RdYlGn_r']
+
+        for zone in CORE_ZONES:
+            x, y = pos[zone]
+            if zone in missing_zones:
+                fc = (0.6, 0.6, 0.6, 0.5)
+                price_str = "N/A (no access)"
+            else:
+                price = prices.get(zone)
+                if price is not None:
+                    fc = cmap((price - p_min) / p_span)
+                    price_str = f"{price:.1f} EUR"
+                else:
+                    fc = (0.45, 0.45, 0.45, 0.88)
+                    price_str = "N/A"
+            ax.text(x, y, f"{zone}\n{price_str}", ha='center', va='center',
+                    fontsize=7.5, fontweight='bold', color='white', zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.35', facecolor=fc,
+                             edgecolor='white', linewidth=1.3, alpha=0.93))
+
+        if valid_prices:
+            sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
+            sm.set_array([])
+            cbar = self.fig8c.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
+            cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
+            cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
+            for lbl in cbar.ax.yaxis.get_ticklabels():
+                lbl.set_color(C_MUTED)
+
+        ax.axis('off')
+        # loc='left' (not the default centered) -- a long title at this
+        # fontsize otherwise overflows past the left edge of this axes,
+        # which tight_layout has already inset to make room for the
+        # colorbar; left-aligned, it starts inside the visible area
+        # regardless of axes width or title length.
+        ax.set_title(f"Core CCR  —  {slot_label} CET  |  schematic, not geographic",
+                     fontsize=9, fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+        self.fig8c.tight_layout(pad=1.5)
+
+    # ------------------------------------------------------------------
+    #  TAB 8c – Whole (Nordic + Core + Baltic, schematic, single snapshot)
+    # ------------------------------------------------------------------
+    def _create_tab8_whole_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ctrl = ttk.Frame(main, style='Card.TFrame')
+        ctrl.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(ctrl, text="Date (CET):").pack(side=tk.LEFT)
+        self._t8w_date = ttk.Entry(ctrl, width=12)
+        self._t8w_date.insert(0, self.today_str)
+        self._t8w_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+        ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
+        self._t8w_mtu = ttk.Combobox(ctrl, values=_mtu_slots, width=7, state='readonly')
+        self._t8w_mtu.set("12:00")
+        self._t8w_mtu.pack(side=tk.LEFT, padx=(4, 16))
+
+        self._t8w_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
+                                   command=self._plot_tab8_whole)
+        self._t8w_btn.pack(side=tk.LEFT)
+
+        self._t8w_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
+        self._t8w_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
+                  text=("Nordic-internal and Nordic↔Core/Baltic flows are real (the "
+                        "latter sourced from the Nordic zones' OWN flow reports -- the "
+                        "only place this API reports them). Core-internal and "
+                        "Baltic-internal borders are reference lines only, no flow "
+                        "data published for those. Schematic layout -- Nordic keeps "
+                        "its real map positions, Core/Baltic are arranged around it, "
+                        "not geographically placed.")
+                  ).pack(fill=tk.X, pady=(0, 6))
+
+        self.toolbar_f8w = ttk.Frame(main, style='Card.TFrame')
+        self.toolbar_f8w.pack(fill=tk.X)
+        self.fig8w = Figure(figsize=(9, 9), dpi=95)
+        self._style_figure(self.fig8w)
+        self.canvas8w = FigureCanvasTkAgg(self.fig8w, main)
+        self.canvas8w.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
+        diag_f.pack(fill=tk.X, pady=(4, 0))
+        self._t8w_diag = tk.Text(
+            diag_f, font=('Consolas', 8), background=C_INK, foreground=C_TINT,
+            height=4, relief='flat', borderwidth=0, padx=8, pady=4, state='disabled')
+        sb = tk.Scrollbar(diag_f, command=self._t8w_diag.yview, bg='#18181B')
+        self._t8w_diag.config(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._t8w_diag.pack(fill=tk.X)
+
+    def _t8w_log(self, msg):
+        self._t8w_diag.config(state='normal')
+        self._t8w_diag.insert(tk.END, msg + "\n")
+        self._t8w_diag.see(tk.END)
+        self._t8w_diag.config(state='disabled')
+
+    def _plot_tab8_whole(self):
+        date_str = self._t8w_date.get().strip()
+        mtu_label = self._t8w_mtu.get().strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Whole Map", "Enter Date as YYYY-MM-DD.")
+            return
+        self._t8w_btn.config(state=tk.DISABLED, text="Fetching…")
+        self._t8w_status.config(text="Fetching prices & flows…", foreground=C_MUTED)
+        self._show_chart_loading(self.fig8w, self.canvas8w)
+        threading.Thread(target=self._fetch_tab8_whole_thread,
+                         args=(date_str, mtu_label), daemon=True).start()
+
+    def _fetch_tab8_whole_thread(self, date_str, mtu_label):
+        def _diag(msg):
+            self.root.after(0, self._t8w_log, msg)
+        token = get_np_access_token()
+        if not token:
+            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
+                            date_str, mtu_label,
+                            "AUTH FAILED: could not obtain NordPool access token.")
+            return
+        hdrs = self._np_headers(token)
+
+        nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
+        nordic_prices, nordic_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
+            date_str, hdrs, nordic_areas_params, _diag)
+        if price_err:
+            _diag(f"[WHOLE] Nordic price error: {price_err}")
+        if flow_err:
+            _diag(f"[WHOLE] Nordic flow error: {flow_err}")
+
+        core_baltic_zones = CORE_ZONES + BALTIC_ZONES
+        price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
+        r, accessible, missing = _np_request_with_access_fallback(
+            NP_PRICE_URL, core_baltic_zones, price_params, hdrs, _diag)
+        cb_prices_at_mtu = {}
+        if r is not None:
+            for area_data in r.json():
+                zone = area_data.get('deliveryArea')
+                if zone not in core_baltic_zones:
+                    continue
+                for p in area_data.get('prices', []):
+                    ts = p.get('deliveryStart', '')
+                    if not ts:
+                        continue
+                    try:
+                        cet_dt = _utc_to_cet(ts)
+                    except Exception:
+                        continue
+                    if cet_dt.strftime('%Y-%m-%d') != date_str:
+                        continue
+                    if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
+                        cb_prices_at_mtu[zone] = p.get('price')
+
+        nordic_prices_at_mtu = nordic_prices.get(mtu_label, {})
+        if not nordic_prices_at_mtu and not cb_prices_at_mtu:
+            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
+                            date_str, mtu_label,
+                            "Could not fetch any price data (Nordic or Core/Baltic).")
+            return
+        all_prices = dict(nordic_prices_at_mtu)
+        all_prices.update(cb_prices_at_mtu)
+
+        raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
+        net_flows = {}
+        for A, B in ZONE_CONNECTIONS:
+            net = raw_at_mtu.get((A, B), 0) - raw_at_mtu.get((B, A), 0)
+            if abs(net) >= 1:
+                net_flows[(A, B)] = net
+
+        # Cross-region flows: the ONLY source for these is the Nordic
+        # zones' own flow report (Core/Baltic's own report is always
+        # empty -- see CORE_CONNECTIONS' own comment). Map the
+        # counterpart code (e.g. "GER" -> "DE_LU") and keep only pairs
+        # that land on a known Core/Baltic zone -- anything else (an
+        # internal/metering counterpart like "DK1_VL", or a region
+        # outside this tab's scope like GB) is dropped, not guessed at.
+        known_cb = set(CORE_ZONES) | set(BALTIC_ZONES)
+        cross_flows = {}
+        for (area, other), mw in raw_at_mtu.items():
+            if area not in NORDIC_ZONES or abs(mw) < 1:
+                continue
+            mapped = _FLOW_COUNTERPART_TO_ZONE.get(other, other)
+            if mapped not in known_cb:
+                continue
+            cross_flows[(area, mapped)] = cross_flows.get((area, mapped), 0.0) + mw
+
+        missing_core = [z for z in missing if z in CORE_ZONES]
+        self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
+                        missing_core, date_str, mtu_label, None)
+
+    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, missing_core,
+                               date_str, mtu_label, error):
+        self._t8w_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        if error:
+            self._t8w_status.config(text=f"⚠ {error}", foreground=C_RED)
+            messagebox.showerror("Whole Map", error)
+            return
+        self._draw_tab8_whole_map(prices or {}, net_flows or {}, cross_flows or {},
+                                  missing_core or [], f"{date_str} {mtu_label}")
+        self.canvas8w.draw()
+        self._add_toolbar(self.canvas8w, self.toolbar_f8w)
+        n_na = len(missing_core or [])
+        self._t8w_status.config(
+            text=f"Done. {n_na} Core zone(s) unavailable (no API access)." if n_na else "Done.",
+            foreground=C_MUTED)
+
+    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, missing_core, slot_label):
+        self.fig8w.clear()
+        ax = self.fig8w.add_subplot(111)
+        ax.set_xlim(0, 1); ax.set_ylim(1, 0)
+        ax.set_facecolor('#F3F2EE')
+
+        # Nordic keeps its real (hand-placed) relative layout, rescaled
+        # into the upper band of this shared canvas; Baltic gets a small
+        # cluster to the upper-right (geographically roughly correct
+        # relative to Nordic); Core is a circle in the lower band. None
+        # of this is pixel-accurate geography (see CORE_ZONES' own
+        # comment on why), just a readable, consistently-grouped layout.
+        pos = {}
+        for z, (nx, ny) in ZONE_POS_NORM.items():
+            pos[z] = (0.12 + nx * 0.62, 0.06 + ny * 0.42)
+        baltic_pos = _schematic_circle_positions(BALTIC_ZONES, cx=0.85, cy=0.22,
+                                                  rx=0.10, ry=0.12, start_angle=0)
+        pos.update(baltic_pos)
+        core_pos = _schematic_circle_positions(CORE_ZONES, cx=0.5, cy=0.76, rx=0.40, ry=0.19)
+        pos.update(core_pos)
+
+        # ── Reference topology (no flow data) ───────────────────────────
+        for A, B in CORE_CONNECTIONS + BALTIC_CONNECTIONS:
+            if A not in pos or B not in pos:
+                continue
+            xA, yA = pos[A]; xB, yB = pos[B]
+            ax.plot([xA, xB], [yA, yB], color='#B8B6AE', linewidth=1.0,
+                    linestyle='-', zorder=2, solid_capstyle='round')
+
+        valid_prices = [v for v in prices.values() if v is not None]
+        p_min = min(valid_prices) if valid_prices else 0
+        p_max = max(valid_prices) if valid_prices else 100
+        p_span = max(p_max - p_min, 1.0)
+        cmap = mpl.colormaps['RdYlGn_r']
+
+        def _zone_box(zone, no_access=False):
+            x, y = pos[zone]
+            if no_access:
+                fc, price_str = (0.6, 0.6, 0.6, 0.5), "N/A (no access)"
+            else:
+                price = prices.get(zone)
+                if price is not None:
+                    fc, price_str = cmap((price - p_min) / p_span), f"{price:.1f}"
+                else:
+                    fc, price_str = (0.45, 0.45, 0.45, 0.88), "N/A"
+            ax.text(x, y, f"{zone}\n{price_str}", ha='center', va='center',
+                    fontsize=6.3, fontweight='bold', color='white', zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor=fc,
+                             edgecolor='white', linewidth=1.1, alpha=0.93))
+
+        for zone in ZONE_POS_NORM:
+            _zone_box(zone)
+        for zone in BALTIC_ZONES:
+            _zone_box(zone)
+        for zone in CORE_ZONES:
+            _zone_box(zone, no_access=(zone in missing_core))
+
+        # ── Flow arrows: Nordic-internal + cross-region (both real) ─────
+        all_flow_mags = [abs(v) for v in net_flows.values()] + [abs(v) for v in cross_flows.values()]
+        max_flow = max(all_flow_mags, default=1) or 1
+        pad = 0.018
+
+        def _draw_flow_arrow(A, B, mw):
+            if A not in pos or B not in pos:
+                return
+            src, dst, mw2 = (A, B, mw) if mw >= 0 else (B, A, -mw)
+            x1, y1 = pos[src]; x2, y2 = pos[dst]
+            p_src, p_dst = prices.get(src), prices.get(dst)
+            counter = (p_src is not None and p_dst is not None and p_src > p_dst)
+            color = C_RED if counter else C_PRIMARY
+            dx, dy = x2 - x1, y2 - y1
+            dist = (dx ** 2 + dy ** 2) ** 0.5 or 1
+            xs, ys = x1 + dx / dist * pad, y1 + dy / dist * pad
+            xe, ye = x2 - dx / dist * pad, y2 - dy / dist * pad
+            lw = 0.7 + 2.6 * (mw2 / max_flow)
+            ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
+                        arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=8))
+            return counter
+
+        has_counter = False
+        for (A, B), mw in net_flows.items():
+            if _draw_flow_arrow(A, B, mw):
+                has_counter = True
+        for (A, B), mw in cross_flows.items():
+            if _draw_flow_arrow(A, B, mw):
+                has_counter = True
+
+        legend_handles = [
+            Line2D([0], [0], color=C_PRIMARY, lw=2, label="Flow (cheap → expensive)"),
+        ]
+        if has_counter:
+            legend_handles.append(
+                Line2D([0], [0], color=C_RED, lw=2, label="Counter-intuitive (expensive → cheap)"))
+        legend_handles.append(
+            Line2D([0], [0], color='#B8B6AE', lw=1.5,
+                   label="Core/Baltic-internal border (no flow data)"))
+        ax.legend(handles=legend_handles, loc='lower right', fontsize=6.5,
+                  framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL, labelcolor=C_TEXT)
+
+        if valid_prices:
+            sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
+            sm.set_array([])
+            cbar = self.fig8w.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
+            cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
+            cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
+            for lbl in cbar.ax.yaxis.get_ticklabels():
+                lbl.set_color(C_MUTED)
+
+        ax.axis('off')
+        # loc='left' -- see _draw_tab8_core_map's identical comment on why.
+        ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET  |  schematic layout",
+                     fontsize=9, fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+        self.fig8w.tight_layout(pad=1.5)
 
     # ------------------------------------------------------------------
     #  TAB 9 – Maintenance Analysis  (FB_CODE integration)
