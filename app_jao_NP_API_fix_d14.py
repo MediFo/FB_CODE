@@ -4485,77 +4485,13 @@ class App:
 
         ax.axis('off')
 
-        # ── Legend panel, mid-LEFT -- price gradient + flow/coverage
-        # swatches, styled after VoltPath's own legend box. Every CORNER
-        # has failed in turn as the tracked-zone set grew: bottom-left sat
-        # on Spain once Spain got its own label; bottom-right then covered
-        # Montenegro/N.Macedonia once the Western Balkans were added too.
-        # The strip of open Atlantic west of Ireland/Portugal -- below the
-        # stats panel (which already owns the sea above Iceland/Norway),
-        # above Portugal/Spain's own labels, and below Great Britain's
-        # (untracked, unlabelled but still drawn) landmass -- is the one
-        # remaining gap nothing else claims at any zoom this map uses.
-        lw_, lh_ = 0.30, 0.178
-        lx0, ly0 = 0.015, 0.26
-        # Soft drop shadow -- a second, slightly offset panel in a muted
-        # dark tone behind the real one, zorder just below it. C_GEO_BORDER
-        # is white now (see its own comment, for the zone-outline look),
-        # so the panel's own edge uses C_GEO_MUTED instead -- a white
-        # border on a white panel would be invisible.
-        shadow = FancyBboxPatch((lx0 + 0.005, ly0 - 0.005), lw_, lh_,
-                                boxstyle="round,pad=0.006,rounding_size=0.012",
-                                transform=ax.transAxes, facecolor='#00000020',
-                                edgecolor='none', zorder=9)
-        ax.add_patch(shadow)
-        panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
-                               boxstyle="round,pad=0.006,rounding_size=0.012",
-                               transform=ax.transAxes, facecolor=C_GEO_PANEL,
-                               edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
-        ax.add_patch(panel)
-        pad_in = 0.014
-        ax.text(lx0 + pad_in, ly0 + lh_ - 0.024, "Price (EUR/MWh)",
-                transform=ax.transAxes, fontsize=6.5, fontweight='bold',
-                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
-        grad_ax = ax.inset_axes(
-            [lx0 + pad_in, ly0 + lh_ - 0.058, lw_ - 2 * pad_in, 0.018],
-            transform=ax.transAxes)
-        grad_ax.imshow([[i / 255 for i in range(256)]], aspect='auto', cmap=cmap)
-        grad_ax.set_xticks([]); grad_ax.set_yticks([])
-        for spine in grad_ax.spines.values():
-            spine.set_visible(False)
-        ax.text(lx0 + pad_in, ly0 + lh_ - 0.068, f"{p_min:.0f}",
-                transform=ax.transAxes, fontsize=5.8, color=C_GEO_MUTED,
-                ha='left', va='top', zorder=11)
-        ax.text(lx0 + lw_ - pad_in, ly0 + lh_ - 0.068, f"{p_max:.0f}",
-                transform=ax.transAxes, fontsize=5.8, color=C_GEO_MUTED,
-                ha='right', va='top', zorder=11)
-
-        swatch_rows = [
-            ("line", C_GEO_COUNTER, "Counter-intuitive flow"),
-            ("line", C_GEO_FLOW, "Other flow"),
-            ("box", C_GEO_NODATA, "No price data"),
-        ]
-        row_y = ly0 + lh_ - 0.092
-        for kind, color, label in swatch_rows:
-            sx = lx0 + pad_in
-            if kind == "line":
-                ax.plot([sx, sx + 0.025], [row_y, row_y], color=color, lw=1.6,
-                        transform=ax.transAxes, zorder=11, solid_capstyle='round')
-            else:
-                ax.add_patch(FancyBboxPatch(
-                    (sx, row_y - 0.006), 0.022, 0.012,
-                    boxstyle="round,pad=0.001,rounding_size=0.002",
-                    transform=ax.transAxes, facecolor=color, edgecolor='none', zorder=11))
-            ax.text(sx + 0.034, row_y, label, transform=ax.transAxes, fontsize=5.8,
-                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
-            row_y -= 0.027
-
         # ── Stats panel, top-LEFT -- average price per region + average
         # cross-border flow magnitude, computed from this slot's own
         # data (not a running/historical average). Top-left falls over
         # open sea above Iceland -- no zone shape sits there regardless
-        # of which zones are present this slot, the same reasoning that
-        # put the legend in the one empty corner on the other side. ────
+        # of which zones are present this slot. Computed/positioned
+        # before the legend below so the legend can stack directly under
+        # it using its own sx0/sw_. ─────────────────────────────────────
         def _avg(vals):
             vals = [v for v in vals if v is not None]
             return sum(vals) / len(vals) if vals else None
@@ -4605,6 +4541,94 @@ class App:
         ax.text(sx0 + sw_ - s_pad, srow_y, flow_str, transform=ax.transAxes,
                 fontsize=5.8, color=C_GEO_TEXT, fontweight='bold',
                 ha='right', va='center', zorder=11)
+
+        # ── Legend panel, stacked directly BELOW the stats panel (same
+        # left column, same width) -- price gradient + flow/coverage
+        # swatches, styled after VoltPath's own legend box. Every spot
+        # tried on its own corner eventually collided with real map
+        # content as the tracked-zone set grew (bottom-left: Spain;
+        # bottom-right: Montenegro/N.Macedonia; mid-left on its own:
+        # clipped Great Britain/Ireland at this panel's old, larger
+        # size) -- stacking it under the stats panel instead of finding
+        # it a fourth corner keeps both panels in the one column that's
+        # reliably open water (north Atlantic, west of Scandinavia/
+        # Ireland), and shrinking it (0.30x0.178 -> 0.225x~0.125, now
+        # matching the stats panel's own width) was needed to still fit
+        # above Ireland/Great Britain's landmass at this stacked position.
+        # Gap below the stats panel is intentionally generous (0.022) so
+        # rounding/shadow edges from the two panels never visibly touch.
+        lw_ = sw_
+        lx0 = sx0
+        pad_in = 0.012
+        row_h = 0.0205
+        n_swatch_rows = 3
+        top_pad, title_h, gap1 = 0.010, 0.016, 0.005
+        grad_h, gap2, minmax_h, gap3 = 0.013, 0.004, 0.014, 0.008
+        bottom_pad = 0.008
+        lh_ = (top_pad + title_h + gap1 + grad_h + gap2 + minmax_h + gap3
+               + row_h * n_swatch_rows + bottom_pad)
+        ly0 = sy0 - 0.022 - lh_
+        # Soft drop shadow -- a second, slightly offset panel in a muted
+        # dark tone behind the real one, zorder just below it. C_GEO_BORDER
+        # is white now (see its own comment, for the zone-outline look),
+        # so the panel's own edge uses C_GEO_MUTED instead -- a white
+        # border on a white panel would be invisible.
+        shadow = FancyBboxPatch((lx0 + 0.004, ly0 - 0.004), lw_, lh_,
+                                boxstyle="round,pad=0.005,rounding_size=0.010",
+                                transform=ax.transAxes, facecolor='#00000020',
+                                edgecolor='none', zorder=9)
+        ax.add_patch(shadow)
+        panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
+                               boxstyle="round,pad=0.005,rounding_size=0.010",
+                               transform=ax.transAxes, facecolor=C_GEO_PANEL,
+                               edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
+        ax.add_patch(panel)
+        ax.text(lx0 + pad_in, ly0 + lh_ - top_pad, "Price (EUR/MWh)",
+                transform=ax.transAxes, fontsize=6.0, fontweight='bold',
+                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
+        grad_y0 = ly0 + lh_ - top_pad - title_h - gap1 - grad_h
+        grad_ax = ax.inset_axes(
+            [lx0 + pad_in, grad_y0, lw_ - 2 * pad_in, grad_h],
+            transform=ax.transAxes)
+        # Inset axes default to zorder=5 -- BELOW the legend panel's own
+        # zorder=10 FancyBboxPatch, so without this the gradient image
+        # rendered fully hidden behind the (opaque, white) panel: the bar
+        # was there, just invisible, which is exactly what looked like "a
+        # blank white legend" with only the title/number labels showing.
+        # Confirmed both the bug and the fix with an isolated repro before
+        # touching this file. Must clear the panel's own zorder (10).
+        grad_ax.set_zorder(11)
+        grad_ax.imshow([[i / 255 for i in range(256)]], aspect='auto', cmap=cmap)
+        grad_ax.set_xticks([]); grad_ax.set_yticks([])
+        for spine in grad_ax.spines.values():
+            spine.set_visible(False)
+        minmax_y = grad_y0 - gap2
+        ax.text(lx0 + pad_in, minmax_y, f"{p_min:.0f}",
+                transform=ax.transAxes, fontsize=5.4, color=C_GEO_MUTED,
+                ha='left', va='top', zorder=11)
+        ax.text(lx0 + lw_ - pad_in, minmax_y, f"{p_max:.0f}",
+                transform=ax.transAxes, fontsize=5.4, color=C_GEO_MUTED,
+                ha='right', va='top', zorder=11)
+
+        swatch_rows = [
+            ("line", C_GEO_COUNTER, "Counter-intuitive flow"),
+            ("line", C_GEO_FLOW, "Other flow"),
+            ("box", C_GEO_NODATA, "No price data"),
+        ]
+        row_y = minmax_y - minmax_h - gap3
+        for kind, color, label in swatch_rows:
+            sx = lx0 + pad_in
+            if kind == "line":
+                ax.plot([sx, sx + 0.020], [row_y, row_y], color=color, lw=1.4,
+                        transform=ax.transAxes, zorder=11, solid_capstyle='round')
+            else:
+                ax.add_patch(FancyBboxPatch(
+                    (sx, row_y - 0.005), 0.018, 0.010,
+                    boxstyle="round,pad=0.001,rounding_size=0.002",
+                    transform=ax.transAxes, facecolor=color, edgecolor='none', zorder=11))
+            ax.text(sx + 0.028, row_y, label, transform=ax.transAxes, fontsize=5.4,
+                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+            row_y -= row_h
 
         # loc='left' -- see _draw_tab8_core_map's identical comment on why.
         # "European" rather than "Nordic + Core + Baltic" now that
