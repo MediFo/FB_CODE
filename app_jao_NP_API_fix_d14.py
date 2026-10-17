@@ -1260,6 +1260,7 @@ class App:
         self._setup_styles()
         self.today_str        = datetime.now().strftime('%Y-%m-%d')
         self.raw_filtered_data = []
+        self._last_analysis    = None  # set by _run_analysis; read by the Strategic Briefing sub-tab
 
         self._create_header()
 
@@ -2009,7 +2010,19 @@ class App:
         self._create_tab2_briefing(sub_briefing)
 
     # ------------------------------------------------------------------
-    #  TAB 2b – Strategic Briefing (UI shell; not yet implemented)
+    #  TAB 2b – Strategic Briefing
+    # ------------------------------------------------------------------
+    # Summarizes the Analysis sub-tab's (Tab 2a's) own most recent result
+    # set -- the same JAO-derived CNEC rows _run_analysis just built for
+    # the given date/time/corridor -- into a KPI row + short narrative.
+    # It does NOT read Tab 9 (Maintenance Analysis)'s outage-propagation
+    # results; that's a separate analysis (outage events vs. CNEC
+    # parameters over a date range) with its own tab, not a data source
+    # for this one. "Refresh" here re-reads self._last_analysis, the
+    # snapshot _run_analysis stores on every click of Tab 2a's own "Run
+    # Analysis" button -- so this sub-tab is only ever as current as the
+    # last Analysis run, which is why it's a manual Refresh rather than
+    # something that silently updates behind the user's back.
     # ------------------------------------------------------------------
     def _create_tab2_briefing(self, parent):
         toolbar = tk.Frame(parent, bg='#111113', height=46)
@@ -2022,51 +2035,176 @@ class App:
         self._brfg_export_btn = tk.Button(btn_frame, text="Export PDF",
                                           command=self._export_briefing_pdf)
         self._brfg_export_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self._brfg_kpis = {k: tk.StringVar(value="—") for k in
+                           ('corridor', 'mtu', 'n_active', 'total_imp', 'top_cnec',
+                            'top_sp', 'top_dptdf', 'top_impact', 'regime')}
+        kpi_frame = tk.Frame(parent, bg=C_PANEL, highlightbackground=C_BORDER,
+                             highlightthickness=1)
+        kpi_frame.pack(fill=tk.X, padx=12, pady=(12, 0))
+        kpi_labels = [
+            ('corridor',   'Corridor'),           ('mtu',        'MTU (CET)'),
+            ('regime',     'Congestion regime'),
+            ('n_active',   'Active CNECs'),        ('total_imp',  'Total price impact (€/MWh)'),
+            ('top_cnec',   'Top-impact CNEC'),
+            ('top_sp',     'Top CNEC shadow price'), ('top_dptdf', 'Top CNEC ΔPTDF'),
+            ('top_impact', 'Top CNEC price impact'),
+        ]
+        for i, (key, label) in enumerate(kpi_labels):
+            r, c = divmod(i, 3)
+            cell = tk.Frame(kpi_frame, bg=C_PANEL)
+            cell.grid(row=r, column=c, sticky='w', padx=14, pady=8)
+            tk.Label(cell, text=label, bg=C_PANEL, fg=C_MUTED,
+                     font=('Segoe UI', 8)).pack(anchor='w')
+            tk.Label(cell, textvariable=self._brfg_kpis[key], bg=C_PANEL, fg=C_TEXT,
+                     font=('Segoe UI', 10, 'bold')).pack(anchor='w')
+
         body = tk.Frame(parent, bg=C_SURFACE)
         body.pack(fill=tk.BOTH, expand=True)
         self._brfg_text = tk.Text(body, font=('Segoe UI', 9), state='disabled',
                                   wrap='word', padx=16, pady=16)
         self._brfg_text.pack(fill=tk.BOTH, expand=True)
-        self._brfg_kpis = {k: tk.StringVar() for k in
-                           ('corridor', 'mtu', 'n_active', 'total_imp', 'top_cnec',
-                            'top_sp', 'top_dptdf', 'top_impact', 'regime')}
         self._update_briefing_placeholder()
 
     def _update_briefing_placeholder(self):
+        for var in self._brfg_kpis.values():
+            var.set("—")
         self._brfg_text.config(state='normal')
         self._brfg_text.delete('1.0', 'end')
         self._brfg_text.insert('end',
-            "Strategic Briefing is not yet implemented in this build.\n\n"
-            "This sub-tab's UI is in place (KPI variables, refresh/export "
-            "buttons) but has no generation logic wired to it yet -- it "
-            "was a stub in the version this was ported from, and "
-            "building narrative-report generation from scratch is a new "
-            "feature rather than a fix, so it wasn't invented here.\n\n"
-            "Use the Analysis sub-tab, or Tab 9 (Maintenance Analysis), "
-            "for working analysis and reporting.")
+            "No briefing generated yet.\n\n"
+            "Run an analysis in the Analysis sub-tab (date/time/corridor, "
+            "\"Run Analysis\") first -- this briefing summarizes that same "
+            "JAO-derived result set. Then come back here and click "
+            "\"Refresh\".")
         self._brfg_text.config(state='disabled')
 
     def _refresh_briefing(self):
-        messagebox.showinfo(
-            "Not yet implemented",
-            "Strategic Briefing generation is not implemented in this build.\n\n"
-            "Use the Analysis sub-tab or Tab 9 (Maintenance Analysis) instead.")
+        snap = self._last_analysis
+        if not snap or not snap['rows']:
+            messagebox.showinfo(
+                "No analysis to summarize",
+                "Run an analysis in the Analysis sub-tab first (it needs "
+                "JAO data loaded in Tab 1, a date/time, and a zone-from/"
+                "zone-to corridor with at least one matching CNEC row), "
+                "then click Refresh here.")
+            self._update_briefing_placeholder()
+            return
 
-    def _update_briefing(self, *args):
-        self._update_briefing_placeholder()
+        rows = snap['rows']               # (cne, zf, zt, sp, pf, pt, impact), |impact| desc
+        corridor = f"{snap['zone_from']} → {snap['zone_to']}"
+        mtu = f"{snap['date']}  {snap['time']}"
+        # "Active" = binding this MTU: a CNEC's shadow price is exactly 0
+        # when non-binding and only positive when binding (see CLAUDE.md's
+        # own note on shadow price being zero-inflated, not continuous) --
+        # rows with a missing shadowPrice (sp is None) are excluded from
+        # this count rather than silently treated as non-binding.
+        active = [r for r in rows if r[3] is not None and r[3] > 0]
+        n_active, n_total = len(active), len(rows)
+        regime = "Congested" if n_active else ("Uncongested" if n_total else "n/a")
+
+        top = rows[0] if rows[0][6] is not None else next(
+            (r for r in rows if r[6] is not None), None)
+        if top is not None:
+            top_cne, _, _, top_sp, top_pf, top_pt, top_impact = top
+            top_dptdf = top_pf - top_pt
+        else:
+            top_cne, top_sp, top_dptdf, top_impact = "n/a", None, None, None
+
+        fmt = lambda v, suffix="": f"{v:.4f}{suffix}" if v is not None else "n/a"
+        self._brfg_kpis['corridor'].set(corridor)
+        self._brfg_kpis['mtu'].set(mtu)
+        self._brfg_kpis['n_active'].set(f"{n_active} / {n_total}")
+        self._brfg_kpis['total_imp'].set(fmt(snap['total_impact']))
+        self._brfg_kpis['top_cnec'].set(top_cne or "n/a")
+        self._brfg_kpis['top_sp'].set(fmt(top_sp))
+        self._brfg_kpis['top_dptdf'].set(fmt(top_dptdf))
+        self._brfg_kpis['top_impact'].set(fmt(top_impact))
+        self._brfg_kpis['regime'].set(regime)
+
+        lines = [
+            f"Strategic Briefing — {corridor}, {mtu} CET",
+            "",
+            f"{n_total} CNEC(s) evaluated for this corridor/MTU from the JAO "
+            f"data loaded in Tab 1; {n_active} show a positive shadow price "
+            f"(binding this MTU) -- regime: {regime}.",
+            f"Total price impact across all evaluated CNECs: {fmt(snap['total_impact'])} €/MWh.",
+        ]
+        if snap['n_missing']:
+            lines.append(
+                f"⚠ {snap['n_missing']} row(s) had a missing shadowPrice/PTDF field "
+                f"this MTU and were excluded from the total above (not treated as zero).")
+        lines.append("")
+        if top is not None:
+            lines.append(
+                f"Largest single price impact: {top_cne}, shadow price "
+                f"{fmt(top_sp)} €/MWh, ΔPTDF ({snap['zone_from']}−{snap['zone_to']}) "
+                f"{fmt(top_dptdf)}, price impact {fmt(top_impact)} €/MWh.")
+        else:
+            lines.append("No CNEC row this MTU has a complete shadowPrice/PTDF/impact "
+                          "figure to report as the top impact.")
+        lines.append("")
+        lines.append("Next 5 by |price impact|:")
+        shown = 0
+        for cne, zf, zt, sp, pf, pt, impact in rows[1:]:
+            if impact is None:
+                continue
+            lines.append(f"  • {cne}: shadow price {fmt(sp)} €/MWh, "
+                         f"ΔPTDF {fmt(pf - pt)}, price impact {fmt(impact)} €/MWh")
+            shown += 1
+            if shown >= 5:
+                break
+        if shown == 0:
+            lines.append("  (none -- the top CNEC above is the only row with a "
+                         "complete figure this MTU)")
+
+        self._brfg_text.config(state='normal')
+        self._brfg_text.delete('1.0', 'end')
+        self._brfg_text.insert('end', "\n".join(lines))
+        self._brfg_text.config(state='disabled')
 
     def _export_briefing_pdf(self):
         if not REPORTLAB_OK:
             messagebox.showerror(
                 "reportlab not installed",
                 "PDF export requires the 'reportlab' package "
-                "(pip install reportlab), and Strategic Briefing "
-                "generation itself is not yet implemented in this build.")
+                "(pip install reportlab).")
             return
-        messagebox.showinfo(
-            "Not yet implemented",
-            "Strategic Briefing PDF export is not implemented in this "
-            "build -- there is no briefing content generated yet to export.")
+        snap = self._last_analysis
+        if not snap or not snap['rows']:
+            messagebox.showinfo(
+                "Nothing to export",
+                "No briefing has been generated yet -- run an analysis in "
+                "the Analysis sub-tab, then click Refresh here, before "
+                "exporting.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf", filetypes=[("PDF file", "*.pdf")],
+            initialfile=f"strategic_briefing_{snap['date']}_{snap['time'].replace(':', '')}.pdf")
+        if not path:
+            return
+        try:
+            import xml.sax.saxutils as _saxutils
+            styles = getSampleStyleSheet()
+            doc = SimpleDocTemplate(path, pagesize=A4)
+            story = [Paragraph("Strategic Briefing", styles['Title']), Spacer(1, 10)]
+            for line in self._brfg_text.get('1.0', 'end').strip('\n').split('\n'):
+                # Paragraph parses its text as a small XML-like markup, so
+                # escape &/</> first (a CNEC name/zone code is never
+                # expected to contain these, but nothing stops one from
+                # someday including one). Separately, swap "⚠" for plain
+                # "[!]" -- confirmed via a rendered test PDF that reportlab's
+                # base Helvetica font has no glyph for U+26A0 and silently
+                # draws a black tofu box instead of erroring, so this isn't
+                # optional cosmetic polish, it's a genuinely unreadable
+                # warning marker otherwise.
+                safe = _saxutils.escape(line).replace("⚠", "[!]")
+                story.append(Paragraph(safe if safe.strip() else "&nbsp;", styles['Normal']))
+                story.append(Spacer(1, 4))
+            doc.build(story)
+            messagebox.showinfo("Exported", f"Briefing exported to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
 
     # ------------------------------------------------------------------
     #  TAB 3 – Shadow / RAM
@@ -2802,6 +2940,18 @@ class App:
             status += f"  |  ⚠ {n_missing} row(s) excluded from total: missing data"
         self._set_status(status)
         self._refresh_cnec_selector()
+
+        # Snapshot this run for the Strategic Briefing sub-tab (below) --
+        # it summarizes THIS result set (same JAO-derived rows this tab
+        # just built: cneName/zoneFrom/zoneTo/shadowPrice/ptdf/impact),
+        # not a separate fetch or Tab 9's maintenance-outage analysis.
+        # `rows` is already sorted by |impact| descending, so rows[0] is
+        # the top-impact CNEC the briefing reports.
+        self._last_analysis = {
+            'rows': rows, 'date': d_str, 'time': t_str,
+            'zone_from': z_f, 'zone_to': z_t,
+            'total_impact': total, 'n_missing': n_missing,
+        }
 
     def _show_all_histories(self):
         cnec = self._get_selected_cnec()
