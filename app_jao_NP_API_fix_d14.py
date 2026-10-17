@@ -208,11 +208,20 @@ CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#8B8B93', '#5252
 # deliberately separate palette from the C_BG/C_TEXT tokens above (not a
 # reuse of them), so a future change to either can't accidentally bleed
 # into the other.
-C_GEO_BG       = '#FFFFFF'   # page/figure background
-C_GEO_UNCOVERED = '#EDEDEF'  # a zone this app doesn't track -- background
+C_GEO_BG       = '#EAF2F8'   # page/figure background -- a pale "sea" blue,
+                              # not flat white, so the water reads as
+                              # water rather than as more undifferentiated
+                              # page behind the landmass (plain white was
+                              # visually flat -- no depth cue separating
+                              # "no data here" land from "there's no land
+                              # here at all")
+C_GEO_UNCOVERED = '#E4E4E7'  # a zone this app doesn't track -- background
                               # context only, never priced ("Regions not
-                              # covered" in VoltPath's own legend)
-C_GEO_NODATA   = '#B8B8C0'   # a TRACKED zone with no price THIS slot --
+                              # covered" in VoltPath's own legend). Kept
+                              # neutral gray (not blue-tinted) specifically
+                              # so it reads as distinct "land" against the
+                              # new blue C_GEO_BG "sea"
+C_GEO_NODATA   = '#AEAEB7'   # a TRACKED zone with no price THIS slot --
                               # a visibly bigger step down from
                               # C_GEO_UNCOVERED than an earlier version of
                               # this token (#D2D2D7) -- the two read as
@@ -222,7 +231,10 @@ C_GEO_NODATA   = '#B8B8C0'   # a TRACKED zone with no price THIS slot --
                               # the "lighter background, missing right now"
                               # vs "not covered at all" distinction from
                               # before, just with more contrast between them.
-C_GEO_BORDER   = '#B8B8BE'   # zone outline stroke
+C_GEO_BORDER   = '#FFFFFF'   # zone outline stroke -- white "cut-paper"
+                              # gaps between adjacent zones read cleaner
+                              # than a gray hairline, especially now that
+                              # turbo's saturated colors sit edge-to-edge
 C_GEO_TEXT     = '#1A1A1E'   # dark text on the light background
 C_GEO_MUTED    = '#6B6B73'
 C_GEO_PANEL    = '#FFFFFF'   # legend panel fill
@@ -4239,7 +4251,7 @@ class App:
               f"{len(entsoe_prices)} from ENTSO-E, {len(all_prices)} combined.")
 
         if not all_prices:
-            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
+            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None, None,
                             date_str, mtu_label,
                             "Could not fetch any price data (Nord Pool or ENTSO-E).")
             return
@@ -4278,8 +4290,22 @@ class App:
         net_flows.update(entsoe_net_flows)
         cross_flows = dict(np_cross_flows)
         cross_flows.update(entsoe_cross_flows)
+
+        # Core-internal and Baltic-internal flows (AT<->CZ, CZ<->SK, ...,
+        # EE<->LV, LV<->LT): Nord Pool's own report NEVER carried these --
+        # no source existed for them at all before ENTSO-E became
+        # available, so the Whole tab used to show these borders as a
+        # plain reference line with no arrow (or, after the real-
+        # geography rewrite, nothing at all -- adjacent zone shapes just
+        # visually touch). Verified live that ENTSO-E's
+        # query_crossborder_flows covers this topology too (AT<->CZ,
+        # CZ<->SK, SK<->HU, HU<->HR, AT<->SI all confirmed), so these are
+        # now real flow arrows, not a visual gap.
+        internal_flows = _fetch_entsoe_flows_parallel(
+            CORE_CONNECTIONS + BALTIC_CONNECTIONS, date_str, mtu_label, _diag)
         _diag(f"[WHOLE] flows: {len(net_flows)} Nordic-internal, {len(cross_flows)} "
-              f"cross-region ({len(entsoe_net_flows) + len(entsoe_cross_flows)} from ENTSO-E).")
+              f"cross-region ({len(entsoe_net_flows) + len(entsoe_cross_flows)} from ENTSO-E), "
+              f"{len(internal_flows)} Core/Baltic-internal (ENTSO-E only).")
 
         # A zone with no price from EITHER source this slot -- genuinely
         # covered by neither, not the old, narrower "wasn't on Nord
@@ -4289,9 +4315,9 @@ class App:
         missing = [z for z in WHOLE_ALL_ZONES if z not in all_prices]
 
         self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
-                        missing, date_str, mtu_label, None)
+                        internal_flows, missing, date_str, mtu_label, None)
 
-    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, missing_cb,
+    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, internal_flows, missing_cb,
                                date_str, mtu_label, error):
         self._t8w_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         if error:
@@ -4299,7 +4325,7 @@ class App:
             messagebox.showerror("Whole Map", error)
             return
         self._draw_tab8_whole_map(prices or {}, net_flows or {}, cross_flows or {},
-                                  f"{date_str} {mtu_label}")
+                                  internal_flows or {}, f"{date_str} {mtu_label}")
         self.canvas8w.draw()
         self._add_toolbar(self.canvas8w, self.toolbar_f8w)
         n_na = len(missing_cb or [])
@@ -4307,7 +4333,7 @@ class App:
             text=f"Done. {n_na} zone(s) have no price from Nord Pool or ENTSO-E this slot." if n_na else "Done.",
             foreground=C_MUTED)
 
-    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, slot_label):
+    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, internal_flows, slot_label):
         """Real-geography choropleth, styled after VoltPath's own Nordic+
         Core+Baltic "Flows & prices" dashboard view (dark theme, zones
         filled by their own real shape and shaded by price, thin flow
@@ -4352,7 +4378,7 @@ class App:
             else:
                 fc = cmap((prices[zone] - p_min) / p_span)
             patch = PathPatch(path, facecolor=fc, edgecolor=C_GEO_BORDER,
-                              linewidth=0.5, zorder=2)
+                              linewidth=0.7, zorder=2)
             ax.add_patch(patch)
             if tracked:
                 label_points[zone] = zinfo["label_point"]
@@ -4368,10 +4394,11 @@ class App:
         # looks visibly stretched east-west at Nordic latitudes.
         ax.set_aspect(1.0 / max(math.cos(math.radians(mean_lat)), 0.1))
 
-        # ── Zone labels: plain text over the shape itself, no box -- a
-        # thin dark stroke keeps it legible over both a light (orange/
-        # yellow, high price) and a dark (blue, low price) fill. ────────
-        label_stroke = [mpl_patheffects.withStroke(linewidth=1.8, foreground='#FFFFFFCC')]
+        # ── Zone labels: a small rounded white chip behind the text,
+        # not just a stroke/halo -- reads cleanly against turbo's full
+        # saturated range (a text-only halo, the previous approach,
+        # still thinned out over the colormap's darkest and lightest
+        # ends; a solid chip doesn't depend on the fill color at all). ──
         for zone, (lx, ly) in label_points.items():
             price = prices.get(zone)
             if price is None:
@@ -4380,10 +4407,16 @@ class App:
                 label = f"{zone}\n{price:.1f}"
             ax.text(lx, ly, label, ha='center', va='center', fontsize=5.6,
                     fontweight='bold', color=C_GEO_TEXT, zorder=5,
-                    path_effects=label_stroke)
+                    bbox=dict(boxstyle='round,pad=0.28,rounding_size=0.4',
+                             facecolor='#FFFFFF', edgecolor=C_GEO_MUTED,
+                             linewidth=0.4, alpha=0.9))
 
-        # ── Flow arrows: Nordic-internal + cross-region (both real) ─────
-        all_flow_mags = [abs(v) for v in net_flows.values()] + [abs(v) for v in cross_flows.values()]
+        # ── Flow arrows: Nordic-internal + cross-region + Core/Baltic-
+        # internal (all real, all via ENTSO-E, see _fetch_tab8_whole_
+        # thread's own comment on internal_flows). ───────────────────────
+        all_flow_mags = ([abs(v) for v in net_flows.values()]
+                         + [abs(v) for v in cross_flows.values()]
+                         + [abs(v) for v in internal_flows.values()])
         max_flow = max(all_flow_mags, default=1) or 1
         pad = (x1 - x0) * 0.012
 
@@ -4407,6 +4440,8 @@ class App:
             _draw_flow_arrow(A, B, mw)
         for (A, B), mw in cross_flows.items():
             _draw_flow_arrow(A, B, mw)
+        for (A, B), mw in internal_flows.items():
+            _draw_flow_arrow(A, B, mw)
 
         ax.axis('off')
 
@@ -4419,10 +4454,20 @@ class App:
         # real data zone regardless of which zones are present this slot.
         lw_, lh_ = 0.30, 0.205
         lx0, ly0 = 1 - 0.015 - lw_, 0.025
+        # Soft drop shadow -- a second, slightly offset panel in a muted
+        # dark tone behind the real one, zorder just below it. C_GEO_BORDER
+        # is white now (see its own comment, for the zone-outline look),
+        # so the panel's own edge uses C_GEO_MUTED instead -- a white
+        # border on a white panel would be invisible.
+        shadow = FancyBboxPatch((lx0 + 0.005, ly0 - 0.005), lw_, lh_,
+                                boxstyle="round,pad=0.006,rounding_size=0.012",
+                                transform=ax.transAxes, facecolor='#00000020',
+                                edgecolor='none', zorder=9)
+        ax.add_patch(shadow)
         panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
                                boxstyle="round,pad=0.006,rounding_size=0.012",
                                transform=ax.transAxes, facecolor=C_GEO_PANEL,
-                               edgecolor=C_GEO_BORDER, linewidth=0.8, zorder=10)
+                               edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
         ax.add_patch(panel)
         pad_in = 0.014
         ax.text(lx0 + pad_in, ly0 + lh_ - 0.024, "Price (EUR/MWh)",
