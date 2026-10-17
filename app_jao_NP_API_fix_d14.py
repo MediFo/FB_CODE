@@ -202,27 +202,35 @@ FONT_MONO_SM  = ('Consolas', 9)
 
 CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#8B8B93', '#52525B']
 
-# Dark theme for the Whole tab's real-geography choropleth ONLY (styled
-# after VoltPath's own dashboard -- see _draw_tab8_whole_map's own
-# comment) -- every other tab/chart in this app stays on the light theme
-# above; this is a deliberately separate palette, not a reskin of C_BG
-# etc., so it can't accidentally bleed into any other chart.
-C_GEO_BG       = '#0B0C10'   # page/figure background
-C_GEO_UNCOVERED = '#1C1F26'  # a zone this app doesn't track -- background
+# Light theme for the Whole tab's real-geography choropleth ONLY --
+# matches this app's own current (light) background rather than
+# VoltPath's dark reference, per explicit request; this is still a
+# deliberately separate palette from the C_BG/C_TEXT tokens above (not a
+# reuse of them), so a future change to either can't accidentally bleed
+# into the other.
+C_GEO_BG       = '#FFFFFF'   # page/figure background
+C_GEO_UNCOVERED = '#EDEDEF'  # a zone this app doesn't track -- background
                               # context only, never priced ("Regions not
                               # covered" in VoltPath's own legend)
-C_GEO_NODATA   = '#30343D'   # a TRACKED zone with no price THIS slot --
-                              # lighter than C_GEO_UNCOVERED so it reads as
-                              # "normally covered, just missing right now"
-                              # rather than "not covered at all"
-C_GEO_BORDER   = '#3A3E48'   # zone outline stroke
-C_GEO_TEXT     = '#F2F2F2'
-C_GEO_MUTED    = '#9AA0AC'
-C_GEO_PANEL    = '#15171C'   # legend panel fill
-C_GEO_FLOW     = '#D8DADF'   # "normal" flow arrow (VoltPath's own map
-                              # uses a near-white/gray for this, not this
-                              # app's usual green/primary accent)
-C_GEO_COUNTER  = '#E2432F'   # counter-intuitive flow arrow
+C_GEO_NODATA   = '#B8B8C0'   # a TRACKED zone with no price THIS slot --
+                              # a visibly bigger step down from
+                              # C_GEO_UNCOVERED than an earlier version of
+                              # this token (#D2D2D7) -- the two read as
+                              # near-identical light grays side by side in
+                              # the legend at that gap, confirmed by
+                              # rendering, not just reasoned about. Still
+                              # the "lighter background, missing right now"
+                              # vs "not covered at all" distinction from
+                              # before, just with more contrast between them.
+C_GEO_BORDER   = '#B8B8BE'   # zone outline stroke
+C_GEO_TEXT     = '#1A1A1E'   # dark text on the light background
+C_GEO_MUTED    = '#6B6B73'
+C_GEO_PANEL    = '#FFFFFF'   # legend panel fill
+C_GEO_FLOW     = '#52525B'   # "normal" flow arrow -- a neutral dark gray
+                              # that reads clearly against a white/light
+                              # background (VoltPath's own near-white
+                              # arrow was specifically for ITS dark bg)
+C_GEO_COUNTER  = '#DC2626'   # counter-intuitive flow arrow
 
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
@@ -597,34 +605,37 @@ PRICE_GEO_VMAX = 200.0
 
 @functools.lru_cache(maxsize=1)
 def _price_geo_cmap():
-    """Blue (low) -> cyan -> yellow -> orange -> red (high) sequential
-    colormap for the Whole tab's real-geography price choropleth --
-    approximates VoltPath's own dashboard colour scale (dark blue/violet
-    at the low end through red at the high end). A visual reference match
-    from a screenshot, not a claim of pixel-identical hex values. The
-    "#f5d76e" yellow stop is a deliberate bridge, not decoration: cyan and
-    orange are near-complementary, so a straight cyan->orange
-    interpolation (an earlier version of this colormap) desaturates
-    toward a muddy gray-olive in the middle of the scale -- visibly wrong
-    on, e.g., DK1/DK2 at a mid-range price sitting right in that band.
-    Routing through yellow keeps every step of the gradient looking like
-    a step along blue->warm rather than through gray. lru_cache(1) instead
-    of a hand-rolled global -- this is a zero-argument function with a
-    fixed stop list, no "retry if the input later changes" nuance to
-    preserve (unlike _load_bidding_zone_geo's own manual cache above,
-    kept manual specifically because it DOES retry if a missing file
-    later appears)."""
-    return mpl.colors.LinearSegmentedColormap.from_list(
-        "voltpath_price",
-        ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
+    """Blue (low) -> cyan -> green -> yellow -> orange -> red (high)
+    sequential colormap for the Whole tab's real-geography price
+    choropleth -- matplotlib's built-in 'turbo', not a hand-rolled
+    LinearSegmentedColormap. Two earlier hand-rolled attempts both hit
+    the same class of bug: a straight 2-stop RGB interpolation between
+    near-complementary hues (first cyan->orange, then -- after adding a
+    yellow "bridge" stop to fix THAT -- cyan->yellow) desaturates toward
+    a muddy gray/olive in the middle of each transition, confirmed
+    visibly wrong both times (DK1/DK2 the first time, AT/SI/HR the
+    second, each sitting right in the newly-muddy band). 'turbo' is
+    purpose-built to avoid exactly this (confirmed: no muddy band at any
+    sampled point across its range), so it replaces the hand-rolled
+    approach entirely rather than risking a third muddy transition
+    somewhere else in the scale. lru_cache(1) is a formality here (turbo
+    is already a singleton colormap object), kept only for a consistent
+    "cached colormap accessor" shape with the rest of this section."""
+    return mpl.colormaps['turbo']
 
 # ----------------------------------------------------------------------
-#  ENTSO-E PRICE FALLBACK — Whole tab only, for zones Nord Pool doesn't
-#  reach: Spain (never on any Nord Pool subscription's zone list -- it's
-#  outside Core CCR entirely) and whichever Core/Baltic zones this
-#  account's own Nord Pool access doesn't currently cover (see
-#  _KNOWN_INACCESSIBLE_CORE_ZONES above).
+#  ENTSO-E — Whole tab's PRIMARY price/flow source, Nord Pool as fallback
 # ----------------------------------------------------------------------
+# ENTSO-E covers every zone this tab tracks (Nordic, Core CCR, Baltic,
+# and Spain -- which Nord Pool structurally never will, since Spain isn't
+# part of Core CCR) from one Transparency Platform account, so it's used
+# as the MAIN source for the Whole tab specifically; Nord Pool's own
+# bulk-request fetch (still run in full, see _fetch_tab8_whole_thread)
+# is kept as the fallback layer for whichever zone/slot ENTSO-E itself
+# doesn't resolve, by merging ENTSO-E's results OVER Nord Pool's (a later
+# dict update wins). This is a Whole-tab-only choice -- the Core tab
+# (_draw_tab8_core_map) stays Nord-Pool-primary, unchanged.
+#
 # Same account's token as propagation.py's own ENTSOE_TOKEN constant --
 # duplicated here, not imported, same "independent copy" reasoning as
 # NORDPOOL_USER/NORDPOOL_PASSWORD above (avoids pulling propagation.py's
@@ -633,27 +644,48 @@ def _price_geo_cmap():
 # credentials already are).
 ENTSOE_TOKEN = "3c9307bd-c6e8-4f0c-99de-f9d754ff6488"
 
-# This app's own zone code -> entsoe-py's day-ahead-price area code.
-# Verified LIVE (2026-02-03) against ENTSO-E's Transparency Platform:
-# every one of these returned real day-ahead price data. Germany is
-# "DE_LU" here (the merged German-Luxembourg price zone), not "GER" or
-# "DE" -- a different code than either this app's own CORE_ZONES value
-# or ENTSO-E's plain country code, confirmed live rather than assumed.
-ENTSOE_PRICE_AREA = {
-    "ES": "ES",
+# This app's own zone code -> entsoe-py's Area code (used for BOTH day-
+# ahead prices and cross-border flows). Verified LIVE (2026-02-03)
+# against ENTSO-E's Transparency Platform -- every one of these returned
+# real data for both query types. Two things to note, confirmed live
+# rather than assumed: Germany is "DE_LU" (the merged German-Luxembourg
+# price zone), not "GER" or "DE"; every Nordic zone needs an underscore
+# ("NO_1", not "NO1" -- this app's own NORDIC_ZONES/CORE_ZONES/
+# BALTIC_ZONES values are NOT valid entsoe-py codes as-is, unlike the
+# single-zone countries where they happen to coincide).
+ENTSOE_AREA_CODE = {
+    "NO1": "NO_1", "NO2": "NO_2", "NO3": "NO_3", "NO4": "NO_4", "NO5": "NO_5",
+    "SE1": "SE_1", "SE2": "SE_2", "SE3": "SE_3", "SE4": "SE_4",
+    "DK1": "DK_1", "DK2": "DK_2", "FI": "FI",
+    "EE": "EE", "LV": "LV", "LT": "LT",
     "AT": "AT", "BE": "BE", "CZ": "CZ", "GER": "DE_LU", "FR": "FR",
     "HR": "HR", "HU": "HU", "NL": "NL", "PL": "PL", "RO": "RO",
     "SI": "SI", "SK": "SK",
-    "EE": "EE", "LV": "LV", "LT": "LT",
+    "ES": "ES",
 }
 
 # Zones the Whole tab's real-geography map tracks beyond Nordic/Core CCR/
-# Baltic -- currently just Spain. Priced via ENTSO-E only (never Nord
-# Pool, see above); NOT added to CORE_ZONES itself, since Spain isn't
-# part of Core CCR and the Core tab's own schematic layout/hub-and-spoke
-# topology (CORE_CONNECTIONS) is specifically a Core CCR concept that
-# this zone shouldn't leak into.
+# Baltic -- currently just Spain. NOT added to CORE_ZONES itself, since
+# Spain isn't part of Core CCR and the Core tab's own schematic layout/
+# hub-and-spoke topology (CORE_CONNECTIONS) is specifically a Core CCR
+# concept that this zone shouldn't leak into.
 WHOLE_EXTRA_ZONES = ["ES"]
+
+# Every zone the Whole tab's own price/flow fetch covers, in one place --
+# used to build the ENTSO-E fetch target list and to compute `missing`
+# (see _fetch_tab8_whole_thread).
+WHOLE_ALL_ZONES = NORDIC_ZONES + CORE_ZONES + BALTIC_ZONES + WHOLE_EXTRA_ZONES
+
+# Fallback cross-region border list, used only when Nord Pool itself is
+# unreachable (no token) and so can't dynamically discover which
+# Nordic<->Core/Baltic interconnectors exist this slot (see
+# _fetch_tab8_whole_thread) -- a short, hand-curated list of the real,
+# well-known interconnectors, not exhaustive, just enough that ENTSO-E
+# cross-region flows still have SOME border list to work from in that
+# degraded case.
+WHOLE_KNOWN_CROSS_BORDERS = [
+    ("DK1", "GER"), ("SE4", "GER"), ("FI", "EE"), ("SE4", "LT"), ("SE4", "PL"),
+]
 
 
 def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
@@ -662,12 +694,13 @@ def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
     actually runs -- this file is otherwise deliberately pandas-free
     (see _CET's own comment above) and entsoe-py is an optional
     dependency (requirements.txt), so a caller with neither installed
-    still gets every OTHER Whole-tab feature; this one fallback source
-    just doesn't fire. Returns None (never raises) on any failure --
-    missing library, auth failure, no data for the window, or a zone
-    whose local calendar day doesn't start at CET midnight -- so the
-    caller can treat it exactly like "Nord Pool didn't have it either"
-    rather than crashing the fetch thread.
+    still gets every OTHER Whole-tab feature; ENTSO-E just doesn't fire
+    and Nord Pool's own fetch (still run regardless) is all the Whole tab
+    has. Returns None (never raises) on any failure -- missing library,
+    auth failure, no data for the window, or a zone whose local calendar
+    day doesn't start at CET midnight -- so the caller can fall back to
+    Nord Pool's own value for that zone rather than crashing the fetch
+    thread or leaving a gap neither source filled.
 
     Requests a window centered on the target MTU rather than exactly
     that CET calendar day: several of these zones (the Baltics, Romania)
@@ -677,7 +710,7 @@ def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
     try:
         from entsoe import EntsoePandasClient
     except ImportError:
-        _diag(f"[ENTSOE] entsoe-py not installed -- skipping {entsoe_area} price fallback")
+        _diag(f"[ENTSOE] entsoe-py not installed -- skipping {entsoe_area} price fetch")
         return None
     try:
         import pandas as pd
@@ -697,6 +730,96 @@ def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
     except Exception as e:
         _diag(f"[ENTSOE] price fetch failed for {entsoe_area} ({date_str} {mtu_label}): {e}")
         return None
+
+
+def _fetch_entsoe_flow_at_mtu(area_a, area_b, date_str, mtu_label, _diag):
+    """One border pair's net scheduled physical flow at one MTU slot
+    (positive = A exporting to B), via ENTSO-E's cross-border-flow
+    endpoint. Queries BOTH directions and nets them (A->B minus B->A) --
+    confirmed live that query_crossborder_flows(X, Y) reports 0 for any
+    slot where the flow isn't actually going X->Y that slot (not a
+    missing-data ambiguity), the same "query both sides, net them"
+    pattern this file's own Nord Pool net_flows/cross_flows computation
+    already uses for exactly that reason. Returns None (never raises) on
+    any failure, same posture as _fetch_entsoe_price_at_mtu."""
+    try:
+        from entsoe import EntsoePandasClient
+    except ImportError:
+        return None
+    try:
+        import pandas as pd
+        target = pd.Timestamp(f"{date_str} {mtu_label}", tz=_CET_ZONE_NAME)
+        client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
+        window = dict(start=target - pd.Timedelta(hours=26), end=target + pd.Timedelta(hours=26))
+        s_ab = client.query_crossborder_flows(area_a, area_b, **window)
+        s_ba = client.query_crossborder_flows(area_b, area_a, **window)
+
+        def _at(s):
+            idx = s.index[s.index <= target]
+            return float(s.loc[idx[-1]]) if len(idx) else 0.0
+
+        return _at(s_ab) - _at(s_ba)
+    except Exception as e:
+        _diag(f"[ENTSOE] flow fetch failed for {area_a}<->{area_b} ({date_str} {mtu_label}): {e}")
+        return None
+
+
+def _fetch_entsoe_prices_parallel(zones, date_str, mtu_label, _diag, max_workers=10):
+    """Fetches day-ahead prices for many zones CONCURRENTLY -- ENTSO-E has
+    no bulk/multi-zone price endpoint (unlike Nord Pool's one combined
+    request for every Core/Baltic zone together), so the Whole tab's full
+    ~28-zone target list would mean ~28 sequential round-trips (tens of
+    seconds of pure wait) without this. Returns {app_zone_code: price},
+    silently omitting any zone that isn't in ENTSOE_AREA_CODE or whose
+    fetch failed -- the caller treats an omitted zone exactly like Nord
+    Pool not having it either (falls back, or shows "Data not available"
+    if neither source does)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = {z: ENTSOE_AREA_CODE[z] for z in zones if z in ENTSOE_AREA_CODE}
+    if not targets:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch_entsoe_price_at_mtu, area, date_str, mtu_label, _diag): zone
+                  for zone, area in targets.items()}
+        for fut in as_completed(futures):
+            zone = futures[fut]
+            try:
+                price = fut.result()
+            except Exception as e:
+                _diag(f"[ENTSOE] price worker error for {zone}: {e}")
+                price = None
+            if price is not None:
+                results[zone] = price
+    return results
+
+
+def _fetch_entsoe_flows_parallel(pairs, date_str, mtu_label, _diag, max_workers=10):
+    """Fetches net scheduled flow for many border pairs CONCURRENTLY --
+    see _fetch_entsoe_prices_parallel's own comment on why a thread pool
+    beats a serial loop here (each pair costs 2 ENTSO-E requests, see
+    _fetch_entsoe_flow_at_mtu). `pairs` is an iterable of (zoneA, zoneB)
+    in this app's own zone codes; returns {(zoneA, zoneB): net_mw},
+    omitting any pair with an unmapped zone or a failed fetch."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = {(a, b): (ENTSOE_AREA_CODE[a], ENTSOE_AREA_CODE[b])
+              for a, b in pairs if a in ENTSOE_AREA_CODE and b in ENTSOE_AREA_CODE}
+    if not targets:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch_entsoe_flow_at_mtu, area_a, area_b, date_str, mtu_label, _diag): pair
+                  for pair, (area_a, area_b) in targets.items()}
+        for fut in as_completed(futures):
+            pair = futures[fut]
+            try:
+                mw = fut.result()
+            except Exception as e:
+                _diag(f"[ENTSOE] flow worker error for {pair}: {e}")
+                mw = None
+            if mw is not None:
+                results[pair] = mw
+    return results
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -4020,16 +4143,16 @@ class App:
         ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
                   text=("Real-geography choropleth (zone shapes from a local "
                         "electricitymaps-contrib extract, AGPLv3 -- see "
-                        "BIDDING_ZONE_GEOJSON_PATH's own comment), styled after "
-                        "VoltPath's own flows-and-prices dashboard view. Nordic-internal "
-                        "and Nordic↔Core/Baltic flow arrows are real (the latter sourced "
-                        "from the Nordic zones' OWN flow reports -- the only place this "
-                        "API publishes them); Core-internal and Baltic-internal borders "
-                        "show no arrow, just the real shared border, since neither side's "
-                        "own report publishes that flow. \"Data not available\" (lighter "
-                        "gray) is a zone this app tracks but with no price this slot; "
-                        "\"Regions not covered\" (darker gray) is background context only, "
-                        "never priced.")
+                        "BIDDING_ZONE_GEOJSON_PATH's own comment). ENTSO-E is the PRIMARY "
+                        "price/flow source for every zone shown here (Nordic, Core CCR, "
+                        "Baltic, and Spain, which Nord Pool never reaches), fetched in "
+                        "parallel per zone/border; Nord Pool's own combined-request fetch "
+                        "runs too and fills in anywhere ENTSO-E itself didn't resolve this "
+                        "slot. Core-internal and Baltic-internal borders with no known "
+                        "interconnector still show no arrow, just the real shared border. "
+                        "\"Data not available\" (darker gray) is a zone this app tracks but "
+                        "with no price from either source this slot; \"Regions not covered\" "
+                        "(lighter gray) is background context only, never priced.")
                   ).pack(fill=tk.X, pady=(0, 6))
 
         self.toolbar_f8w = ttk.Frame(main, style='Card.TFrame')
@@ -4072,88 +4195,99 @@ class App:
     def _fetch_tab8_whole_thread(self, date_str, mtu_label):
         def _diag(msg):
             self.root.after(0, self._t8w_log, msg)
+
+        # Nord Pool is the FALLBACK layer for the Whole tab now (see the
+        # ENTSO-E section's own comment on why ENTSO-E is primary here) --
+        # its own token/access failures are no longer fatal to this
+        # fetch, just a reason to skip straight to ENTSO-E-only data.
+        nordic_prices, nordic_flows_raw = {}, {}
+        cb_prices_at_mtu = {}
         token = get_np_access_token()
         if not token:
-            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
-                            date_str, mtu_label,
-                            "AUTH FAILED: could not obtain NordPool access token.")
-            return
-        hdrs = self._np_headers(token)
+            _diag("[WHOLE] Nord Pool auth failed -- continuing with ENTSO-E only.")
+        else:
+            hdrs = self._np_headers(token)
+            nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
+            nordic_prices, nordic_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
+                date_str, hdrs, nordic_areas_params, _diag)
+            if price_err:
+                _diag(f"[WHOLE] Nordic price error: {price_err}")
+            if flow_err:
+                _diag(f"[WHOLE] Nordic flow error: {flow_err}")
 
-        nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
-        nordic_prices, nordic_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
-            date_str, hdrs, nordic_areas_params, _diag)
-        if price_err:
-            _diag(f"[WHOLE] Nordic price error: {price_err}")
-        if flow_err:
-            _diag(f"[WHOLE] Nordic flow error: {flow_err}")
-
-        core_baltic_zones = CORE_ZONES + BALTIC_ZONES
-        price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
-        r, accessible, missing = _np_request_with_access_fallback(
-            NP_PRICE_URL, core_baltic_zones, price_params, hdrs, _diag)
-        cb_prices_at_mtu = (_parse_np_prices_at_mtu(r.json(), core_baltic_zones, date_str, mtu_label)
-                           if r is not None else {})
+            core_baltic_zones = CORE_ZONES + BALTIC_ZONES
+            price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
+            r, accessible, np_missing = _np_request_with_access_fallback(
+                NP_PRICE_URL, core_baltic_zones, price_params, hdrs, _diag)
+            cb_prices_at_mtu = (_parse_np_prices_at_mtu(r.json(), core_baltic_zones, date_str, mtu_label)
+                               if r is not None else {})
 
         nordic_prices_at_mtu = nordic_prices.get(mtu_label, {})
-        all_prices = dict(nordic_prices_at_mtu)
-        all_prices.update(cb_prices_at_mtu)
+        nordpool_prices = dict(nordic_prices_at_mtu)
+        nordpool_prices.update(cb_prices_at_mtu)
 
-        # ENTSO-E fallback: Spain (WHOLE_EXTRA_ZONES, never on Nord Pool's
-        # own zone list at all) always gets tried here; any Core/Baltic
-        # zone this account's Nord Pool access doesn't currently reach
-        # (`missing`) gets a second shot too, rather than staying dark
-        # "Regions not covered" when a perfectly real price is available
-        # from a different source. A zone that fills in here is dropped
-        # from `missing` -- it's genuinely covered now, not merely
-        # "accessible but no price this slot" (which stays the lighter
-        # "Data not available" shade, a real and different state). Run
-        # BEFORE the "got nothing at all" guard below, so a Nord Pool
-        # outage that takes out both Nordic and Core/Baltic can still be
-        # saved by Spain (or a recovered Core zone) alone rather than
-        # hard-erroring with real data sitting right there.
-        entsoe_fallback_zones = [z for z in missing if z in ENTSOE_PRICE_AREA] + WHOLE_EXTRA_ZONES
-        filled_via_entsoe = []
-        for zone in entsoe_fallback_zones:
-            price = _fetch_entsoe_price_at_mtu(
-                ENTSOE_PRICE_AREA[zone], date_str, mtu_label, _diag)
-            if price is not None:
-                all_prices[zone] = price
-                filled_via_entsoe.append(zone)
-        if filled_via_entsoe:
-            _diag(f"[WHOLE] ENTSO-E fallback filled: {', '.join(filled_via_entsoe)}")
-        missing = [z for z in missing if z not in filled_via_entsoe]
+        # ENTSO-E is the PRIMARY source for the Whole tab -- fetched for
+        # EVERY zone this tab tracks (not just whatever Nord Pool
+        # couldn't reach), and merged OVER nordpool_prices (a later dict
+        # update wins) so an ENTSO-E value always takes priority when
+        # both sources have one; Nord Pool's value survives only where
+        # ENTSO-E itself didn't resolve that zone this slot.
+        entsoe_prices = _fetch_entsoe_prices_parallel(WHOLE_ALL_ZONES, date_str, mtu_label, _diag)
+        all_prices = dict(nordpool_prices)
+        all_prices.update(entsoe_prices)
+        _diag(f"[WHOLE] prices: {len(nordpool_prices)} from Nord Pool, "
+              f"{len(entsoe_prices)} from ENTSO-E, {len(all_prices)} combined.")
 
         if not all_prices:
             self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
                             date_str, mtu_label,
-                            "Could not fetch any price data (Nordic, Core/Baltic, or ENTSO-E).")
+                            "Could not fetch any price data (Nord Pool or ENTSO-E).")
             return
 
         raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
-        net_flows = {}
+        np_net_flows = {}
         for A, B in ZONE_CONNECTIONS:
             net = raw_at_mtu.get((A, B), 0) - raw_at_mtu.get((B, A), 0)
             if abs(net) >= 1:
-                net_flows[(A, B)] = net
+                np_net_flows[(A, B)] = net
 
-        # Cross-region flows: the ONLY source for these is the Nordic
-        # zones' own flow report (Core/Baltic's own report is always
-        # empty -- see CORE_CONNECTIONS' own comment). Every counterpart
-        # code this endpoint actually uses now matches CORE_ZONES/
-        # BALTIC_ZONES directly (including "GER" -- see CORE_ZONES' own
-        # comment), so no code-mapping is needed; anything that still
-        # doesn't match a known zone (an internal/metering counterpart
-        # like "DK1_VL", or a region outside this tab's scope like GB) is
-        # dropped, not guessed at (see _extract_cross_region_flows).
+        # Cross-region flows: Nord Pool's own report is the only source
+        # that tells us WHICH Nordic<->Core/Baltic interconnectors exist
+        # in the first place (every counterpart code it uses now matches
+        # CORE_ZONES/BALTIC_ZONES directly, including "GER" -- see
+        # CORE_ZONES' own comment -- so no code-mapping is needed;
+        # anything that still doesn't match a known zone, like an
+        # internal/metering counterpart "DK1_VL", is dropped, not guessed
+        # at). When Nord Pool is down entirely (no token above), fall
+        # back to a short hand-curated list of the real, well-known
+        # interconnectors instead, so ENTSO-E flows below still have
+        # SOME border list to work from.
         known_cb = set(CORE_ZONES) | set(BALTIC_ZONES)
-        cross_flows = _extract_cross_region_flows(raw_at_mtu, known_cb)
+        np_cross_flows = _extract_cross_region_flows(raw_at_mtu, known_cb)
+        cross_border_pairs = list(np_cross_flows.keys()) or WHOLE_KNOWN_CROSS_BORDERS
 
-        # `missing` here already covers both Core AND Baltic (the single
-        # combined request above queried core_baltic_zones together) --
-        # kept as one combined list now (was narrowed to Core-only before)
-        # so the real-geography map can distinguish "not on this account's
-        # subscription" for a Baltic zone too, not just a Core one.
+        # ENTSO-E flows get the SAME "primary, merged over Nord Pool"
+        # treatment as prices: Nordic-internal borders (ZONE_CONNECTIONS,
+        # a fixed, known topology) always get tried; cross-region borders
+        # use cross_border_pairs above.
+        entsoe_net_flows = _fetch_entsoe_flows_parallel(
+            ZONE_CONNECTIONS, date_str, mtu_label, _diag)
+        entsoe_cross_flows = _fetch_entsoe_flows_parallel(
+            cross_border_pairs, date_str, mtu_label, _diag)
+        net_flows = dict(np_net_flows)
+        net_flows.update(entsoe_net_flows)
+        cross_flows = dict(np_cross_flows)
+        cross_flows.update(entsoe_cross_flows)
+        _diag(f"[WHOLE] flows: {len(net_flows)} Nordic-internal, {len(cross_flows)} "
+              f"cross-region ({len(entsoe_net_flows) + len(entsoe_cross_flows)} from ENTSO-E).")
+
+        # A zone with no price from EITHER source this slot -- genuinely
+        # covered by neither, not the old, narrower "wasn't on Nord
+        # Pool's own subscription" meaning `missing` had before ENTSO-E
+        # became the primary source for every Whole-tab zone (Nordic
+        # included, which never had a `missing` concept before this).
+        missing = [z for z in WHOLE_ALL_ZONES if z not in all_prices]
+
         self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
                         missing, date_str, mtu_label, None)
 
@@ -4165,15 +4299,15 @@ class App:
             messagebox.showerror("Whole Map", error)
             return
         self._draw_tab8_whole_map(prices or {}, net_flows or {}, cross_flows or {},
-                                  missing_cb or [], f"{date_str} {mtu_label}")
+                                  f"{date_str} {mtu_label}")
         self.canvas8w.draw()
         self._add_toolbar(self.canvas8w, self.toolbar_f8w)
         n_na = len(missing_cb or [])
         self._t8w_status.config(
-            text=f"Done. {n_na} Core/Baltic zone(s) unavailable (no API access)." if n_na else "Done.",
+            text=f"Done. {n_na} zone(s) have no price from Nord Pool or ENTSO-E this slot." if n_na else "Done.",
             foreground=C_MUTED)
 
-    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, missing_cb, slot_label):
+    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, slot_label):
         """Real-geography choropleth, styled after VoltPath's own Nordic+
         Core+Baltic "Flows & prices" dashboard view (dark theme, zones
         filled by their own real shape and shaded by price, thin flow
@@ -4213,7 +4347,7 @@ class App:
             zone, tracked, path = zinfo["zone"], zinfo["tracked"], zinfo["path"]
             if not tracked:
                 fc = C_GEO_UNCOVERED
-            elif zone in missing_cb or prices.get(zone) is None:
+            elif prices.get(zone) is None:
                 fc = C_GEO_NODATA
             else:
                 fc = cmap((prices[zone] - p_min) / p_span)
@@ -4237,10 +4371,10 @@ class App:
         # ── Zone labels: plain text over the shape itself, no box -- a
         # thin dark stroke keeps it legible over both a light (orange/
         # yellow, high price) and a dark (blue, low price) fill. ────────
-        label_stroke = [mpl_patheffects.withStroke(linewidth=1.8, foreground='#00000099')]
+        label_stroke = [mpl_patheffects.withStroke(linewidth=1.8, foreground='#FFFFFFCC')]
         for zone, (lx, ly) in label_points.items():
             price = prices.get(zone)
-            if zone in missing_cb or price is None:
+            if price is None:
                 label = zone
             else:
                 label = f"{zone}\n{price:.1f}"
@@ -4276,9 +4410,15 @@ class App:
 
         ax.axis('off')
 
-        # ── Legend panel, bottom-left -- price gradient + flow/coverage
-        # swatches, styled after VoltPath's own legend box. ─────────────
-        lx0, ly0, lw_, lh_ = 0.015, 0.025, 0.30, 0.205
+        # ── Legend panel, bottom-RIGHT -- price gradient + flow/coverage
+        # swatches, styled after VoltPath's own legend box. Bottom-left
+        # (the original placement) sat directly on top of Spain once
+        # Spain became a tracked, labelled zone -- bottom-right instead
+        # falls over the Balkans/Black Sea area, which this app has never
+        # tracked (background context only), so the legend can't cover a
+        # real data zone regardless of which zones are present this slot.
+        lw_, lh_ = 0.30, 0.205
+        lx0, ly0 = 1 - 0.015 - lw_, 0.025
         panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
                                boxstyle="round,pad=0.006,rounding_size=0.012",
                                transform=ax.transAxes, facecolor=C_GEO_PANEL,
