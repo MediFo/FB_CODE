@@ -24,6 +24,7 @@ try:
     from matplotlib.lines import Line2D
     from matplotlib.patches import Circle, FancyBboxPatch, PathPatch
     from matplotlib.path import Path as MplPath
+    import matplotlib.patheffects as mpl_patheffects
     MATPLOTLIB_OK = True
     MATPLOTLIB_IMPORT_ERROR = None
 except ImportError as _mpl_exc:
@@ -375,6 +376,56 @@ def _np_request_with_access_fallback(url, zones, extra_params, hdrs, log_func=la
     return None, [], []
 
 
+def _parse_np_prices_at_mtu(raw_json, zone_list, date_str, mtu_label):
+    """Picks the single-MTU price per zone out of a NordPool price-API
+    response -- the same parse (iterate delivery areas, iterate each
+    area's prices, convert deliveryStart to CET, match the requested
+    calendar day + "HH:MM" slot) the Core and Whole tab fetch threads
+    both need for their own zone set, factored out rather than kept as
+    two copies that could silently drift apart."""
+    zone_set = set(zone_list)
+    prices = {}
+    for area_data in raw_json:
+        zone = area_data.get('deliveryArea')
+        if zone not in zone_set:
+            continue
+        for p in area_data.get('prices', []):
+            ts = p.get('deliveryStart', '')
+            if not ts:
+                continue
+            try:
+                cet_dt = _utc_to_cet(ts)
+            except Exception:
+                continue
+            if cet_dt.strftime('%Y-%m-%d') != date_str:
+                continue
+            if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
+                prices[zone] = p.get('price')
+    return prices
+
+
+def _extract_cross_region_flows(raw_at_mtu, target_zones, flip_sign=False):
+    """Pulls (Nordic zone, target zone) flows out of a Nordic zone's own
+    scheduled-flow report (`raw_at_mtu`, {(area, other): mw}) -- the ONLY
+    source for a Core/Baltic zone's cross-region flow, since neither
+    Core's nor Baltic's own report ever carries one (see CORE_CONNECTIONS'
+    own comment). `flip_sign=True` re-keys/signs the result from the
+    TARGET zone's own perspective instead of the Nordic zone's (the Core
+    tab's own external-flow circles need this -- see
+    _fetch_tab8_core_thread's own comment on why), used by both the Core
+    tab (target_zones=CORE_ZONES, flip_sign=True) and the Whole tab
+    (target_zones=CORE_ZONES|BALTIC_ZONES, flip_sign=False, its own
+    Nordic-perspective cross_flows)."""
+    out = {}
+    for (area, other), mw in raw_at_mtu.items():
+        if area not in NORDIC_ZONES or other not in target_zones or abs(mw) < 1:
+            continue
+        key = (other, area) if flip_sign else (area, other)
+        val = -mw if flip_sign else mw
+        out[key] = out.get(key, 0.0) + val
+    return out
+
+
 def _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle=-90):
     """Evenly spaces `zones` around an ellipse centered at (cx, cy) with
     radii (rx, ry), all normalized [0,1] figure coordinates -- used for
@@ -418,14 +469,6 @@ def _schematic_hub_positions(zones, connections, cx, cy, rx, ry, start_angle=-90
     pos.update(_schematic_circle_positions(rest, cx, cy, rx, ry, start_angle))
     return pos
 
-
-def _draw_group_label(ax, text, x, y):
-    """Small, faint caption (e.g. "NORDIC") marking a zone cluster on the
-    Whole tab's shared canvas -- purely a readability aid, same visual
-    weight on every group so none reads as more "primary" than another."""
-    ax.text(x, y, text, fontsize=7, fontweight='bold', color=C_MUTED,
-            alpha=0.55, ha='left', va='top', zorder=1,
-            family='sans-serif')
 
 # ----------------------------------------------------------------------
 #  REAL-GEOGRAPHY ZONE SHAPES — Whole tab's "flows & prices" choropleth
@@ -488,6 +531,51 @@ def _geojson_geom_to_path(geom):
     return MplPath(verts, codes)
 
 
+_bidding_zone_paths_cache = None
+
+
+def _load_bidding_zone_paths():
+    """Lazily builds + caches, from _load_bidding_zone_geo()'s raw JSON,
+    each zone's matplotlib Path plus the combined bounding box -- both are
+    pure functions of the (static, file-backed) GeoJSON content, never of
+    a click's own price/flow data, so computing them fresh on every
+    Whole-tab redraw (an earlier version of this code did) would rebuild
+    ~4600 vertices' worth of Path geometry on every "Fetch & Plot" click
+    for no reason. Returns None if the GeoJSON itself is missing (see
+    _load_bidding_zone_geo). The cached Path objects are reused across
+    draws; only the per-zone PathPatch wrapper (which carries this
+    click's own fill color) is built fresh each time, since a Patch
+    artist -- unlike the Path geometry it wraps -- can't be shared once
+    added to an Axes."""
+    global _bidding_zone_paths_cache
+    if _bidding_zone_paths_cache is not None:
+        return _bidding_zone_paths_cache
+    geo = _load_bidding_zone_geo()
+    if geo is None:
+        return None
+    zones = []
+    x0 = y0 = x1 = y1 = None
+    for feat in geo['features']:
+        props = feat['properties']
+        path = _geojson_geom_to_path(feat['geometry'])
+        ext = path.get_extents()
+        x0 = ext.x0 if x0 is None else min(x0, ext.x0)
+        y0 = ext.y0 if y0 is None else min(y0, ext.y0)
+        x1 = ext.x1 if x1 is None else max(x1, ext.x1)
+        y1 = ext.y1 if y1 is None else max(y1, ext.y1)
+        zones.append({
+            "zone": props["zone"],
+            "tracked": props["tracked"],
+            "label_point": tuple(props["label_point"]),
+            "path": path,
+        })
+    _bidding_zone_paths_cache = {"zones": zones, "bounds": (x0, y0, x1, y1)}
+    return _bidding_zone_paths_cache
+
+
+_price_geo_cmap_cache = None
+
+
 def _price_geo_cmap():
     """Blue (low) -> cyan -> yellow -> orange -> red (high) sequential
     colormap for the Whole tab's real-geography price choropleth --
@@ -500,10 +588,14 @@ def _price_geo_cmap():
     toward a muddy gray-olive in the middle of the scale -- visibly wrong
     on, e.g., DK1/DK2 at a mid-range price sitting right in that band.
     Routing through yellow keeps every step of the gradient looking like
-    a step along blue->warm rather than through gray."""
-    return mpl.colors.LinearSegmentedColormap.from_list(
-        "voltpath_price",
-        ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
+    a step along blue->warm rather than through gray. Cached (the stop
+    list is fixed) rather than rebuilt on every redraw."""
+    global _price_geo_cmap_cache
+    if _price_geo_cmap_cache is None:
+        _price_geo_cmap_cache = mpl.colors.LinearSegmentedColormap.from_list(
+            "voltpath_price",
+            ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
+    return _price_geo_cmap_cache
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -3520,23 +3612,7 @@ class App:
                             "Price API: no accessible Core zone returned data "
                             f"({', '.join(missing) if missing else 'unknown error'}).")
             return
-        prices = {}
-        for area_data in r.json():
-            zone = area_data.get('deliveryArea')
-            if zone not in CORE_ZONES:
-                continue
-            for p in area_data.get('prices', []):
-                ts = p.get('deliveryStart', '')
-                if not ts:
-                    continue
-                try:
-                    cet_dt = _utc_to_cet(ts)
-                except Exception:
-                    continue
-                if cet_dt.strftime('%Y-%m-%d') != date_str:
-                    continue
-                if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
-                    prices[zone] = p.get('price')
+        prices = _parse_np_prices_at_mtu(r.json(), CORE_ZONES, date_str, mtu_label)
 
         # Core zones' OWN flow report is always empty (status="Missing" --
         # see CORE_CONNECTIONS' own comment on why), so the only way to
@@ -3544,11 +3620,13 @@ class App:
         # workaround _fetch_tab8_whole_thread's cross_flows already uses:
         # fetch the NORDIC side's own report, which does carry each
         # Nordic zone's cleared interconnector flow to its Core
-        # counterpart. Mirrors the original Nordic tab's own external-
-        # flow treatment, just anchored on the Core zone instead of the
-        # Nordic one. Core<->Baltic isn't included here -- neither side
-        # publishes that one (Baltic's own report is empty too, the same
-        # as Core's), so there's no source for it at all, not just a
+        # counterpart, re-keyed to the Core zone's own perspective (see
+        # _extract_cross_region_flows' own comment on the sign flip).
+        # Mirrors the original Nordic tab's own external-flow treatment,
+        # just anchored on the Core zone instead of the Nordic one.
+        # Core<->Baltic isn't included here -- neither side publishes
+        # that one (Baltic's own report is empty too, the same as
+        # Core's), so there's no source for it at all, not just a
         # missing one.
         nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
         _, nordic_flows_raw, _, flow_err = self._fetch_tab8_one_day(
@@ -3556,15 +3634,7 @@ class App:
         if flow_err:
             _diag(f"[CORE] Nordic flow fetch (for external arrows) error: {flow_err}")
         raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
-        ext_flows = {}
-        for (area, other), mw in raw_at_mtu.items():
-            if area not in NORDIC_ZONES or other not in CORE_ZONES or abs(mw) < 1:
-                continue
-            # Flip sign: the raw value is the NORDIC zone's own reported
-            # export (positive = Nordic exporting TO this Core zone), so
-            # the Core zone's own export on that same link is the
-            # negative of that.
-            ext_flows[(other, area)] = ext_flows.get((other, area), 0.0) - mw
+        ext_flows = _extract_cross_region_flows(raw_at_mtu, CORE_ZONES, flip_sign=True)
 
         self.root.after(0, self._tab8_core_fetch_done, prices, ext_flows, missing,
                         date_str, mtu_label, None)
@@ -3584,14 +3654,26 @@ class App:
             text=f"Done. {n_na} zone(s) unavailable (no API access)." if n_na else "Done.",
             foreground=C_MUTED)
 
-    def _draw_tab8_core_map(self, prices, missing_zones, slot_label, ext_flows=None):
+    # External-flow circle geometry (see the "External flow arrows" block
+    # below) -- module-level constants, not inline magic numbers, because
+    # the axis margin just below is DERIVED from them: a circle can sit
+    # EXT_LEN + R_MAX beyond a zone position at the edge of the main
+    # layout circle, so that's exactly how far the axis limits need to
+    # extend to avoid clipping it. Keeping them here means a future
+    # change to the circle sizing can't silently reopen the clipping bug
+    # this margin exists to fix.
+    _EXT_LEN = 0.17
+    _EXT_R_MIN, _EXT_R_MAX = 0.024, 0.052
+
+    def _draw_tab8_core_map(self, prices, missing_zones, slot_label, ext_flows):
         self.fig8c.clear()
         ax = self.fig8c.add_subplot(111)
-        # A bit of margin beyond [0,1] -- the external-flow circles below
-        # are planted OUTWARD from their anchor zone, which can push a
-        # zone near the edge of the main circle (e.g. the zone opposite
-        # the hub) past a flush [0,1] limit and get clipped.
-        ax.set_xlim(-0.08, 1.08); ax.set_ylim(1.08, -0.08)
+        # Flush [0,1] normally -- _schematic_hub_positions' own cx/rx
+        # bounds (0.46 +/- 0.35) never leave that range on their own.
+        # Margin is only added when there are external-flow circles to
+        # plant outward from a zone, which can push past a flush edge.
+        margin = (self._EXT_LEN + self._EXT_R_MAX + 0.01) if ext_flows else 0.0
+        ax.set_xlim(-margin, 1 + margin); ax.set_ylim(1 + margin, -margin)
         ax.set_facecolor('#F3F2EE')
 
         # A zone is drawn only if it has a REAL price this slot -- no API
@@ -3656,10 +3738,7 @@ class App:
         # exporting) -- see _fetch_tab8_core_thread's own comment on the
         # sign flip this required, since the underlying API only ever
         # reports the Nordic side's own value.
-        ext_flows = ext_flows or {}
-        has_external = False
         if ext_flows:
-            has_external = True
             by_anchor = {}
             for (core_zone, other), mw in ext_flows.items():
                 if core_zone not in pos:
@@ -3668,8 +3747,8 @@ class App:
             max_ext = max((abs(mw) for mw in ext_flows.values()), default=1) or 1
             cx0 = sum(x for x, y in pos.values()) / len(pos)
             cy0 = sum(y for x, y in pos.values()) / len(pos)
-            ext_len = 0.17
-            r_min, r_max = 0.024, 0.052
+            ext_len = self._EXT_LEN
+            r_min, r_max = self._EXT_R_MIN, self._EXT_R_MAX
             for core_zone, links in sorted(by_anchor.items()):
                 x0, y0 = pos[core_zone]
                 dx0, dy0 = x0 - cx0, y0 - cy0
@@ -3718,7 +3797,7 @@ class App:
             Line2D([0], [0], color='#B8B6AE', lw=1.5,
                    label="Core-internal border (no flow data)"),
         ]
-        if has_external:
+        if ext_flows:
             legend_handles.append(
                 Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
                        markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
@@ -3848,24 +3927,8 @@ class App:
         price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
         r, accessible, missing = _np_request_with_access_fallback(
             NP_PRICE_URL, core_baltic_zones, price_params, hdrs, _diag)
-        cb_prices_at_mtu = {}
-        if r is not None:
-            for area_data in r.json():
-                zone = area_data.get('deliveryArea')
-                if zone not in core_baltic_zones:
-                    continue
-                for p in area_data.get('prices', []):
-                    ts = p.get('deliveryStart', '')
-                    if not ts:
-                        continue
-                    try:
-                        cet_dt = _utc_to_cet(ts)
-                    except Exception:
-                        continue
-                    if cet_dt.strftime('%Y-%m-%d') != date_str:
-                        continue
-                    if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
-                        cb_prices_at_mtu[zone] = p.get('price')
+        cb_prices_at_mtu = (_parse_np_prices_at_mtu(r.json(), core_baltic_zones, date_str, mtu_label)
+                           if r is not None else {})
 
         nordic_prices_at_mtu = nordic_prices.get(mtu_label, {})
         if not nordic_prices_at_mtu and not cb_prices_at_mtu:
@@ -3891,15 +3954,9 @@ class App:
         # comment), so no code-mapping is needed; anything that still
         # doesn't match a known zone (an internal/metering counterpart
         # like "DK1_VL", or a region outside this tab's scope like GB) is
-        # dropped, not guessed at.
+        # dropped, not guessed at (see _extract_cross_region_flows).
         known_cb = set(CORE_ZONES) | set(BALTIC_ZONES)
-        cross_flows = {}
-        for (area, other), mw in raw_at_mtu.items():
-            if area not in NORDIC_ZONES or abs(mw) < 1:
-                continue
-            if other not in known_cb:
-                continue
-            cross_flows[(area, other)] = cross_flows.get((area, other), 0.0) + mw
+        cross_flows = _extract_cross_region_flows(raw_at_mtu, known_cb)
 
         # `missing` here already covers both Core AND Baltic (the single
         # combined request above queried core_baltic_zones together) --
@@ -3936,15 +3993,13 @@ class App:
         note, and CORE_ZONES'/BALTIC_ZONES' own comment for why a
         schematic layout existed here in the first place (no such
         position data used to be available in this repo)."""
-        import matplotlib.patheffects as patheffects
-
         self.fig8w.clear()
         ax = self.fig8w.add_subplot(111)
         self.fig8w.patch.set_facecolor(C_GEO_BG)
         ax.set_facecolor(C_GEO_BG)
 
-        geo = _load_bidding_zone_geo()
-        if geo is None:
+        geo_paths = _load_bidding_zone_paths()
+        if geo_paths is None:
             ax.text(0.5, 0.5, "Zone boundary data (bidding_zones_europe.geojson) "
                     "not found next to this script.", ha='center', va='center',
                     fontsize=10, color=C_GEO_MUTED, transform=ax.transAxes, wrap=True)
@@ -3960,19 +4015,15 @@ class App:
         p_max = max(valid_prices) if valid_prices else 100.0
         p_span = max(p_max - p_min, 1.0)
 
+        # Path geometry + the overall bounding box are cached (pure
+        # functions of the static GeoJSON, never of this click's own
+        # price data) -- only each zone's fill color is computed fresh
+        # per draw, via a fresh lightweight PathPatch wrapper around the
+        # same cached Path (a Patch artist can't be reused once added to
+        # an Axes, unlike the Path geometry it wraps).
         label_points = {}
-        x0 = y0 = x1 = y1 = None
-        for feat in geo['features']:
-            props = feat['properties']
-            zone = props['zone']
-            tracked = props['tracked']
-            path = _geojson_geom_to_path(feat['geometry'])
-            ext = path.get_extents()
-            x0 = ext.x0 if x0 is None else min(x0, ext.x0)
-            y0 = ext.y0 if y0 is None else min(y0, ext.y0)
-            x1 = ext.x1 if x1 is None else max(x1, ext.x1)
-            y1 = ext.y1 if y1 is None else max(y1, ext.y1)
-
+        for zinfo in geo_paths["zones"]:
+            zone, tracked, path = zinfo["zone"], zinfo["tracked"], zinfo["path"]
             if not tracked:
                 fc = C_GEO_UNCOVERED
             elif zone in missing_cb or prices.get(zone) is None:
@@ -3983,8 +4034,9 @@ class App:
                               linewidth=0.5, zorder=2)
             ax.add_patch(patch)
             if tracked:
-                label_points[zone] = tuple(props['label_point'])
+                label_points[zone] = zinfo["label_point"]
 
+        x0, y0, x1, y1 = geo_paths["bounds"]
         margin_x = (x1 - x0) * 0.02
         margin_y = (y1 - y0) * 0.02
         ax.set_xlim(x0 - margin_x, x1 + margin_x)
@@ -3998,7 +4050,7 @@ class App:
         # ── Zone labels: plain text over the shape itself, no box -- a
         # thin dark stroke keeps it legible over both a light (orange/
         # yellow, high price) and a dark (blue, low price) fill. ────────
-        label_stroke = [patheffects.withStroke(linewidth=1.8, foreground='#00000099')]
+        label_stroke = [mpl_patheffects.withStroke(linewidth=1.8, foreground='#00000099')]
         for zone, (lx, ly) in label_points.items():
             price = prices.get(zone)
             if zone in missing_cb or price is None:
@@ -4016,7 +4068,7 @@ class App:
 
         def _draw_flow_arrow(A, B, mw):
             if A not in label_points or B not in label_points:
-                return None
+                return
             src, dst, mw2 = (A, B, mw) if mw >= 0 else (B, A, -mw)
             x1a, y1a = label_points[src]; x2a, y2a = label_points[dst]
             p_src, p_dst = prices.get(src), prices.get(dst)
@@ -4029,7 +4081,6 @@ class App:
             lw = 0.5 + 1.6 * (mw2 / max_flow)
             ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
                         arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=6))
-            return counter
 
         for (A, B), mw in net_flows.items():
             _draw_flow_arrow(A, B, mw)
