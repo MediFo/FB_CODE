@@ -579,6 +579,22 @@ def _load_bidding_zone_paths():
     return _bidding_zone_paths_cache
 
 
+# Fixed price-color-scale bounds for the Whole tab's real-geography map --
+# NOT auto-scaled to each snapshot's own min/max, deliberately: a single
+# outlier (Spain's price is often near zero; a Baltic zone can spike well
+# past 300 during tight supply) would otherwise compress the color
+# differentiation among the "normal"-range zones everyone actually wants
+# to compare at a glance -- confirmed live, adding Spain's ENTSO-E price
+# (0.9 EUR/MWh one test slot) pulled p_min down enough to turn every
+# Nordic zone's usual blue into a washed-out yellow. VoltPath's own
+# legend reads as a fixed "44...445"-style band for the same reason, not
+# a per-frame rescale. A price outside [VMIN, VMAX] still renders --
+# matplotlib colormaps clamp an out-of-[0,1] normalized value to the
+# nearest end color rather than erroring or extrapolating a new hue.
+PRICE_GEO_VMIN = 0.0
+PRICE_GEO_VMAX = 200.0
+
+
 @functools.lru_cache(maxsize=1)
 def _price_geo_cmap():
     """Blue (low) -> cyan -> yellow -> orange -> red (high) sequential
@@ -601,6 +617,86 @@ def _price_geo_cmap():
     return mpl.colors.LinearSegmentedColormap.from_list(
         "voltpath_price",
         ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
+
+# ----------------------------------------------------------------------
+#  ENTSO-E PRICE FALLBACK — Whole tab only, for zones Nord Pool doesn't
+#  reach: Spain (never on any Nord Pool subscription's zone list -- it's
+#  outside Core CCR entirely) and whichever Core/Baltic zones this
+#  account's own Nord Pool access doesn't currently cover (see
+#  _KNOWN_INACCESSIBLE_CORE_ZONES above).
+# ----------------------------------------------------------------------
+# Same account's token as propagation.py's own ENTSOE_TOKEN constant --
+# duplicated here, not imported, same "independent copy" reasoning as
+# NORDPOOL_USER/NORDPOOL_PASSWORD above (avoids pulling propagation.py's
+# pandas-heavy import chain into Tab 8 just for one token string, and
+# keeps this tab's own fetch code self-contained the same way its other
+# credentials already are).
+ENTSOE_TOKEN = "3c9307bd-c6e8-4f0c-99de-f9d754ff6488"
+
+# This app's own zone code -> entsoe-py's day-ahead-price area code.
+# Verified LIVE (2026-02-03) against ENTSO-E's Transparency Platform:
+# every one of these returned real day-ahead price data. Germany is
+# "DE_LU" here (the merged German-Luxembourg price zone), not "GER" or
+# "DE" -- a different code than either this app's own CORE_ZONES value
+# or ENTSO-E's plain country code, confirmed live rather than assumed.
+ENTSOE_PRICE_AREA = {
+    "ES": "ES",
+    "AT": "AT", "BE": "BE", "CZ": "CZ", "GER": "DE_LU", "FR": "FR",
+    "HR": "HR", "HU": "HU", "NL": "NL", "PL": "PL", "RO": "RO",
+    "SI": "SI", "SK": "SK",
+    "EE": "EE", "LV": "LV", "LT": "LT",
+}
+
+# Zones the Whole tab's real-geography map tracks beyond Nordic/Core CCR/
+# Baltic -- currently just Spain. Priced via ENTSO-E only (never Nord
+# Pool, see above); NOT added to CORE_ZONES itself, since Spain isn't
+# part of Core CCR and the Core tab's own schematic layout/hub-and-spoke
+# topology (CORE_CONNECTIONS) is specifically a Core CCR concept that
+# this zone shouldn't leak into.
+WHOLE_EXTRA_ZONES = ["ES"]
+
+
+def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
+    """Fetches one zone's ENTSO-E day-ahead price for one MTU slot.
+    Lazily imports entsoe-py (and, inside that, pandas) only when this
+    actually runs -- this file is otherwise deliberately pandas-free
+    (see _CET's own comment above) and entsoe-py is an optional
+    dependency (requirements.txt), so a caller with neither installed
+    still gets every OTHER Whole-tab feature; this one fallback source
+    just doesn't fire. Returns None (never raises) on any failure --
+    missing library, auth failure, no data for the window, or a zone
+    whose local calendar day doesn't start at CET midnight -- so the
+    caller can treat it exactly like "Nord Pool didn't have it either"
+    rather than crashing the fetch thread.
+
+    Requests a window centered on the target MTU rather than exactly
+    that CET calendar day: several of these zones (the Baltics, Romania)
+    run on EET/EEST, an hour ahead of CET, so a flush "CET day" request
+    window can clip the last local hour of the target zone's own day.
+    """
+    try:
+        from entsoe import EntsoePandasClient
+    except ImportError:
+        _diag(f"[ENTSOE] entsoe-py not installed -- skipping {entsoe_area} price fallback")
+        return None
+    try:
+        import pandas as pd
+        target = pd.Timestamp(f"{date_str} {mtu_label}", tz=_CET_ZONE_NAME)
+        client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
+        s = client.query_day_ahead_prices(
+            entsoe_area, start=target - pd.Timedelta(hours=26), end=target + pd.Timedelta(hours=26))
+        # ENTSO-E prices can be hourly OR 15-min resolution depending on
+        # zone/date -- match the latest index value AT OR BEFORE the
+        # target instant (correct either way) rather than an exact-
+        # equality lookup, which would silently miss every sub-hour slot
+        # on an hourly-resolution zone.
+        idx = s.index[s.index <= target]
+        if len(idx) == 0:
+            return None
+        return float(s.loc[idx[-1]])
+    except Exception as e:
+        _diag(f"[ENTSOE] price fetch failed for {entsoe_area} ({date_str} {mtu_label}): {e}")
+        return None
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -2792,6 +2888,15 @@ class App:
         # range never re-fetches.
         self._t8_play_btn = ttk.Button(ctrl, text="▶ Play", command=self._t8_play)
         self._t8_play_btn.pack(side=tk.LEFT, padx=(12, 4))
+        # Pause freezes the timer at the current frame WITHOUT resetting
+        # _t8_play_idx -- "▶ Play" (relabelled "▶ Resume" while paused)
+        # then continues from that same index instead of restarting the
+        # period from slot 0. Stop, by contrast, is still a full reset
+        # (see _t8_stop_play's own comment) -- the two are deliberately
+        # different actions now, not two names for the same one.
+        self._t8_pause_btn = ttk.Button(ctrl, text="⏸ Pause",
+                                        command=self._t8_pause_play, state=tk.DISABLED)
+        self._t8_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
         self._t8_stop_btn = ttk.Button(ctrl, text="⏹ Stop",
                                        command=self._t8_stop_play, state=tk.DISABLED)
         self._t8_stop_btn.pack(side=tk.LEFT, padx=(0, 12))
@@ -2811,7 +2916,9 @@ class App:
         self._t8_fetch_target_slot = None
         self._t8_play_mtus      = []
         self._t8_play_idx       = 0
-        self._t8_playing        = False
+        self._t8_playing        = False   # timer is actively ticking right now
+        self._t8_paused         = False   # a playback session is frozen mid-period,
+                                          # resumable from _t8_play_idx (see _t8_pause_play)
         self._t8_play_after_id  = None
 
         self.toolbar_f8 = ttk.Frame(main, style='Card.TFrame')
@@ -2922,8 +3029,22 @@ class App:
     def _t8_play(self):
         """Start slow-motion playback: fetch (or reuse cached) prices/flows
         for every MTU across the WHOLE [From, To] period, then step
-        through them on a timer."""
+        through them on a timer. If a session is currently PAUSED (see
+        _t8_pause_play), this instead RESUMES it from the exact frame it
+        was paused at, without touching the From/To fields or re-fetching
+        -- a fresh Play-period click (period fields edited, or Stop was
+        pressed since) always still restarts at slot 0, only a paused
+        session skips that reset."""
         if self._t8_playing:
+            return
+        if self._t8_paused and self._t8_play_mtus:
+            self._t8_paused = False
+            self._t8_playing = True
+            self._t8_btn.config(state=tk.DISABLED)
+            self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
+            self._t8_pause_btn.config(state=tk.NORMAL)
+            self._t8_stop_btn.config(state=tk.NORMAL)
+            self._t8_play_step()
             return
         period = self._t8_parse_period()
         if period is None:
@@ -2976,8 +3097,10 @@ class App:
         self._t8_play_mtus = slots
         self._t8_play_idx  = 0
         self._t8_playing = True
+        self._t8_paused = False
         self._t8_btn.config(state=tk.DISABLED)
         self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
+        self._t8_pause_btn.config(state=tk.NORMAL)
         self._t8_stop_btn.config(state=tk.NORMAL)
         self._t8_play_step()
 
@@ -3009,9 +3132,38 @@ class App:
         interval_ms = self._T8_SPEED_MS.get(self._t8_speed.get(), 1200)
         self._t8_play_after_id = self.root.after(interval_ms, self._t8_play_step)
 
-    def _t8_stop_play(self):
-        was_playing = self._t8_playing
+    def _t8_pause_play(self):
+        """Freezes playback at the CURRENT frame -- unlike _t8_stop_play,
+        _t8_play_idx is left exactly where it is (not reset to 0), so the
+        next "▶ Resume" click (_t8_play's own paused-session branch)
+        continues from this same point instead of restarting the period.
+        A no-op if nothing is actively playing."""
+        if not self._t8_playing:
+            return
         self._t8_playing = False
+        self._t8_paused = True
+        if self._t8_play_after_id is not None:
+            try:
+                self.root.after_cancel(self._t8_play_after_id)
+            except Exception:
+                pass
+            self._t8_play_after_id = None
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Resume")
+        self._t8_pause_btn.config(state=tk.DISABLED)
+        self._t8_stop_btn.config(state=tk.NORMAL)
+        self._t8_status.config(
+            text=f"Paused at {self._t8_play_idx}/{len(self._t8_play_mtus)}.",
+            foreground=C_MUTED)
+        self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _t8_stop_play(self):
+        """Full reset -- unlike _t8_pause_play, a subsequent "▶ Play"
+        always restarts the period from slot 0 (see _t8_start_playback's
+        own comment on why that's deliberate), never resumes."""
+        was_active = self._t8_playing or self._t8_paused
+        self._t8_playing = False
+        self._t8_paused = False
         if self._t8_play_after_id is not None:
             try:
                 self.root.after_cancel(self._t8_play_after_id)
@@ -3020,8 +3172,9 @@ class App:
             self._t8_play_after_id = None
         self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
+        self._t8_pause_btn.config(state=tk.DISABLED)
         self._t8_stop_btn.config(state=tk.DISABLED)
-        if was_playing:
+        if was_active:
             self._t8_status.config(text="Stopped.", foreground=C_MUTED)
             self._add_toolbar(self.canvas8, self.toolbar_f8)
 
@@ -3943,13 +4096,39 @@ class App:
                            if r is not None else {})
 
         nordic_prices_at_mtu = nordic_prices.get(mtu_label, {})
-        if not nordic_prices_at_mtu and not cb_prices_at_mtu:
-            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
-                            date_str, mtu_label,
-                            "Could not fetch any price data (Nordic or Core/Baltic).")
-            return
         all_prices = dict(nordic_prices_at_mtu)
         all_prices.update(cb_prices_at_mtu)
+
+        # ENTSO-E fallback: Spain (WHOLE_EXTRA_ZONES, never on Nord Pool's
+        # own zone list at all) always gets tried here; any Core/Baltic
+        # zone this account's Nord Pool access doesn't currently reach
+        # (`missing`) gets a second shot too, rather than staying dark
+        # "Regions not covered" when a perfectly real price is available
+        # from a different source. A zone that fills in here is dropped
+        # from `missing` -- it's genuinely covered now, not merely
+        # "accessible but no price this slot" (which stays the lighter
+        # "Data not available" shade, a real and different state). Run
+        # BEFORE the "got nothing at all" guard below, so a Nord Pool
+        # outage that takes out both Nordic and Core/Baltic can still be
+        # saved by Spain (or a recovered Core zone) alone rather than
+        # hard-erroring with real data sitting right there.
+        entsoe_fallback_zones = [z for z in missing if z in ENTSOE_PRICE_AREA] + WHOLE_EXTRA_ZONES
+        filled_via_entsoe = []
+        for zone in entsoe_fallback_zones:
+            price = _fetch_entsoe_price_at_mtu(
+                ENTSOE_PRICE_AREA[zone], date_str, mtu_label, _diag)
+            if price is not None:
+                all_prices[zone] = price
+                filled_via_entsoe.append(zone)
+        if filled_via_entsoe:
+            _diag(f"[WHOLE] ENTSO-E fallback filled: {', '.join(filled_via_entsoe)}")
+        missing = [z for z in missing if z not in filled_via_entsoe]
+
+        if not all_prices:
+            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None,
+                            date_str, mtu_label,
+                            "Could not fetch any price data (Nordic, Core/Baltic, or ENTSO-E).")
+            return
 
         raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
         net_flows = {}
@@ -4019,17 +4198,9 @@ class App:
             self.fig8w.tight_layout(pad=1.0)
             return
 
-        # No `zone in tracked_zones` filter needed here -- `prices` (built
-        # by _fetch_tab8_whole_thread from _fetch_tab8_one_day's own
-        # NORDIC_ZONES filter plus _parse_np_prices_at_mtu's own
-        # CORE_ZONES/BALTIC_ZONES filter) can never contain an untracked
-        # zone's key in the first place.
         cmap = _price_geo_cmap()
-        valid_prices = [v for z, v in prices.items()
-                        if z not in missing_cb and v is not None]
-        p_min = min(valid_prices) if valid_prices else 0.0
-        p_max = max(valid_prices) if valid_prices else 100.0
-        p_span = max(p_max - p_min, 1.0)
+        p_min, p_max = PRICE_GEO_VMIN, PRICE_GEO_VMAX
+        p_span = p_max - p_min
 
         # Path geometry + the overall bounding box are cached (pure
         # functions of the static GeoJSON, never of this click's own
