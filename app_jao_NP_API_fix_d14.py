@@ -1,10 +1,13 @@
 import bisect
 import csv
+import functools
 import json
+import math
 import os
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -20,8 +23,21 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
-except ImportError:
-    pass  # error shown after Tk is up
+    from matplotlib.patches import Circle, FancyBboxPatch, PathPatch
+    from matplotlib.path import Path as MplPath
+    import matplotlib.patheffects as mpl_patheffects
+    MATPLOTLIB_OK = True
+    MATPLOTLIB_IMPORT_ERROR = None
+except ImportError as _mpl_exc:
+    # Swallowed here rather than crashing at import time because messagebox
+    # needs a Tk root to exist first -- App.__init__ checks MATPLOTLIB_OK as
+    # its first step and shows this exact error, instead of letting a tab
+    # builder crash deep in the widget tree with a bare "name 'Figure' is
+    # not defined" NameError that gives no hint the actual problem is an
+    # import failure (e.g. matplotlib not installed in this venv, or a
+    # broken Tk backend).
+    MATPLOTLIB_OK = False
+    MATPLOTLIB_IMPORT_ERROR = str(_mpl_exc)
 
 try:
     from reportlab.lib.pagesizes import A4
@@ -76,26 +92,156 @@ MAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "energies-13-01930-g001.png")
 
 # ----------------------------------------------------------------------
+#  CORE / BALTIC ZONES — Tab 8's "Core" and "Whole" sub-tabs
+# ----------------------------------------------------------------------
+# Core CCR (Core Capacity Calculation Region), the standard FBMC domain
+# definition. Unlike NORDIC_ZONES there is no background map image or
+# hand-placed ZONE_POS_NORM for these -- positions are computed at draw
+# time (see _schematic_circle_positions) rather than pixel-measured
+# against an image, since no such image exists in this repo (see
+# CLAUDE.md on ZONE_POS_NORM only ever covering the 12 Nordic zones).
+#
+# Germany/Luxembourg is "GER" here, NOT the ISO-style "DE_LU" -- verified
+# LIVE: "DE_LU" is a real, different, genuinely inaccessible code on this
+# account (403), while "GER" returns real price data (and matches Nord
+# Pool's own web UI, which groups AT/BE/FR/GER/NL/PL together as "CWE" --
+# exactly the set of Core zones this account can actually reach, which is
+# presumably why: CWE access, not full Core CCR access).
+CORE_ZONES = ["AT", "BE", "CZ", "GER", "FR", "HR", "HU", "NL", "PL", "RO", "SI", "SK"]
+BALTIC_ZONES = ["EE", "LV", "LT"]
+
+# Verified LIVE against this account's actual Nord Pool subscription
+# (2026-10-15): price data is available for all of BALTIC_ZONES, and for
+# AT/BE/FR/GER/NL/PL of CORE_ZONES (Nord Pool's own "CWE" grouping) --
+# CZ/HU/RO/SI/SK/HR come back "Missing access for area(s) ..." (403) on
+# the SAME combined request, which Nord Pool's API rejects in full the
+# moment ANY requested area is inaccessible (not just omitting that area
+# from the response). This list is NOT hardcoded into the fetch path --
+# _np_request_with_access_fallback parses the 403 body itself and retries
+# with whatever subset IS accessible, so a future subscription change
+# (e.g. gaining full Core CCR access) is picked up automatically without
+# a code change; it's recorded here only as the known state at build time.
+_KNOWN_INACCESSIBLE_CORE_ZONES = ["CZ", "HU", "RO", "SI", "SK", "HR"]
+
+# Real bidding-zone borders within Core CCR, for drawing static reference
+# topology only -- NOT flow arrows. Verified LIVE (2026-10-15): Nord
+# Pool's ScheduledPhysicalFlows/ByAreas endpoint returns status="Missing"
+# with an empty flows list for EVERY Core zone on every date tried
+# (several months apart), unlike Nordic zones which reliably return
+# status="Final" with 96 real rows -- Core-internal flow data simply
+# isn't published through this API, price auctions aside. Drawing a
+# fabricated or zero flow arrow here would misreport that as "zero flow"
+# when the truth is "no data source" -- so Core/Baltic-internal borders
+# are drawn as plain unlabeled reference lines, never arrows.
+CORE_CONNECTIONS = [
+    ("GER", "FR"), ("GER", "BE"), ("GER", "NL"), ("GER", "AT"),
+    ("GER", "CZ"), ("GER", "PL"),
+    ("FR", "BE"), ("BE", "NL"),
+    ("AT", "CZ"), ("AT", "SI"), ("AT", "HU"),
+    ("CZ", "SK"), ("CZ", "PL"),
+    ("SK", "HU"), ("SK", "PL"),
+    ("HU", "HR"), ("HU", "RO"),
+    ("SI", "HR"),
+]
+BALTIC_CONNECTIONS = [("EE", "LV"), ("LV", "LT")]
+
+# Every non-Nordic counterpart code observed live across all 12 Nordic
+# zones' own flow reports (EE, GER, LT, NL, PL) already matches
+# CORE_ZONES/BALTIC_ZONES as-is now that CORE_ZONES itself uses "GER" --
+# no code-mapping table needed between the two endpoints. Anything seen
+# that matches neither (e.g. "DK1_VL", an internal/metering counterpart,
+# also observed live) is simply not a real external zone and is dropped
+# by the "mapped not in known_cb" check at the cross-flow call site, not
+# guessed at.
+
+# ----------------------------------------------------------------------
 #  DESIGN TOKENS
 # ----------------------------------------------------------------------
-C_BG      = '#f0f4f8'
-C_PANEL   = '#ffffff'
-C_ACCENT  = '#1e3a5f'
-C_PRIMARY = '#2563eb'
-C_BORDER  = '#d1d9e6'
-C_TEXT    = '#1e293b'
-C_MUTED   = '#64748b'
-C_GREEN   = '#059669'
-C_RED     = '#dc2626'
-C_PURPLE  = '#7c3aed'
-C_AMBER   = '#d97706'
+C_BG        = '#FFFFFF'
+C_PANEL     = '#ffffff'
+C_SURFACE   = '#F6F6F7'   # subtle neutral surface -- ghost-button fill, hover
+C_ACCENT    = '#111113'   # near-black, used for emphasis text (no colored
+                          # header block in this design -- restraint over
+                          # brand-color repetition is the point)
+C_PRIMARY   = '#163C2C'   # the single accent color: primary actions, focus,
+                          # selection. Everything else in this design stays
+                          # neutral grayscale so this one color still reads
+                          # as a deliberate signal, not just "the palette"
+C_BORDER    = '#E6E6E9'
+C_BORDER_LO = '#F0F0F2'   # hairline separators
+C_TEXT      = '#18181B'
+C_MUTED     = '#6B6B73'
+C_GREEN     = '#15803D'   # status/data semantics only -- not a brand color
+C_RED       = '#B91C1C'
+C_PURPLE    = '#6D5B97'
+C_AMBER     = '#B45309'
+C_TINT      = '#EEF0F4'   # light accent-tinted surface: hover, selection,
+                          # light text on a dark panel
+C_INK       = '#1F1F23'   # dark panel fill for log/diagnostic panes --
+                          # deliberately NOT the same value as C_TEXT, or a
+                          # scrollbar sitting on one of these panels (styled
+                          # bg=C_TEXT to match body text elsewhere) would be
+                          # visually indistinguishable from the panel itself
 
-FONT_UI   = ('Segoe UI', 9)
-FONT_BOLD = ('Segoe UI', 9,  'bold')
-FONT_H1   = ('Segoe UI', 11, 'bold')
-FONT_MONO = ('Consolas',  10)
+# One family throughout (native on Windows), varied by size/weight only --
+# nothing silently falls back to a substitute font on a machine that lacks
+# an exotic family name. A real hierarchy (not just 3 sizes) is what makes
+# a plain, undecorated design still read as considered rather than bare.
+FONT_UI       = ('Segoe UI', 9)
+FONT_UI_SM    = ('Segoe UI', 8)
+FONT_BOLD     = ('Segoe UI', 9,  'bold')
+FONT_LABEL    = ('Segoe UI', 8,  'bold')   # field captions
+FONT_H1       = ('Segoe UI', 12, 'bold')   # section headers
+FONT_H2       = ('Segoe UI', 10, 'bold')   # sub-section headers
+FONT_TITLE    = ('Segoe UI', 14)           # app header title -- regular
+                                            # weight, not bold: restraint is
+                                            # the whole point of this design
+FONT_SUBTITLE = ('Segoe UI', 9)
+FONT_MONO     = ('Consolas', 10)
+FONT_MONO_SM  = ('Consolas', 9)
 
-CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#0891b2', '#be185d']
+CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#8B8B93', '#52525B']
+
+# Light theme for the Whole tab's real-geography choropleth ONLY --
+# matches this app's own current (light) background rather than
+# VoltPath's dark reference, per explicit request; this is still a
+# deliberately separate palette from the C_BG/C_TEXT tokens above (not a
+# reuse of them), so a future change to either can't accidentally bleed
+# into the other.
+C_GEO_BG       = '#EAF2F8'   # page/figure background -- a pale "sea" blue,
+                              # not flat white, so the water reads as
+                              # water rather than as more undifferentiated
+                              # page behind the landmass (plain white was
+                              # visually flat -- no depth cue separating
+                              # "no data here" land from "there's no land
+                              # here at all")
+C_GEO_NODATA   = '#C2C2C9'   # no price to show here -- either a zone this
+                              # app doesn't track at all, or one it does
+                              # but with no price THIS slot. Previously
+                              # two different grays (C_GEO_UNCOVERED vs
+                              # C_GEO_NODATA, "Regions not covered" vs
+                              # "Data not available") -- merged into one
+                              # per explicit request: with ENTSO-E now
+                              # covering most of the map (see
+                              # WHOLE_EXTRA_ZONES), the "untracked"
+                              # category shrank to a handful of edge
+                              # cases (GB, Iceland, Bosnia, ...) and the
+                              # distinction stopped earning its own color
+                              # and legend row. Kept neutral gray (not
+                              # blue-tinted) so it reads as distinct
+                              # "land" against the blue C_GEO_BG "sea".
+C_GEO_BORDER   = '#FFFFFF'   # zone outline stroke -- white "cut-paper"
+                              # gaps between adjacent zones read cleaner
+                              # than a gray hairline, especially now that
+                              # turbo's saturated colors sit edge-to-edge
+C_GEO_TEXT     = '#1A1A1E'   # dark text on the light background
+C_GEO_MUTED    = '#6B6B73'
+C_GEO_PANEL    = '#FFFFFF'   # legend panel fill
+C_GEO_FLOW     = '#52525B'   # "normal" flow arrow -- a neutral dark gray
+                              # that reads clearly against a white/light
+                              # background (VoltPath's own near-white
+                              # arrow was specifically for ITS dark bg)
+C_GEO_COUNTER  = '#DC2626'   # counter-intuitive flow arrow
 
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
@@ -215,6 +361,509 @@ def get_np_access_token():
     except Exception:
         return None
 
+
+def _np_request_with_access_fallback(url, zones, extra_params, hdrs, log_func=lambda m: None):
+    """GET `url` for `zones`; Nord Pool rejects a COMBINED request in
+    full (403) the moment any one requested area isn't on this account's
+    subscription, rather than just omitting that area from the response
+    -- verified live against Core CCR zones (see CORE_ZONES' own comment).
+    Parses the "Missing access for area(s) X, Y, ..." body and retries
+    with just the accessible subset, so a partial-access zone list still
+    returns whatever it can rather than failing outright. Adaptive, not
+    hardcoded to today's known-missing list -- a future subscription
+    change is picked up automatically.
+    Returns (requests.Response_or_None, accessible_zones, missing_zones).
+    """
+    params = extra_params + [('areas', z) for z in zones]
+    r = requests.get(url, headers=hdrs, params=params, timeout=20)
+    if r.status_code == 200:
+        return r, list(zones), []
+    if r.status_code == 403 and 'Missing access' in r.text:
+        m = re.search(r'Missing access for area\(s\)\s*([A-Za-z0-9_,\s]+)', r.text)
+        missing = [s.strip() for s in m.group(1).split(',')] if m else []
+        missing = [z for z in missing if z in zones]
+        accessible = [z for z in zones if z not in missing]
+        log_func(f"  Access: {len(missing)}/{len(zones)} zone(s) not on this "
+                 f"account's subscription ({', '.join(missing)}) -- retrying "
+                 f"with the remaining {len(accessible)}.")
+        if not accessible:
+            return None, [], missing
+        params2 = extra_params + [('areas', z) for z in accessible]
+        r2 = requests.get(url, headers=hdrs, params=params2, timeout=20)
+        if r2.status_code == 200:
+            return r2, accessible, missing
+        return None, [], zones
+    return None, [], []
+
+
+def _parse_np_prices_at_mtu(raw_json, zone_list, date_str, mtu_label):
+    """Picks the single-MTU price per zone out of a NordPool price-API
+    response -- the same parse (iterate delivery areas, iterate each
+    area's prices, convert deliveryStart to CET, match the requested
+    calendar day + "HH:MM" slot) the Core and Whole tab fetch threads
+    both need for their own zone set, factored out rather than kept as
+    two copies that could silently drift apart."""
+    zone_set = set(zone_list)
+    prices = {}
+    for area_data in raw_json:
+        zone = area_data.get('deliveryArea')
+        if zone not in zone_set:
+            continue
+        for p in area_data.get('prices', []):
+            ts = p.get('deliveryStart', '')
+            if not ts:
+                continue
+            try:
+                cet_dt = _utc_to_cet(ts)
+            except Exception:
+                continue
+            if cet_dt.strftime('%Y-%m-%d') != date_str:
+                continue
+            if f"{cet_dt.hour:02d}:{cet_dt.minute:02d}" == mtu_label:
+                prices[zone] = p.get('price')
+    return prices
+
+
+def _extract_cross_region_flows(raw_at_mtu, target_zones, flip_sign=False):
+    """Pulls (Nordic zone, target zone) flows out of a Nordic zone's own
+    scheduled-flow report (`raw_at_mtu`, {(area, other): mw}) -- the ONLY
+    source for a Core/Baltic zone's cross-region flow, since neither
+    Core's nor Baltic's own report ever carries one (see CORE_CONNECTIONS'
+    own comment). `flip_sign=True` re-keys/signs the result from the
+    TARGET zone's own perspective instead of the Nordic zone's (the Core
+    tab's own external-flow circles need this -- see
+    _fetch_tab8_core_thread's own comment on why), used by both the Core
+    tab (target_zones=CORE_ZONES, flip_sign=True) and the Whole tab
+    (target_zones=CORE_ZONES|BALTIC_ZONES, flip_sign=False, its own
+    Nordic-perspective cross_flows)."""
+    out = {}
+    for (area, other), mw in raw_at_mtu.items():
+        if area not in NORDIC_ZONES or other not in target_zones or abs(mw) < 1:
+            continue
+        key = (other, area) if flip_sign else (area, other)
+        val = -mw if flip_sign else mw
+        out[key] = out.get(key, 0.0) + val
+    return out
+
+
+def _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle=-90):
+    """Evenly spaces `zones` around an ellipse centered at (cx, cy) with
+    radii (rx, ry), all normalized [0,1] figure coordinates -- used for
+    Core/Baltic zones, which have no real background-map position (see
+    CORE_ZONES' own comment: no map image exists for them in this repo).
+    start_angle in degrees, -90 = 12 o'clock, going clockwise."""
+    n = len(zones)
+    pos = {}
+    for i, z in enumerate(zones):
+        angle = math.radians(start_angle + 360 * i / n)
+        pos[z] = (cx + rx * math.cos(angle), cy + ry * math.sin(angle))
+    return pos
+
+
+def _schematic_hub_positions(zones, connections, cx, cy, rx, ry, start_angle=-90):
+    """Like _schematic_circle_positions, but when one zone in `zones` is
+    connected (per `connections`) to at least half of the others, that
+    zone is placed at the CENTER and the rest around it, instead of
+    everyone on the circle. A plain circle puts every edge on a chord, so
+    a hub zone with many neighbours (e.g. GER within Core CCR, bordering
+    nearly every other visible Core zone most days) produces a dense
+    crossing star purely from the layout, not from the underlying
+    topology -- hub-and-spoke uses short, largely non-crossing spokes
+    instead for exactly that case, and falls back to a plain circle
+    (below 4 zones, or when no single zone dominates) rather than risk a
+    worse layout on a more balanced subgraph."""
+    n = len(zones)
+    if n < 4:
+        return _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle)
+    zone_set = set(zones)
+    degree = {z: 0 for z in zones}
+    for A, B in connections:
+        if A in zone_set and B in zone_set:
+            degree[A] += 1
+            degree[B] += 1
+    hub = max(zones, key=lambda z: degree[z])
+    if degree[hub] < (n - 1) / 2:
+        return _schematic_circle_positions(zones, cx, cy, rx, ry, start_angle)
+    rest = [z for z in zones if z != hub]
+    pos = {hub: (cx, cy)}
+    pos.update(_schematic_circle_positions(rest, cx, cy, rx, ry, start_angle))
+    return pos
+
+
+# ----------------------------------------------------------------------
+#  REAL-GEOGRAPHY ZONE SHAPES — Whole tab's "flows & prices" choropleth
+# ----------------------------------------------------------------------
+# bidding_zones_europe.geojson carries real bidding-zone boundary shapes
+# for every Nordic/Baltic/Core zone this app tracks, plus a ring of
+# neighbouring countries drawn only as background context (never priced,
+# never labelled). Extracted from electricitymaps-contrib's own
+# world.geojson (https://github.com/electricitymaps/electricitymaps-contrib,
+# geo/world.geojson) -- the only source found with real NO1-5/SE1-4/DK1-2
+# SUB-national splits rather than just country outlines (CORE_ZONES/
+# BALTIC_ZONES above use a schematic, non-geographic layout precisely
+# because no such position data existed in this repo before now).
+# electricitymaps-contrib is AGPLv3-licensed; this extract (geometry +
+# zone codes only, simplified and re-keyed to this app's own zone
+# naming) is used here under those terms -- if this tool is ever
+# distributed or run as a public-facing network service, AGPLv3's
+# source-disclosure obligation applies to it.
+BIDDING_ZONE_GEOJSON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bidding_zones_europe.geojson")
+
+_bidding_zone_geo_cache = None
+
+
+def _load_bidding_zone_geo():
+    """Lazily loads + caches bidding_zones_europe.geojson. Returns None
+    (never raises) if the file is missing next to this script, so the
+    caller can show an on-chart message instead of crashing the GUI --
+    the same "a missing optional asset degrades visibly, not silently"
+    posture this file already uses for a missing map.png. A manual cache
+    rather than @functools.lru_cache (unlike _price_geo_cmap below) on
+    purpose: a missing-file None result is deliberately NOT cached, so a
+    later click retries os.path.exists() and will pick the file up if
+    it's added while the app is still running -- lru_cache would instead
+    cache that first None forever."""
+    global _bidding_zone_geo_cache
+    if _bidding_zone_geo_cache is not None:
+        return _bidding_zone_geo_cache
+    if not os.path.exists(BIDDING_ZONE_GEOJSON_PATH):
+        return None
+    with open(BIDDING_ZONE_GEOJSON_PATH, encoding='utf-8') as f:
+        _bidding_zone_geo_cache = json.load(f)
+    return _bidding_zone_geo_cache
+
+
+def _geojson_geom_to_path(geom):
+    """Converts one GeoJSON Polygon/MultiPolygon geometry into a SINGLE
+    compound matplotlib Path -- every ring (exterior and any holes, across
+    every part of a MultiPolygon) as its own MOVETO..LINETO..CLOSEPOLY
+    subpath within one Path/PathPatch, so a zone with an interior hole or
+    several disjoint land masses (offshore islands) still renders as one
+    patch with correctly-punched holes under matplotlib's default
+    nonzero-winding fill rule. That relies on this source data already
+    following GeoJSON's own right-hand-rule ring winding (exterior
+    counter-clockwise, holes clockwise) -- true of electricitymaps-
+    contrib's own export, not re-verified here per zone."""
+    polys = geom['coordinates'] if geom['type'] == 'MultiPolygon' else [geom['coordinates']]
+    verts, codes = [], []
+    for poly in polys:
+        for ring in poly:
+            for i, (x, y) in enumerate(ring):
+                verts.append((x, y))
+                codes.append(MplPath.MOVETO if i == 0 else MplPath.LINETO)
+            codes[-1] = MplPath.CLOSEPOLY
+    return MplPath(verts, codes)
+
+
+_bidding_zone_paths_cache = None
+
+
+def _load_bidding_zone_paths():
+    """Lazily builds + caches, from _load_bidding_zone_geo()'s raw JSON,
+    each zone's matplotlib Path plus the combined bounding box -- both are
+    pure functions of the (static, file-backed) GeoJSON content, never of
+    a click's own price/flow data, so computing them fresh on every
+    Whole-tab redraw (an earlier version of this code did) would rebuild
+    ~4600 vertices' worth of Path geometry on every "Fetch & Plot" click
+    for no reason. Returns None if the GeoJSON itself is missing (see
+    _load_bidding_zone_geo). The cached Path objects are reused across
+    draws; only the per-zone PathPatch wrapper (which carries this
+    click's own fill color) is built fresh each time, since a Patch
+    artist -- unlike the Path geometry it wraps -- can't be shared once
+    added to an Axes."""
+    global _bidding_zone_paths_cache
+    if _bidding_zone_paths_cache is not None:
+        return _bidding_zone_paths_cache
+    geo = _load_bidding_zone_geo()
+    if geo is None:
+        return None
+    zones = []
+    x0 = y0 = x1 = y1 = None
+    for feat in geo['features']:
+        props = feat['properties']
+        path = _geojson_geom_to_path(feat['geometry'])
+        ext = path.get_extents()
+        x0 = ext.x0 if x0 is None else min(x0, ext.x0)
+        y0 = ext.y0 if y0 is None else min(y0, ext.y0)
+        x1 = ext.x1 if x1 is None else max(x1, ext.x1)
+        y1 = ext.y1 if y1 is None else max(y1, ext.y1)
+        zones.append({
+            "zone": props["zone"],
+            "tracked": props["tracked"],
+            "label_point": tuple(props["label_point"]),
+            "path": path,
+        })
+    _bidding_zone_paths_cache = {"zones": zones, "bounds": (x0, y0, x1, y1)}
+    return _bidding_zone_paths_cache
+
+
+# Fixed price-color-scale bounds for the Whole tab's real-geography map --
+# NOT auto-scaled to each snapshot's own min/max, deliberately: a single
+# outlier (Spain's price is often near zero; a Baltic zone can spike well
+# past 300 during tight supply) would otherwise compress the color
+# differentiation among the "normal"-range zones everyone actually wants
+# to compare at a glance -- confirmed live, adding Spain's ENTSO-E price
+# (0.9 EUR/MWh one test slot) pulled p_min down enough to turn every
+# Nordic zone's usual blue into a washed-out yellow. VoltPath's own
+# legend reads as a fixed "44...445"-style band for the same reason, not
+# a per-frame rescale. A price outside [VMIN, VMAX] still renders --
+# matplotlib colormaps clamp an out-of-[0,1] normalized value to the
+# nearest end color rather than erroring or extrapolating a new hue.
+PRICE_GEO_VMIN = 0.0
+PRICE_GEO_VMAX = 200.0
+
+
+@functools.lru_cache(maxsize=1)
+def _price_geo_cmap():
+    """Blue (low) -> cyan -> green -> yellow -> orange -> red (high)
+    sequential colormap for the Whole tab's real-geography price
+    choropleth -- matplotlib's built-in 'turbo', not a hand-rolled
+    LinearSegmentedColormap. Two earlier hand-rolled attempts both hit
+    the same class of bug: a straight 2-stop RGB interpolation between
+    near-complementary hues (first cyan->orange, then -- after adding a
+    yellow "bridge" stop to fix THAT -- cyan->yellow) desaturates toward
+    a muddy gray/olive in the middle of each transition, confirmed
+    visibly wrong both times (DK1/DK2 the first time, AT/SI/HR the
+    second, each sitting right in the newly-muddy band). 'turbo' is
+    purpose-built to avoid exactly this (confirmed: no muddy band at any
+    sampled point across its range), so it replaces the hand-rolled
+    approach entirely rather than risking a third muddy transition
+    somewhere else in the scale. lru_cache(1) is a formality here (turbo
+    is already a singleton colormap object), kept only for a consistent
+    "cached colormap accessor" shape with the rest of this section."""
+    return mpl.colormaps['turbo']
+
+# ----------------------------------------------------------------------
+#  ENTSO-E — Whole tab's PRIMARY price/flow source, Nord Pool as fallback
+# ----------------------------------------------------------------------
+# ENTSO-E covers every zone this tab tracks (Nordic, Core CCR, Baltic,
+# and Spain -- which Nord Pool structurally never will, since Spain isn't
+# part of Core CCR) from one Transparency Platform account, so it's used
+# as the MAIN source for the Whole tab specifically; Nord Pool's own
+# bulk-request fetch (still run in full, see _fetch_tab8_whole_thread)
+# is kept as the fallback layer for whichever zone/slot ENTSO-E itself
+# doesn't resolve, by merging ENTSO-E's results OVER Nord Pool's (a later
+# dict update wins). This is a Whole-tab-only choice -- the Core tab
+# (_draw_tab8_core_map) stays Nord-Pool-primary, unchanged.
+#
+# Same account's token as propagation.py's own ENTSOE_TOKEN constant --
+# duplicated here, not imported, same "independent copy" reasoning as
+# NORDPOOL_USER/NORDPOOL_PASSWORD above (avoids pulling propagation.py's
+# pandas-heavy import chain into Tab 8 just for one token string, and
+# keeps this tab's own fetch code self-contained the same way its other
+# credentials already are).
+ENTSOE_TOKEN = "3c9307bd-c6e8-4f0c-99de-f9d754ff6488"
+
+# This app's own zone code -> entsoe-py's Area code (used for BOTH day-
+# ahead prices and cross-border flows). Verified LIVE (2026-02-03)
+# against ENTSO-E's Transparency Platform -- every one of these returned
+# real data for both query types. Two things to note, confirmed live
+# rather than assumed: Germany is "DE_LU" (the merged German-Luxembourg
+# price zone), not "GER" or "DE"; every Nordic zone needs an underscore
+# ("NO_1", not "NO1" -- this app's own NORDIC_ZONES/CORE_ZONES/
+# BALTIC_ZONES values are NOT valid entsoe-py codes as-is, unlike the
+# single-zone countries where they happen to coincide).
+ENTSOE_AREA_CODE = {
+    "NO1": "NO_1", "NO2": "NO_2", "NO3": "NO_3", "NO4": "NO_4", "NO5": "NO_5",
+    "SE1": "SE_1", "SE2": "SE_2", "SE3": "SE_3", "SE4": "SE_4",
+    "DK1": "DK_1", "DK2": "DK_2", "FI": "FI",
+    "EE": "EE", "LV": "LV", "LT": "LT",
+    "AT": "AT", "BE": "BE", "CZ": "CZ", "GER": "DE_LU", "FR": "FR",
+    "HR": "HR", "HU": "HU", "NL": "NL", "PL": "PL", "RO": "RO",
+    "SI": "SI", "SK": "SK",
+    "ES": "ES",
+    # Further south/southeast European zones -- verified LIVE
+    # (2026-02-03) to have real ENTSO-E day-ahead price data, unlike a
+    # few other candidates tried the same day and genuinely excluded (see
+    # WHOLE_EXTRA_ZONES' own comment): Ireland is "IE_SEM" (the Single
+    # Electricity Market, not "IE"); Italy has SIX separate price zones
+    # here (north/central-north/central-south/south/Sardinia/Sicily),
+    # not one aggregate "IT".
+    "IE": "IE_SEM", "PT": "PT", "CH": "CH", "RS": "RS", "BG": "BG", "GR": "GR",
+    "AL": "AL", "ME": "ME", "MK": "MK",
+    "IT-NO": "IT_NORD", "IT-CNO": "IT_CNOR", "IT-CSO": "IT_CSUD", "IT-SO": "IT_SUD",
+    "IT-SAR": "IT_SARD", "IT-SIC": "IT_SICI",
+}
+
+# Zones the Whole tab's real-geography map tracks beyond Nordic/Core CCR/
+# Baltic. NOT added to CORE_ZONES itself -- none of these are part of
+# Core CCR, and the Core tab's own schematic layout/hub-and-spoke
+# topology (CORE_CONNECTIONS) is specifically a Core CCR concept that
+# they shouldn't leak into.
+#
+# Every entry here was verified LIVE (2026-02-03) to have real ENTSO-E
+# day-ahead price data. Several more obvious candidates were tried the
+# same day and genuinely don't: GB (post-Brexit, no longer in EU day-
+# ahead coupling -- entsoe-py's own query raised NoMatchingDataError, not
+# a fetch bug), Bosnia (BA) and Moldova (MD) likewise NoMatchingDataError,
+# Iceland (IS, genuinely isolated -- no subsea interconnector to
+# continental Europe at all), Ukraine (UA -- entsoe-py's own internal
+# Area->timezone table uses the key "Europe/Kiev", which errors with
+# ZoneInfoNotFoundError against this sandbox's tzdata; may well work in
+# an environment with a newer/different tzdata, not reflective of
+# ENTSO-E itself lacking the data, but not safe to assume here). Belarus
+# (BY) was never tried -- not an ENTSO-E market member. Luxembourg (LU)
+# and Liechtenstein (LI) have no separate price zone of their own (LU is
+# merged into Germany's own "DE_LU", LI has no day-ahead market, informally
+# part of the Swiss/Austrian grid). All eight stay in the GeoJSON as
+# background-context-only zones (see bidding_zones_europe.geojson's own
+# "tracked": false flag for each).
+WHOLE_EXTRA_ZONES = [
+    "ES", "IE", "PT", "CH", "RS", "BG", "GR", "AL", "ME", "MK",
+    "IT-NO", "IT-CNO", "IT-CSO", "IT-SO", "IT-SAR", "IT-SIC",
+]
+
+# Every zone the Whole tab's own price/flow fetch covers, in one place --
+# used to build the ENTSO-E fetch target list and to compute `missing`
+# (see _fetch_tab8_whole_thread).
+WHOLE_ALL_ZONES = NORDIC_ZONES + CORE_ZONES + BALTIC_ZONES + WHOLE_EXTRA_ZONES
+
+# Fallback cross-region border list, used only when Nord Pool itself is
+# unreachable (no token) and so can't dynamically discover which
+# Nordic<->Core/Baltic interconnectors exist this slot (see
+# _fetch_tab8_whole_thread) -- a short, hand-curated list of the real,
+# well-known interconnectors, not exhaustive, just enough that ENTSO-E
+# cross-region flows still have SOME border list to work from in that
+# degraded case.
+WHOLE_KNOWN_CROSS_BORDERS = [
+    ("DK1", "GER"), ("SE4", "GER"), ("FI", "EE"), ("SE4", "LT"), ("SE4", "PL"),
+]
+
+
+def _fetch_entsoe_price_at_mtu(entsoe_area, date_str, mtu_label, _diag):
+    """Fetches one zone's ENTSO-E day-ahead price for one MTU slot.
+    Lazily imports entsoe-py (and, inside that, pandas) only when this
+    actually runs -- this file is otherwise deliberately pandas-free
+    (see _CET's own comment above) and entsoe-py is an optional
+    dependency (requirements.txt), so a caller with neither installed
+    still gets every OTHER Whole-tab feature; ENTSO-E just doesn't fire
+    and Nord Pool's own fetch (still run regardless) is all the Whole tab
+    has. Returns None (never raises) on any failure -- missing library,
+    auth failure, no data for the window, or a zone whose local calendar
+    day doesn't start at CET midnight -- so the caller can fall back to
+    Nord Pool's own value for that zone rather than crashing the fetch
+    thread or leaving a gap neither source filled.
+
+    Requests a window centered on the target MTU rather than exactly
+    that CET calendar day: several of these zones (the Baltics, Romania)
+    run on EET/EEST, an hour ahead of CET, so a flush "CET day" request
+    window can clip the last local hour of the target zone's own day.
+    """
+    try:
+        from entsoe import EntsoePandasClient
+    except ImportError:
+        _diag(f"[ENTSOE] entsoe-py not installed -- skipping {entsoe_area} price fetch")
+        return None
+    try:
+        import pandas as pd
+        target = pd.Timestamp(f"{date_str} {mtu_label}", tz=_CET_ZONE_NAME)
+        client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
+        s = client.query_day_ahead_prices(
+            entsoe_area, start=target - pd.Timedelta(hours=26), end=target + pd.Timedelta(hours=26))
+        # ENTSO-E prices can be hourly OR 15-min resolution depending on
+        # zone/date -- match the latest index value AT OR BEFORE the
+        # target instant (correct either way) rather than an exact-
+        # equality lookup, which would silently miss every sub-hour slot
+        # on an hourly-resolution zone.
+        idx = s.index[s.index <= target]
+        if len(idx) == 0:
+            return None
+        return float(s.loc[idx[-1]])
+    except Exception as e:
+        _diag(f"[ENTSOE] price fetch failed for {entsoe_area} ({date_str} {mtu_label}): {e}")
+        return None
+
+
+def _fetch_entsoe_flow_at_mtu(area_a, area_b, date_str, mtu_label, _diag):
+    """One border pair's net scheduled physical flow at one MTU slot
+    (positive = A exporting to B), via ENTSO-E's cross-border-flow
+    endpoint. Queries BOTH directions and nets them (A->B minus B->A) --
+    confirmed live that query_crossborder_flows(X, Y) reports 0 for any
+    slot where the flow isn't actually going X->Y that slot (not a
+    missing-data ambiguity), the same "query both sides, net them"
+    pattern this file's own Nord Pool net_flows/cross_flows computation
+    already uses for exactly that reason. Returns None (never raises) on
+    any failure, same posture as _fetch_entsoe_price_at_mtu."""
+    try:
+        from entsoe import EntsoePandasClient
+    except ImportError:
+        return None
+    try:
+        import pandas as pd
+        target = pd.Timestamp(f"{date_str} {mtu_label}", tz=_CET_ZONE_NAME)
+        client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
+        window = dict(start=target - pd.Timedelta(hours=26), end=target + pd.Timedelta(hours=26))
+        s_ab = client.query_crossborder_flows(area_a, area_b, **window)
+        s_ba = client.query_crossborder_flows(area_b, area_a, **window)
+
+        def _at(s):
+            idx = s.index[s.index <= target]
+            return float(s.loc[idx[-1]]) if len(idx) else 0.0
+
+        return _at(s_ab) - _at(s_ba)
+    except Exception as e:
+        _diag(f"[ENTSOE] flow fetch failed for {area_a}<->{area_b} ({date_str} {mtu_label}): {e}")
+        return None
+
+
+def _fetch_entsoe_prices_parallel(zones, date_str, mtu_label, _diag, max_workers=10):
+    """Fetches day-ahead prices for many zones CONCURRENTLY -- ENTSO-E has
+    no bulk/multi-zone price endpoint (unlike Nord Pool's one combined
+    request for every Core/Baltic zone together), so the Whole tab's full
+    ~28-zone target list would mean ~28 sequential round-trips (tens of
+    seconds of pure wait) without this. Returns {app_zone_code: price},
+    silently omitting any zone that isn't in ENTSOE_AREA_CODE or whose
+    fetch failed -- the caller treats an omitted zone exactly like Nord
+    Pool not having it either (falls back, or shows "Data not available"
+    if neither source does)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = {z: ENTSOE_AREA_CODE[z] for z in zones if z in ENTSOE_AREA_CODE}
+    if not targets:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch_entsoe_price_at_mtu, area, date_str, mtu_label, _diag): zone
+                  for zone, area in targets.items()}
+        for fut in as_completed(futures):
+            zone = futures[fut]
+            try:
+                price = fut.result()
+            except Exception as e:
+                _diag(f"[ENTSOE] price worker error for {zone}: {e}")
+                price = None
+            if price is not None:
+                results[zone] = price
+    return results
+
+
+def _fetch_entsoe_flows_parallel(pairs, date_str, mtu_label, _diag, max_workers=10):
+    """Fetches net scheduled flow for many border pairs CONCURRENTLY --
+    see _fetch_entsoe_prices_parallel's own comment on why a thread pool
+    beats a serial loop here (each pair costs 2 ENTSO-E requests, see
+    _fetch_entsoe_flow_at_mtu). `pairs` is an iterable of (zoneA, zoneB)
+    in this app's own zone codes; returns {(zoneA, zoneB): net_mw},
+    omitting any pair with an unmapped zone or a failed fetch."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = {(a, b): (ENTSOE_AREA_CODE[a], ENTSOE_AREA_CODE[b])
+              for a, b in pairs if a in ENTSOE_AREA_CODE and b in ENTSOE_AREA_CODE}
+    if not targets:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_fetch_entsoe_flow_at_mtu, area_a, area_b, date_str, mtu_label, _diag): pair
+                  for pair, (area_a, area_b) in targets.items()}
+        for fut in as_completed(futures):
+            pair = futures[fut]
+            try:
+                mw = fut.result()
+            except Exception as e:
+                _diag(f"[ENTSOE] flow worker error for {pair}: {e}")
+                mw = None
+            if mw is not None:
+                results[pair] = mw
+    return results
+
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
 # ----------------------------------------------------------------------
@@ -228,10 +877,43 @@ def get_np_access_token():
 
 API_URL = "https://publicationtool.jao.eu/nordic/api/data/fbDomainShadowPrice"
 
-_JAO_PAGE_SIZE = 15000
-_JAO_MAX_PAGES = 20  # 20 x 15000 = 300k rows/day -- far beyond any plausible day
-_PS_HTTP_TIMEOUT_S = 60
+_JAO_PAGE_SIZE = 30000
+_JAO_MAX_PAGES = 20  # 20 x 30000 = 600k rows/day -- far beyond any plausible day
+# A real high-volume day (the full unfiltered Nordic+neighboring FB domain's
+# CNEC x MTU grid for the day, not just one zone -- the API's own `filter`
+# param is sent as "{}", so filtering down to specific CNECs only happens
+# client-side afterward) can need 100k+ rows, i.e. several pages at the
+# original 15000. A live run's own log showed per-page latency climbing
+# with page depth even on SUCCESSFUL pages (page 1 ~14s, pages 2-8 each
+# ~29-39s, not flat) -- consistent with the JAO server's own pagination
+# being OFFSET-based (it has to scan-and-discard everything before `skip`
+# on every request, so cost grows with depth), which a bigger page can't
+# fix outright but DOES reduce: fewer, larger jumps mean fewer total
+# "scan up to here" operations server-side for the same total row count,
+# and fewer PowerShell-process-launch/TLS-handshake round trips client-
+# side. _PS_HTTP_TIMEOUT_S is raised to match -- a single request now
+# transfers/parses roughly 2x the rows AND can land at a deeper offset.
+# This is a best-effort tuning based on that one log's evidence, not
+# verified against the live API from this sandbox (no JAO/Windows access
+# here) -- if 30000 turns out to exceed some undocumented server-side
+# `take` cap, lower this back toward 15000 rather than raising it further.
+_PS_HTTP_TIMEOUT_S = 100
 _PS_PROCESS_TIMEOUT_S = _PS_HTTP_TIMEOUT_S + 30  # margin over the PS script's own HTTP timeout
+# Invoke-WebRequest's own -TimeoutSec is documented to not reliably cover a
+# stalled DNS lookup / TLS handshake / proxy negotiation on every PowerShell
+# version -- the connection can hang well past it, which is exactly what the
+# _PS_PROCESS_TIMEOUT_S kill above exists to bound. That means a single "did
+# not exit within Ns" is often a one-off transient stall (a flaky VPN/proxy
+# hiccup), not a permanent failure. The goal of a multi-day fetch is to come
+# back with every requested day, not to fail fast, so this retries several
+# times with a growing backoff (giving a VPN reconnect / proxy hiccup real
+# time to clear, instead of immediately re-hitting whatever just failed)
+# before giving up on the page. Deliberately bounded, not infinite --
+# there's no cancel button on this fetch (see Tab 8's Stop button for
+# contrast), so an unbounded retry loop against a genuinely unreachable API
+# would hang the fetch forever with no way for the user to get out of it.
+_PS_MAX_RETRIES = 3
+_PS_RETRY_BACKOFF_S = [5, 15, 30]  # delay before retry 1, 2, 3 respectively
 
 
 def _fetch_one_page(api_url, log_func):
@@ -349,6 +1031,16 @@ def fetch_day_via_powershell(date_str, log_func, source_tz="UTC"):
                      (f" (page {page + 1}, skip={skip})" if page else ""))
 
             page_rows, err = _fetch_one_page(api_url, log_func)
+            retries_left = _PS_MAX_RETRIES
+            while page_rows is None and retries_left > 0:
+                attempt_num = _PS_MAX_RETRIES - retries_left
+                backoff_s = _PS_RETRY_BACKOFF_S[min(attempt_num, len(_PS_RETRY_BACKOFF_S) - 1)]
+                retries_left -= 1
+                log_func(f"  {date_str}: page {page + 1} failed ({err}) -- "
+                         f"retrying in {backoff_s}s "
+                         f"({_PS_MAX_RETRIES - retries_left}/{_PS_MAX_RETRIES})...")
+                time.sleep(backoff_s)
+                page_rows, err = _fetch_one_page(api_url, log_func)
             if page_rows is None:
                 if all_rows:
                     # Earlier pages already succeeded -- surface the error
@@ -409,9 +1101,16 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
     jao_timestamp_zone = params.get('jao_timestamp_zone', 'UTC')
     _log = status_cb if status_cb else (lambda m: None)
 
-    all_data = []
+    # Keyed by date rather than a flat list so the resweep below can
+    # REPLACE a day's rows outright (a day that failed partway through
+    # pagination -- e.g. a page-7-of-N HTTP 500 after 90,000 rows already
+    # came back -- already holds real rows in all_data; re-fetching it
+    # without a way to discard the old partial rows first would double
+    # them up in the final dataset instead of completing it).
+    all_data_by_date = {}
     total_days = len(date_list)
     failed_dates = []
+    retry_eligible_dates = []  # 0-record OR partial days -- eligible for the resweep below
 
     for idx, d_str in enumerate(date_list):
         day_num = idx + 1
@@ -427,20 +1126,60 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
         # actually reach the user to be of any use.
         batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
         if batch is None:
+            all_data_by_date[d_str] = []
             failed_dates.append(d_str)
+            retry_eligible_dates.append(d_str)
             if status_cb:
                 status_cb(f"  Failed: {d_str} ({err})")
         else:
-            all_data.extend(batch)
+            all_data_by_date[d_str] = batch
             if err:
                 # Partial success: some pages came back before a failure or
                 # the page-count cap was hit. Don't report this the same as
                 # a clean "OK" -- the day's data may be incomplete.
                 failed_dates.append(f"{d_str} (partial: {err})")
+                retry_eligible_dates.append(d_str)
                 if status_cb:
                     status_cb(f"  ⚠ PARTIAL: {d_str} ({len(batch)} records, {err})")
             elif status_cb:
                 status_cb(f"  OK: {d_str} ({len(batch)} records)")
+
+    # Second-chance sweep: any day that didn't come back clean -- zero
+    # records, OR a partial page-pagination failure like an HTTP 500 mid-
+    # day -- gets one more full attempt now, after the rest of the range
+    # has already been fetched. The goal here is to come back with every
+    # requested day complete, not to fail fast -- a stall/error that
+    # outlasted fetch_day_via_powershell's own per-page retries (a longer
+    # VPN reconnect, a proxy hiccup, a transient server-side 500) has had
+    # the time the rest of the range took to fetch to clear, so retrying
+    # now has a materially better shot than another attempt immediately
+    # back-to-back with the one that just failed. A resweep result only
+    # REPLACES what's already held for that day when it's at least as
+    # good (a clean success, or a partial with at least as many rows) --
+    # never regresses a day to fewer rows than it already had.
+    if retry_eligible_dates:
+        _log(f"Retry sweep: re-attempting {len(retry_eligible_dates)} day(s) with "
+             f"incomplete data ({', '.join(retry_eligible_dates)})...")
+        for d_str in retry_eligible_dates:
+            _log(f"  Retry sweep: {d_str}...")
+            batch, err = fetch_day_via_powershell(d_str, _log, source_tz=jao_timestamp_zone)
+            held_n = len(all_data_by_date.get(d_str, []))
+            if batch is not None and (err is None or len(batch) >= held_n):
+                all_data_by_date[d_str] = batch
+                failed_dates = [fd for fd in failed_dates
+                               if fd != d_str and not fd.startswith(f"{d_str} (partial:")]
+                if err:
+                    failed_dates.append(f"{d_str} (partial: {err})")
+                    _log(f"  ⚠ Retry sweep PARTIAL: {d_str} ({len(batch)} records, {err})")
+                else:
+                    _log(f"  Retry sweep OK: {d_str} ({len(batch)} records)")
+            elif batch is not None:
+                _log(f"  Retry sweep for {d_str} returned fewer rows ({len(batch)}) than "
+                     f"already held ({held_n}) -- keeping the original data")
+            else:
+                _log(f"  Retry sweep still failed: {d_str} ({err})")
+
+    all_data = [row for d in date_list for row in all_data_by_date.get(d, [])]
 
     if params.get('shadow_price_filter') == 'positive':
         def _sp_positive(d):
@@ -451,7 +1190,16 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
                 return float(v) > 0
             except (TypeError, ValueError):
                 return False
+        _n_before_sp_filter = len(all_data)
         all_data = [d for d in all_data if _sp_positive(d)]
+        # "Shadow Price > 0 only" discards every non-binding row -- most
+        # Nordic CNECs are non-binding most of the time, so this can (and
+        # routinely does) cut a fetch down by >99%. Without this line the
+        # final "FETCH COMPLETE. Records: N" summary gave no hint that the
+        # small N was this filter's doing rather than a fetch problem.
+        _log(f"Shadow-price filter: kept {len(all_data):,}/{_n_before_sp_filter:,} "
+             f"row(s) with shadow price > 0 "
+             f"({_n_before_sp_filter - len(all_data):,} excluded)")
 
     for entry in all_data:
         if entry.get('dateTimeUtc'):
@@ -486,7 +1234,25 @@ def run_data_fetching_and_processing(params, status_cb=None, progress_cb=None):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("JAO & Nordpool Analytics")
+        if not MATPLOTLIB_OK:
+            # Tk root exists now, so a real dialog can be shown here (see the
+            # import try/except above) instead of letting tab construction
+            # crash later with an opaque NameError on Figure/FigureCanvasTkAgg.
+            messagebox.showerror(
+                "Missing dependency: matplotlib",
+                "This app could not import matplotlib, which most tabs "
+                "(Shadow/RAM, Impact/PTDF, Gen/Cons, Price History, "
+                "Maintenance Analysis) require for charts.\n\n"
+                f"Import error: {MATPLOTLIB_IMPORT_ERROR}\n\n"
+                "Fix: install it into the SAME Python/venv you're running "
+                "this script with, e.g.:\n"
+                "    python -m pip install matplotlib\n\n"
+                "If matplotlib is already installed, this is usually a "
+                "broken/partial install or a version mismatch with another "
+                "package (numpy, etc.) — check the import error above.")
+            root.destroy()
+            raise SystemExit(1)
+        self.root.title("Flow-Based Market Analyser")
         self.root.geometry("1280x980")
         self.root.configure(bg=C_BG)
         self.root.minsize(900, 700)
@@ -530,31 +1296,39 @@ class App:
     #  HEADER BAR
     # ------------------------------------------------------------------
     def _create_header(self):
-        hdr = tk.Frame(self.root, bg=C_ACCENT, height=52)
+        # Plain panel background, not a colored block -- separation from the
+        # content below comes from a single hairline, not a filled bar. The
+        # accent color appears nowhere in this header at all; restraint is
+        # the point, not just "a different set of colors."
+        hdr = tk.Frame(self.root, bg=C_PANEL, height=56)
         hdr.pack(fill=tk.X, side=tk.TOP)
         hdr.pack_propagate(False)
 
-        tk.Label(hdr, text="JAO & Nordpool Analytics",
-                 bg=C_ACCENT, fg='white', font=('Segoe UI', 13, 'bold')
-                 ).pack(side=tk.LEFT, padx=20)
+        title_box = tk.Frame(hdr, bg=C_PANEL)
+        title_box.pack(side=tk.LEFT, padx=24)
+        tk.Label(title_box, text="Flow-Based Market Analyser",
+                 bg=C_PANEL, fg=C_TEXT, font=FONT_TITLE, anchor='w'
+                 ).pack(anchor='w')
+        tk.Label(title_box, text="Developed by Mehdi Foroughi, Market Integration Team",
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_SUBTITLE, anchor='w'
+                 ).pack(anchor='w')
 
-        tk.Label(hdr, text="Energy Market Intelligence Platform",
-                 bg=C_ACCENT, fg='#93c5fd', font=('Segoe UI', 9)
-                 ).pack(side=tk.LEFT, padx=(0, 20))
-
-        # Data status badge (right-aligned)
-        self.data_badge_var = tk.StringVar(value="No data loaded")
-        badge = tk.Label(hdr, textvariable=self.data_badge_var,
-                         bg='#162d4a', fg='#93c5fd',
-                         font=('Segoe UI', 8), padx=12, pady=4)
-        badge.pack(side=tk.RIGHT, padx=16, pady=10)
-
-        # Clock
+        # Clock (packed first so it lands in the far corner)
         self._clock_var = tk.StringVar()
         tk.Label(hdr, textvariable=self._clock_var,
-                 bg=C_ACCENT, fg='#64748b', font=('Segoe UI', 8)
-                 ).pack(side=tk.RIGHT, padx=4)
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM
+                 ).pack(side=tk.RIGHT, padx=(0, 24))
         self._tick_clock()
+
+        # Data status -- plain text, no colored pill; a decorative badge
+        # for a two-state "loaded / not loaded" fact would be the chrome
+        # outweighing the content it's reporting on.
+        self.data_badge_var = tk.StringVar(value="No data loaded")
+        tk.Label(hdr, textvariable=self.data_badge_var,
+                 bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM
+                 ).pack(side=tk.RIGHT)
+
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X, side=tk.TOP)
 
     def _tick_clock(self):
         self._clock_var.set(datetime.now().strftime('%Y-%m-%d  %H:%M:%S'))
@@ -564,12 +1338,17 @@ class App:
     #  STATUS BAR
     # ------------------------------------------------------------------
     def _create_statusbar(self):
-        sb = tk.Frame(self.root, bg='#e2e8f0', height=26)
+        # Plain panel background with a single top hairline -- pack the bar
+        # itself FIRST (side=BOTTOM stacks in call order from the bottom
+        # edge upward, so packing the hairline first would put it below the
+        # bar, at the window's true edge, doing nothing).
+        sb = tk.Frame(self.root, bg=C_PANEL, height=28)
         sb.pack(fill=tk.X, side=tk.BOTTOM)
         sb.pack_propagate(False)
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X, side=tk.BOTTOM)
 
-        self._sb_left  = tk.Label(sb, text="Ready", bg='#e2e8f0', fg=C_MUTED, font=('Segoe UI', 8))
-        self._sb_right = tk.Label(sb, text="",      bg='#e2e8f0', fg=C_MUTED, font=('Segoe UI', 8))
+        self._sb_left  = tk.Label(sb, text="Ready", bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM)
+        self._sb_right = tk.Label(sb, text="",      bg=C_PANEL, fg=C_MUTED, font=FONT_UI_SM)
         self._sb_left.pack(side=tk.LEFT,  padx=10)
         self._sb_right.pack(side=tk.RIGHT, padx=10)
 
@@ -590,52 +1369,81 @@ class App:
         s.configure('TLabel',       background=C_PANEL, foreground=C_TEXT,   font=FONT_UI)
         s.configure('Muted.TLabel', background=C_PANEL, foreground=C_MUTED,  font=FONT_UI)
         s.configure('H1.TLabel',    background=C_PANEL, foreground=C_ACCENT, font=FONT_H1)
-        s.configure('Sum.TLabel',   background='#dcfce7', foreground='#166534',
+        s.configure('Eyebrow.TLabel', background=C_PANEL, foreground=C_MUTED,
+                    font=FONT_LABEL)
+        s.configure('Sum.TLabel',   background=C_SURFACE, foreground=C_ACCENT,
                     font=FONT_BOLD, padding=(10, 5), relief='flat')
 
-        s.configure('TLabelframe',       background=C_PANEL, relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
-        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT, font=FONT_BOLD)
+        # No drawn border at all -- grouping comes from whitespace and the
+        # section label alone. A bordered box around every panel is the
+        # single most common tell of an unstyled/template UI; the point of
+        # a minimal design is trusting spacing to do that job instead.
+        s.configure('TLabelframe',       background=C_PANEL, relief='flat',
+                    borderwidth=0)
+        s.configure('TLabelframe.Label', background=C_PANEL, foreground=C_ACCENT,
+                    font=FONT_H2)
 
+        # Default buttons: flat, borderless, same fill as the surrounding
+        # panel until hovered -- present when you need them, invisible when
+        # you don't, rather than a permanent bordered box competing for
+        # attention with actual content.
         s.configure('TButton', background=C_PANEL, foreground=C_TEXT,
-                    font=FONT_UI, padding=(10, 5), relief='solid',
-                    bordercolor=C_BORDER, borderwidth=1)
+                    font=FONT_UI, padding=(12, 6), relief='flat', borderwidth=0)
         s.map('TButton',
-              background=[('active', '#e8edf5'), ('disabled', '#f1f5f9')],
+              background=[('pressed', C_BORDER), ('active', C_SURFACE),
+                          ('disabled', C_PANEL)],
               foreground=[('disabled', C_MUTED)])
 
+        # One accent color, used deliberately: the single primary action on
+        # a screen is the only thing that gets it. Plain white text on a
+        # solid fill -- no cleverness, just legible and obvious.
         s.configure('Accent.TButton', background=C_PRIMARY, foreground='white',
-                    font=FONT_BOLD, padding=(12, 6), relief='flat', borderwidth=0)
+                    font=FONT_BOLD, padding=(14, 7), relief='flat', borderwidth=0)
         s.map('Accent.TButton',
-              background=[('active', '#1d4ed8'), ('disabled', '#93c5fd')],
-              foreground=[('disabled', 'white')])
+              background=[('pressed', '#0F2A1E'), ('active', '#1F5138'),
+                          ('disabled', C_BORDER)],
+              foreground=[('disabled', C_MUTED)])
 
         s.configure('TEntry',    fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI, padding=(4, 3))
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TEntry', bordercolor=[('focus', C_PRIMARY)],
+              lightcolor=[('focus', C_PRIMARY)])
         s.configure('TCombobox', fieldbackground=C_PANEL, foreground=C_TEXT,
-                    bordercolor=C_BORDER, font=FONT_UI)
-        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)])
+                    bordercolor=C_BORDER, font=FONT_UI, padding=(6, 4))
+        s.map('TCombobox', fieldbackground=[('readonly', C_PANEL)],
+              bordercolor=[('focus', C_PRIMARY)])
 
         s.configure('TRadiobutton', background=C_PANEL, foreground=C_TEXT, font=FONT_UI)
 
-        s.configure('App.TNotebook', background=C_BG, bordercolor=C_BORDER, borderwidth=1)
-        s.configure('App.TNotebook.Tab', padding=(14, 7), font=FONT_UI,
-                    background='#e2e8f0', foreground=C_MUTED)
+        # Tabs carry zero decoration of their own -- no fill change, no
+        # border, nothing but a change in text weight and color between
+        # selected and unselected. This is the most restrained a tab bar
+        # can be while still being unambiguous about which tab is active.
+        s.configure('App.TNotebook', background=C_BG, borderwidth=0)
+        s.configure('App.TNotebook.Tab', padding=(16, 10), font=FONT_UI,
+                    background=C_BG, foreground=C_MUTED, borderwidth=0)
         s.map('App.TNotebook.Tab',
-              background=[('selected', C_PANEL)],
+              background=[('selected', C_BG)],
               foreground=[('selected', C_ACCENT)],
               font=[('selected', FONT_BOLD)])
 
         s.configure('Treeview', background=C_PANEL, foreground=C_TEXT,
-                    fieldbackground=C_PANEL, rowheight=24, font=FONT_UI, borderwidth=0)
-        s.configure('Treeview.Heading', background=C_ACCENT, foreground='white',
-                    font=FONT_BOLD, relief='flat', padding=(6, 4))
+                    fieldbackground=C_PANEL, rowheight=27, font=FONT_UI, borderwidth=0)
+        # A quiet header -- a hairline rule under it, not a solid block of
+        # color, so the emphasis stays on the data rather than the chrome
+        # around it.
+        s.configure('Treeview.Heading', background=C_PANEL, foreground=C_TEXT,
+                    font=FONT_H2, relief='flat', padding=(8, 6),
+                    bordercolor=C_BORDER, borderwidth=1)
+        s.map('Treeview.Heading', background=[('active', C_PANEL)])
         s.map('Treeview',
-              background=[('selected', '#dbeafe')],
+              background=[('selected', C_TINT)],
               foreground=[('selected', C_ACCENT)])
 
         s.configure('TScrollbar', background=C_BORDER, troughcolor=C_BG,
-                    bordercolor=C_BG, arrowcolor=C_MUTED)
+                    bordercolor=C_BG, arrowcolor=C_MUTED, relief='flat',
+                    borderwidth=0)
+        s.map('TScrollbar', background=[('active', C_PRIMARY)])
 
     # ------------------------------------------------------------------
     #  MATPLOTLIB HELPERS
@@ -644,7 +1452,7 @@ class App:
         fig.patch.set_facecolor(C_PANEL)
 
     def _setup_ax(self, ax, labels):
-        ax.set_facecolor('#f8fafc')
+        ax.set_facecolor(C_PANEL)
         for sp in ['top', 'right']:
             ax.spines[sp].set_visible(False)
         for sp in ['left', 'bottom']:
@@ -658,10 +1466,34 @@ class App:
         ax.title.set_color(C_ACCENT)
         ax.title.set_fontsize(9.5)
         ax.title.set_fontweight('bold')
-        ax.grid(True, color='#e2e8f0', linewidth=0.7, linestyle='-', alpha=0.8)
+        ax.grid(True, color=C_BORDER_LO, linewidth=0.7, linestyle='-', alpha=0.9)
         ax.set_axisbelow(True)
+        # These charts plot an integer index on x (0, 1, 2, ...) and only
+        # relabel the visible TICKS with `labels` (see every call site: x
+        # data is `range(len(xs))`, `ax.set_xticklabels(xs)` only touches
+        # what's drawn at each tick) -- so without this, the mouse-position
+        # readout in the toolbar's bottom-left corner shows the raw index
+        # ("x=42.31"), never the actual date/time or CNEC name it stands
+        # for. Overriding format_coord to look the hovered x back up in the
+        # same `labels` list fixes the readout wherever this helper is
+        # already called with real labels, no per-chart change needed.
+        if labels:
+            ax.format_coord = self._index_format_coord(labels)
 
-    def _style_twin(self, ax, color):
+    def _index_format_coord(self, labels):
+        """Shared closure factory behind the hover-format fix in both
+        _setup_ax and _style_twin: given the same `labels` list already
+        used for a chart's x tick labels, returns a format_coord function
+        that looks the hovered x position up in it, instead of showing a
+        raw index float."""
+        _labels_snapshot = list(labels)
+        def _fmt_coord(x, y):
+            idx = int(round(x))
+            xs = _labels_snapshot[idx] if 0 <= idx < len(_labels_snapshot) else f"{x:.2f}"
+            return f"x={xs}   y={y:,.3f}"
+        return _fmt_coord
+
+    def _style_twin(self, ax, color, labels=None):
         ax.tick_params(axis='y', colors=color, labelsize=7.5)
         ax.yaxis.label.set_color(color)
         ax.yaxis.label.set_fontsize(8.5)
@@ -670,6 +1502,22 @@ class App:
         ax.spines['right'].set_visible(True)
         ax.spines['right'].set_color(color)
         ax.spines['right'].set_linewidth(0.8)
+        # A twin axis needs this SAME hover fix as its primary axis, not a
+        # copy of the primary's own fix -- matplotlib's mouse-move handler
+        # only calls format_coord on `event.inaxes`, whichever of the two
+        # overlapping twins is topmost at that pixel (typically the twin,
+        # since it's created after the primary via ax.twinx()). Without
+        # this, hovering shows matplotlib's own DEFAULT twin-aware
+        # format_coord instead -- Axes.format_coord(), when an axes has
+        # twins, renders "(x, y) = (a, b) | (c, d)" by calling
+        # format_xdata()/format_ydata() on EACH twin, and format_xdata()
+        # comes back blank for any x not exactly on a tick once
+        # set_xticklabels() has replaced the axis's formatter with a
+        # FixedFormatter (fine for drawing ticks, useless for arbitrary
+        # continuous hover positions) -- producing exactly the broken
+        # "(x, y) = (, 453.) | (, 1093.)" readout this was fixed for.
+        if labels:
+            ax.format_coord = self._index_format_coord(labels)
 
     def _legend(self, ax, **kw):
         ax.legend(frameon=True, framealpha=0.95, fontsize=7.5,
@@ -721,7 +1569,7 @@ class App:
         canvas.draw()
         self.root.update_idletasks()
 
-    def _plot_net_pos_twin(self, ax, x_idx, y_np):
+    def _plot_net_pos_twin(self, ax, x_idx, y_np, labels=None):
         """Add a net-position twin-axis: blue fill above zero, red below."""
         pos = [v >= 0 for v in y_np]
         neg = [v <  0 for v in y_np]
@@ -730,7 +1578,7 @@ class App:
         ax.plot(x_idx, y_np, color=C_PRIMARY, linewidth=1.2, label="Net Position (MW)")
         ax.axhline(0, color=C_BORDER, linewidth=0.8, linestyle='--')
         ax.set_ylabel("Net Position (MW)", color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax, C_PRIMARY)
+        self._style_twin(ax, C_PRIMARY, labels)
 
     def _add_toolbar(self, canvas, frame):
         for w in frame.winfo_children():
@@ -744,6 +1592,194 @@ class App:
                 pass
         tb.update()
         canvas.draw()
+
+    def _make_scrollable_pane(self, parent):
+        """Wrap arbitrary content in a vertically-scrollable pane -- same
+        pattern Single Event's ITS sub-tab already used (a tk.Canvas
+        viewport + inner Frame + scrollbar + mousewheel binding), factored
+        out so ΔRAM decomposition and Price Spread can have it too, instead
+        of clipping their content on a short window.
+
+        Returns (outer, inner): place OUTER yourself (grid/pack, matching
+        whatever geometry manager the rest of `parent`'s children already
+        use -- this method never places it, since mixing pack and grid on
+        the same parent raises a TclError), and build content into INNER.
+        The canvas auto-tracks the inner frame's size (scrollregion) and
+        keeps the inner frame's width pinned to the viewport's own width,
+        so nothing scrolls horizontally by accident."""
+        outer = ttk.Frame(parent, style='Card.TFrame')
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        vsb = ttk.Scrollbar(outer, orient='vertical')
+        vsb.grid(row=0, column=1, sticky='ns')
+        viewport = tk.Canvas(outer, bg=C_PANEL, yscrollcommand=vsb.set,
+                              highlightthickness=0)
+        viewport.grid(row=0, column=0, sticky='nsew')
+        vsb.config(command=viewport.yview)
+        inner = ttk.Frame(viewport, style='Card.TFrame')
+        win_id = viewport.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_configure(_event=None):
+            viewport.configure(scrollregion=viewport.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_viewport_configure(event):
+            viewport.itemconfigure(win_id, width=event.width)
+        viewport.bind("<Configure>", _on_viewport_configure)
+
+        def _on_scroll(event):
+            viewport.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        viewport.bind("<MouseWheel>", _on_scroll)
+        inner.bind("<MouseWheel>", _on_scroll)
+
+        return outer, inner
+
+    def _open_figure_fullscreen(self, fig, title="Full Screen"):
+        """Pop a snapshot of `fig` open in its own large window -- a static
+        image (fig.savefig), not a second live embedding of the same
+        Figure: reparenting a matplotlib Figure across two simultaneous Tk
+        canvases risks the next in-place redraw (fig.clear() + rebuild,
+        which every chart here does on its next run) fighting over which
+        canvas owns it. A snapshot has none of that risk, and this is a
+        read-only "look closer" view, not a second interactive chart -- the
+        original embedded chart keeps its own zoom/pan toolbar as before.
+
+        Rendered ONCE at a fixed high resolution (dpi=200, well above any
+        screen's pixel density) and then scaled for DISPLAY -- opens
+        already scaled to fit entirely inside the window (no forced
+        scrolling to see the rest of the chart, the original complaint),
+        with Zoom In/Out/Reset/Fit buttons that rescale that same
+        high-res source, so zooming in stays sharp rather than blurring a
+        screen-sized image blown up further. Needs Pillow for arbitrary
+        (non-integer) scaling; without it, falls back to a fixed-size,
+        already-fitted image with no zoom controls -- still fixes the
+        original "doesn't fit" complaint, just without the adjustable
+        view."""
+        if fig is None:
+            return
+        import io
+        buf = io.BytesIO()
+        try:
+            fig.savefig(buf, format='png', dpi=200,
+                        facecolor=fig.get_facecolor(), bbox_inches='tight')
+        except Exception as e:
+            messagebox.showerror("Full Screen", f"Could not render full-screen view: {e}")
+            return
+        png_bytes = buf.getvalue()
+
+        try:
+            from PIL import Image, ImageTk
+            src_img = Image.open(io.BytesIO(png_bytes))
+            src_img.load()
+        except Exception:
+            src_img = None
+
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=C_PANEL)
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        win_w, win_h = int(sw * 0.92), int(sh * 0.90)
+        top.geometry(f"{win_w}x{win_h}+{(sw - win_w) // 2}+{(sh - win_h) // 2}")
+
+        bar = ttk.Frame(top, style='Card.TFrame')
+        bar.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Button(bar, text="Close  (Esc)", command=top.destroy).pack(side=tk.RIGHT)
+
+        vsb = ttk.Scrollbar(top, orient='vertical')
+        hsb = ttk.Scrollbar(top, orient='horizontal')
+        canvas = tk.Canvas(top, bg=C_PANEL, highlightthickness=0,
+                            yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=canvas.yview)
+        hsb.config(command=canvas.xview)
+
+        if src_img is None:
+            # No Pillow -- fall back to a plain tk.PhotoImage, pre-shrunk to
+            # fit the window via subsample() (integer factor only, so this
+            # can undershoot slightly, but that still beats not fitting at
+            # all). No zoom controls in this path.
+            import base64
+            photo = tk.PhotoImage(data=base64.b64encode(png_bytes).decode('ascii'))
+            fx = max(1, -(-photo.width() // max(1, win_w - 40)))
+            fy = max(1, -(-photo.height() // max(1, win_h - 90)))
+            f = max(fx, fy)
+            if f > 1:
+                photo = photo.subsample(f, f)
+            top.image = photo  # keep a reference alive for the widget's lifetime
+            ttk.Label(bar, text="Install Pillow for zoom controls",
+                      style='Muted.TLabel').pack(side=tk.LEFT)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            hsb.pack(side=tk.BOTTOM, fill=tk.X)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+            canvas.create_image(0, 0, anchor='nw', image=photo)
+            canvas.configure(scrollregion=(0, 0, photo.width(), photo.height()))
+            top.bind("<Escape>", lambda e: top.destroy())
+            top.transient(self.root)
+            top.focus_set()
+            return
+
+        # Pillow path: real "adjusting views" -- Fit to Window (default),
+        # Zoom In/Out, Reset to 100%, all rescaling the ONE high-res source
+        # image rather than the display-sized one, so zooming in doesn't
+        # blur. `state` is a plain dict (not instance attrs) since each
+        # popout is independent and short-lived.
+        state = {"scale": 1.0, "tk_img": None}
+
+        def _render():
+            w = max(1, int(src_img.width * state["scale"]))
+            h = max(1, int(src_img.height * state["scale"]))
+            resized = src_img.resize((w, h), Image.LANCZOS)
+            tkimg = ImageTk.PhotoImage(resized)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor='nw', image=tkimg)
+            canvas.configure(scrollregion=(0, 0, w, h))
+            state["tk_img"] = tkimg  # keep a reference alive -- Tk drops a PhotoImage with none
+            zoom_lbl.config(text=f"{int(state['scale'] * 100)}%")
+
+        def _fit_to_window():
+            avail_w = max(1, canvas.winfo_width() or (win_w - 40))
+            avail_h = max(1, canvas.winfo_height() or (win_h - 90))
+            state["scale"] = min(avail_w / src_img.width, avail_h / src_img.height)
+            _render()
+
+        def _zoom(factor):
+            state["scale"] = max(0.1, min(6.0, state["scale"] * factor))
+            _render()
+
+        def _reset():
+            state["scale"] = 1.0
+            _render()
+
+        ttk.Button(bar, text="Fit to Window", command=_fit_to_window).pack(side=tk.LEFT)
+        ttk.Button(bar, text="−", width=3, command=lambda: _zoom(0.8)).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(bar, text="+", width=3, command=lambda: _zoom(1.25)).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(bar, text="Reset (100%)", command=_reset).pack(side=tk.LEFT, padx=(8, 0))
+        zoom_lbl = ttk.Label(bar, text="100%", style='Muted.TLabel')
+        zoom_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        def _on_wheel(event):
+            if event.state & 0x4:  # Ctrl held -> zoom instead of scroll
+                _zoom(1.1 if event.delta > 0 else 0.9)
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _on_wheel)
+        canvas.bind("<Shift-MouseWheel>",
+                    lambda e: canvas.xview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        top.bind("<Escape>", lambda e: top.destroy())
+        top.bind("+", lambda e: _zoom(1.25)); top.bind("=", lambda e: _zoom(1.25))
+        top.bind("-", lambda e: _zoom(0.8))
+        top.bind("0", lambda e: _reset())
+        top.transient(self.root)
+        top.focus_set()
+        # Fit-to-window needs the canvas's REAL size, which isn't known
+        # until the window has actually been mapped/laid out -- schedule
+        # it just after that, rather than computing against win_w/win_h
+        # (the requested geometry, not necessarily the actual one).
+        top.after(50, _fit_to_window)
 
     # ------------------------------------------------------------------
     #  TAB 1 – Fetch / Upload  (two-column layout)
@@ -799,9 +1835,22 @@ class App:
         settings_row.pack(fill=tk.X)
         settings_row.columnconfigure(1, weight=1)
 
-        self.shadow_price_filter_var = tk.StringVar(value="positive")
-        ttk.Radiobutton(settings_row, text="Shadow Price > 0",
-                        variable=self.shadow_price_filter_var, value="positive"
+        # Was a ttk.Radiobutton bound to a StringVar defaulting to
+        # "positive" -- with no sibling Radiobutton in the group, it had
+        # no "off" state to switch to: every live/CSV fetch silently
+        # discarded every non-binding row (shadow price <= 0) with no way
+        # to turn that off from the UI, and no log line even said it had
+        # happened -- "FETCH COMPLETE. Records: 834" after a genuinely
+        # successful 128,656-row day fetch, with nothing connecting the
+        # two numbers. Most of this pipeline's covariates (fall, PTDF,
+        # RAM) don't depend on shadow price at all, so defaulting to
+        # fetching only binding rows silently starved every other
+        # analysis of >99% of its real data. Now a real Checkbutton,
+        # off by default (fetch everything), with the filter itself
+        # logging what it actually removed when turned on.
+        self.shadow_price_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(settings_row, text="Shadow Price > 0 only",
+                        variable=self.shadow_price_filter_var
                         ).grid(row=0, column=0, sticky='w')
 
         tz_f = ttk.Frame(settings_row, style='Card.TFrame')
@@ -844,15 +1893,15 @@ class App:
 
         # ── Status log ───────────────────────────────────────────────
         ttk.Label(main, text="Status Log", style='H1.TLabel').pack(anchor='w', pady=(4, 2))
-        log_frame = tk.Frame(main, bg='#0f172a', padx=2, pady=2)
+        log_frame = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.status_text = tk.Text(
             log_frame, font=FONT_MONO,
-            background='#0f172a', foreground='#94e2d5',
+            background=C_INK, foreground=C_TINT,
             insertbackground='white', relief='flat',
             borderwidth=0, padx=10, pady=8
         )
-        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#1e293b')
+        sb = tk.Scrollbar(log_frame, command=self.status_text.yview, bg='#18181B')
         self.status_text.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.status_text.pack(fill=tk.BOTH, expand=True)
@@ -951,7 +2000,7 @@ class App:
             self.analysis_tree.heading(col, text=lbl)
             self.analysis_tree.column(col, width=120, anchor='center')
         self.analysis_tree.tag_configure('oddrow',  background=C_PANEL)
-        self.analysis_tree.tag_configure('evenrow', background='#f1f5f9')
+        self.analysis_tree.tag_configure('evenrow', background=C_SURFACE)
         self.analysis_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
@@ -963,9 +2012,9 @@ class App:
     #  TAB 2b – Strategic Briefing (UI shell; not yet implemented)
     # ------------------------------------------------------------------
     def _create_tab2_briefing(self, parent):
-        toolbar = tk.Frame(parent, bg='#0f2340', height=46)
+        toolbar = tk.Frame(parent, bg='#111113', height=46)
         toolbar.pack(fill=tk.X, side=tk.TOP)
-        btn_frame = tk.Frame(toolbar, bg='#0f2340')
+        btn_frame = tk.Frame(toolbar, bg='#111113')
         btn_frame.pack(side=tk.RIGHT, padx=14, pady=8)
         self._brfg_refresh_btn = tk.Button(btn_frame, text="Refresh",
                                            command=self._refresh_briefing)
@@ -973,7 +2022,7 @@ class App:
         self._brfg_export_btn = tk.Button(btn_frame, text="Export PDF",
                                           command=self._export_briefing_pdf)
         self._brfg_export_btn.pack(side=tk.LEFT, padx=(8, 0))
-        body = tk.Frame(parent, bg='#f1f5f9')
+        body = tk.Frame(parent, bg=C_SURFACE)
         body.pack(fill=tk.BOTH, expand=True)
         self._brfg_text = tk.Text(body, font=('Segoe UI', 9), state='disabled',
                                   wrap='word', padx=16, pady=16)
@@ -1247,7 +2296,7 @@ class App:
         ax1b.step(x_idx, y_ram, color=C_PRIMARY, where='post', alpha=0.8, linewidth=1.5)
         ax1b.fill_between(x_idx, y_ram, alpha=0.06, color=C_PRIMARY, step='post')
         ax1b.set_ylabel("RAM (MW)", color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax1b, C_PRIMARY)
+        self._style_twin(ax1b, C_PRIMARY, xs)
         ax1.set_title(f"{cnec}  —  {dtype} ({area_label}) vs RAM")
         ax1.set_xticks(list(x_idx)); ax1.set_xticklabels(xs)
         self._setup_ax(ax1, xs); self._legend(ax1)
@@ -1260,7 +2309,7 @@ class App:
                   linewidth=1.2, label="Shadow Price")
         ax2b.fill_between(x_idx, y_sp, alpha=0.08, color=C_RED)
         ax2b.set_ylabel("Shadow Price (€/MWh)", color=C_RED, fontsize=8.5)
-        self._style_twin(ax2b, C_RED)
+        self._style_twin(ax2b, C_RED, xs)
         ax2.set_title(f"{dtype} ({area_label}) vs Shadow Price")
         ax2.set_xticks(list(x_idx)); ax2.set_xticklabels(xs)
         self._setup_ax(ax2, xs); self._legend(ax2)
@@ -1382,7 +2431,11 @@ class App:
 
         ax.set_title("Day-Ahead Market Price History")
         ax.set_ylabel("EUR / MWh", fontsize=8.5)
-        self._setup_ax(ax, [])
+        # unified_labels is the FULL per-index CET label list (only the
+        # visible TICKS are subsampled above, for readability) -- passing
+        # it here fixes hover on every index, not just the ones with a
+        # drawn tick, same as every other dated chart in this file.
+        self._setup_ax(ax, unified_labels)
         self.fig6.tight_layout(pad=2.0)
         self._add_toolbar(self.canvas6, self.toolbar_f6)
 
@@ -1571,7 +2624,7 @@ class App:
         ax1.fill_between(x_idx, y_prc, alpha=0.1, color=C_AMBER)
         ax1.set_ylabel("Price (€/MWh)", color=C_AMBER, fontsize=8.5)
         ax1.tick_params(axis='y', colors=C_AMBER, labelsize=7.5)
-        self._plot_net_pos_twin(ax1.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax1.twinx(), x_idx, y_np, xs)
         ax1.set_title("Day-Ahead Price vs Net Position")
         ax1.set_xticks(list(x_idx)); ax1.set_xticklabels(xs)
         self._setup_ax(ax1, xs); self._legend(ax1)
@@ -1582,7 +2635,7 @@ class App:
         ax2.fill_between(x_idx, y_ram, alpha=0.1, color=C_GREEN, step='post')
         ax2.set_ylabel("RAM (MW)", color=C_GREEN, fontsize=8.5)
         ax2.tick_params(axis='y', colors=C_GREEN, labelsize=7.5)
-        self._plot_net_pos_twin(ax2.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax2.twinx(), x_idx, y_np, xs)
         ax2.set_title("RAM vs Net Position")
         ax2.set_xticks(list(x_idx)); ax2.set_xticklabels(xs)
         self._setup_ax(ax2, xs); self._legend(ax2)
@@ -1593,7 +2646,7 @@ class App:
         ax3.fill_between(x_idx, y_sp, alpha=0.08, color=C_RED)
         ax3.set_ylabel("Shadow Price (€/MWh)", color=C_RED, fontsize=8.5)
         ax3.tick_params(axis='y', colors=C_RED, labelsize=7.5)
-        self._plot_net_pos_twin(ax3.twinx(), x_idx, y_np)
+        self._plot_net_pos_twin(ax3.twinx(), x_idx, y_np, xs)
         ax3.set_title("Shadow Price vs Net Position")
         ax3.set_xticks(list(x_idx)); ax3.set_xticklabels(xs)
         self._setup_ax(ax3, xs); self._legend(ax3)
@@ -1705,6 +2758,10 @@ class App:
 
     def _run_analysis(self):
         if not self.raw_filtered_data:
+            messagebox.showinfo(
+                "No data loaded",
+                "Tab 1 hasn't loaded any data yet — upload a JAO CSV or run "
+                "a live fetch there first, then come back to Tab 2.")
             return
         d_str = self.analysis_date_entry.get().replace('-', '')
         t_str = self.analysis_time_entry.get().strip()
@@ -1749,11 +2806,26 @@ class App:
     def _show_all_histories(self):
         cnec = self._get_selected_cnec()
         if not cnec:
+            if not self.raw_filtered_data:
+                messagebox.showinfo(
+                    "No data loaded",
+                    "Tab 1 hasn't loaded any data yet — upload a JAO CSV or "
+                    "run a live fetch there first, then come back to Tab 2.")
+            else:
+                messagebox.showinfo(
+                    "No CNEC selected",
+                    "Pick a CNEC from the \"Selected CNEC\" dropdown, or "
+                    "click a row in the results table below, first.")
             return
 
         data = sorted([d for d in self.raw_filtered_data if d.get('cneName') == cnec],
                       key=lambda x: (str(x['date']), x['time']))
         if not data:
+            messagebox.showinfo(
+                "No data for this CNEC",
+                f"No loaded rows match CNEC '{cnec}' — the data in Tab 1 "
+                f"may have changed since it was selected. Reselect it from "
+                f"the dropdown/table.")
             return
 
         # Show loading on both canvases, then defer heavy render by 30 ms
@@ -1794,6 +2866,7 @@ class App:
         # plotting a fabricated flat-zero line for an absent field.
         pf_missing = all(m for _, m in pf_flagged) if pf_flagged else False
         pt_missing = all(m for _, m in pt_flagged) if pt_flagged else False
+        ptdf_missing = pf_missing or pt_missing
 
         # ── Tab 3 ──────────────────────────────────────────────────
         self.fig3.clear()
@@ -1806,7 +2879,7 @@ class App:
         ax3b = ax3.twinx()
         ax3b.bar(x_idx, rams, color=C_PRIMARY, alpha=0.2, label='RAM', width=0.7)
         ax3b.set_ylabel('RAM (MW)', color=C_PRIMARY, fontsize=8.5)
-        self._style_twin(ax3b, C_PRIMARY)
+        self._style_twin(ax3b, C_PRIMARY, xs)
         ax3.set_title(f"Shadow Price & RAM  —  {cnec}")
         ax3.set_xticks(list(x_idx))
         ax3.set_xticklabels(xs)
@@ -1836,7 +2909,6 @@ class App:
         a2.plot(x_idx, pt_l,  color=C_AMBER,   linewidth=1.5, label=z_t)
         a2.plot(x_idx, diffs, color=C_MUTED,   linewidth=1.0, linestyle='--', label='Δ PTDF')
         a2.set_ylabel("PTDF", fontsize=8.5)
-        ptdf_missing = pf_missing or pt_missing
         ptdf_title = "PTDF" + ("  ⚠ field absent for one or both zones — shown as 0"
                                 if ptdf_missing else "")
         a2.set_title(ptdf_title, color=(C_AMBER if ptdf_missing else C_ACCENT))
@@ -1868,7 +2940,7 @@ class App:
             'start_cet':           f"{self.start_date_entry.get()}T00:00:00",
             'end_cet':             f"{self.end_date_entry.get()}T00:00:00",
             'output_file':         os.path.join(self.save_folder, self.filename_entry.get()),
-            'shadow_price_filter': self.shadow_price_filter_var.get(),
+            'shadow_price_filter': 'positive' if self.shadow_price_filter_var.get() else None,
             'jao_timestamp_zone':  self.jao_timestamp_zone_var.get(),
         }
         self.run_button.config(state=tk.DISABLED, text="⏳  Fetching…")
@@ -1907,17 +2979,59 @@ class App:
     # ------------------------------------------------------------------
     #  TAB 8 – Nordic Map (Prices + Flows)
     # ------------------------------------------------------------------
+    _T8_SPEED_MS = {"Slow": 1200, "Medium": 600, "Fast": 250}
+
     def _create_tab8_widgets(self):
-        main = ttk.Frame(self.tab8, style='Card.TFrame', padding=12)
+        """Tab 8 is itself a sub-notebook of three panes: Nordic (the
+        original map, unchanged -- real background image + hand-placed
+        positions, full period/playback support), Core (Core CCR zones,
+        schematic layout -- see CORE_ZONES' own comment on why there's no
+        real map image/positions, and why Core-internal borders are
+        plain reference lines rather than flow arrows: Nord Pool simply
+        doesn't publish Core flow data through this API), and Whole
+        (Nordic + Core + Baltic together, cross-region arrows sourced
+        from the NORDIC zones' own flow reports -- the only place this
+        API actually reports a cross-region flow, since neither Core nor
+        Baltic's own report ever does). Core and Whole are single-
+        snapshot "Fetch & Plot" only, not full period/playback like
+        Nordic -- a reasonable follow-up, not built here to keep this
+        addition scoped and verifiable."""
+        outer_nb = ttk.Notebook(self.tab8)
+        outer_nb.pack(fill=tk.BOTH, expand=True)
+
+        nordic_pane = ttk.Frame(outer_nb, style='Card.TFrame')
+        core_pane   = ttk.Frame(outer_nb, style='Card.TFrame')
+        whole_pane  = ttk.Frame(outer_nb, style='Card.TFrame')
+        outer_nb.add(nordic_pane, text='  Nordic  ')
+        outer_nb.add(core_pane,   text='  Core  ')
+        outer_nb.add(whole_pane,  text='  Whole (Nordic + Core + Baltic)  ')
+
+        self._create_tab8_nordic_widgets(nordic_pane)
+        self._create_tab8_core_widgets(core_pane)
+        self._create_tab8_whole_widgets(whole_pane)
+
+    def _create_tab8_nordic_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
         main.pack(fill=tk.BOTH, expand=True)
 
         ctrl = ttk.Frame(main, style='Card.TFrame')
         ctrl.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Label(ctrl, text="Date:").pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="From (CET):").pack(side=tk.LEFT)
         self._t8_date = ttk.Entry(ctrl, width=12)
         self._t8_date.insert(0, self.today_str)
-        self._t8_date.pack(side=tk.LEFT, padx=(4, 16))
+        self._t8_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        # "To" extends "From" into a PERIOD, for Play -- a single "Fetch &
+        # Plot" snapshot always uses From + the MTU dropdown below and
+        # ignores To entirely, so the single-shot behavior is unchanged
+        # when To is left equal to From (its default). Two independent
+        # plain Entries, no auto-sync between them, matching every other
+        # date-range field in this app (e.g. Tab 9's ENTSO-E Start/End).
+        ttk.Label(ctrl, text="To (CET):").pack(side=tk.LEFT)
+        self._t8_end_date = ttk.Entry(ctrl, width=12)
+        self._t8_end_date.insert(0, self.today_str)
+        self._t8_end_date.pack(side=tk.LEFT, padx=(4, 16))
 
         _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
         ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
@@ -1928,8 +3042,50 @@ class App:
         self._t8_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
                                   command=self._plot_tab8)
         self._t8_btn.pack(side=tk.LEFT)
+
+        # ── Slow-motion playback: steps through every MTU slot across the
+        # WHOLE [From, To] period (not just one day), redrawing price + flow
+        # on each one, so a flow reversal or price spike -- or a multi-day
+        # trend -- is watched happening rather than read off a static
+        # snapshot. Reuses the SAME fetch+parse as "Fetch & Plot" (see
+        # _fetch_tab8_period_thread), one Nord Pool request pair per
+        # calendar day in the period, cached in self._t8_period_cache so
+        # switching between a single snapshot and playback for the same
+        # range never re-fetches.
+        self._t8_play_btn = ttk.Button(ctrl, text="▶ Play", command=self._t8_play)
+        self._t8_play_btn.pack(side=tk.LEFT, padx=(12, 4))
+        # Pause freezes the timer at the current frame WITHOUT resetting
+        # _t8_play_idx -- "▶ Play" (relabelled "▶ Resume" while paused)
+        # then continues from that same index instead of restarting the
+        # period from slot 0. Stop, by contrast, is still a full reset
+        # (see _t8_stop_play's own comment) -- the two are deliberately
+        # different actions now, not two names for the same one.
+        self._t8_pause_btn = ttk.Button(ctrl, text="⏸ Pause",
+                                        command=self._t8_pause_play, state=tk.DISABLED)
+        self._t8_pause_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._t8_stop_btn = ttk.Button(ctrl, text="⏹ Stop",
+                                       command=self._t8_stop_play, state=tk.DISABLED)
+        self._t8_stop_btn.pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(ctrl, text="Speed:").pack(side=tk.LEFT)
+        self._t8_speed = ttk.Combobox(ctrl, values=list(self._T8_SPEED_MS),
+                                      width=8, state='readonly')
+        self._t8_speed.set("Slow")
+        self._t8_speed.pack(side=tk.LEFT, padx=(4, 0))
+
         self._t8_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
         self._t8_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Playback state
+        self._t8_period_cache   = None   # {"start","end","prices":{slot:{zone:px}},"flows":{slot:{(A,B):mw}},"external_flows":{slot:{(nordic,other):mw}}}
+                                          # slot = "YYYY-MM-DD HH:MM", one key format for both single-day and multi-day periods
+        self._t8_fetch_mode     = "single"   # "single" | "play" -- which action the in-flight fetch is for
+        self._t8_fetch_target_slot = None
+        self._t8_play_mtus      = []
+        self._t8_play_idx       = 0
+        self._t8_playing        = False   # timer is actively ticking right now
+        self._t8_paused         = False   # a playback session is frozen mid-period,
+                                          # resumable from _t8_play_idx (see _t8_pause_play)
+        self._t8_play_after_id  = None
 
         self.toolbar_f8 = ttk.Frame(main, style='Card.TFrame')
         self.toolbar_f8.pack(fill=tk.X)
@@ -1938,30 +3094,85 @@ class App:
         self.canvas8 = FigureCanvasTkAgg(self.fig8, main)
         self.canvas8.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        # External interconnector flows (Nordic → Core/Baltic/other) are
+        # drawn directly on the map as short outward arrows from their
+        # Nordic anchor zone, tagged with the external zone's code + MW --
+        # see _draw_tab8_map's own "External flow arrows" section. No
+        # separate panel here: the background image only depicts the 12
+        # Nordic zones, so there's no real position to draw TO and no
+        # price to show a color for, just the flow and which zone it's
+        # going to.
+
         # ── Diagnostic log (collapsible, 5 rows) ──────────────────────
-        diag_f = tk.Frame(main, bg='#0f172a', padx=2, pady=2)
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
         diag_f.pack(fill=tk.X, pady=(4, 0))
         self._t8_diag = tk.Text(
             diag_f, font=('Consolas', 8),
-            background='#0f172a', foreground='#94e2d5',
+            background=C_INK, foreground=C_TINT,
             height=5, relief='flat', borderwidth=0, padx=8, pady=4,
             state='disabled'
         )
-        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#1e293b')
+        sb8 = tk.Scrollbar(diag_f, command=self._t8_diag.yview, bg='#18181B')
         self._t8_diag.config(yscrollcommand=sb8.set)
         sb8.pack(side=tk.RIGHT, fill=tk.Y)
         self._t8_diag.pack(fill=tk.X)
 
+    _T8_MAX_PERIOD_DAYS = 31   # soft cap -- one Nord Pool request pair per day, confirm before more
+
+    def _t8_parse_period(self):
+        """Read + validate the From/To fields. Returns (start_str, end_str,
+        n_days) or None (showing an error dialog) if invalid. To defaults
+        to From when blank or equal, so every existing single-day caller
+        keeps working unchanged."""
+        start_str = self._t8_date.get().strip()
+        end_str   = self._t8_end_date.get().strip() or start_str
+        try:
+            d0 = datetime.strptime(start_str, "%Y-%m-%d").date()
+            d1 = datetime.strptime(end_str, "%Y-%m-%d").date()
+        except ValueError:
+            messagebox.showerror("Nordic Map", "Enter From/To as YYYY-MM-DD.")
+            return None
+        if d1 < d0:
+            messagebox.showerror("Nordic Map", "To date is before From date.")
+            return None
+        n_days = (d1 - d0).days + 1
+        return start_str, end_str, n_days
+
     def _plot_tab8(self):
-        date_str = self._t8_date.get().strip()
-        mtu_str  = self._t8_mtu.get().strip()   # "HH:MM"
+        self._t8_stop_play()   # a running animation shouldn't fight a fresh single-shot fetch
+        period = self._t8_parse_period()
+        if period is None:
+            return
+        start_str, end_str, n_days = period
+        mtu_str = self._t8_mtu.get().strip()   # "HH:MM"
         try:
             mtu_h, mtu_m = int(mtu_str[:2]), int(mtu_str[3:])
         except Exception:
             messagebox.showinfo("Info", "Select a valid MTU slot.")
             return
+        # A single snapshot always targets the FROM date specifically --
+        # To only matters for Play (see _t8_parse_period's docstring).
+        slot_label = f"{start_str} {mtu_h:02d}:{mtu_m:02d}"
 
+        if (self._t8_period_cache and self._t8_period_cache["start"] == start_str
+                and self._t8_period_cache["end"] == end_str):
+            # Already fetched this exact range (e.g. from a previous Play)
+            # -- redraw immediately instead of re-querying Nord Pool.
+            self._t8_show_slot(slot_label)
+            self._add_toolbar(self.canvas8, self.toolbar_f8)
+            self._t8_status.config(text="(from cache)", foreground=C_MUTED)
+            return
+
+        if n_days > 1 and not messagebox.askyesno(
+                "Nordic Map",
+                f"A single snapshot only needs the From date -- the To date "
+                f"({end_str}) only matters for Play. Fetch just {start_str}?"):
+            return
+
+        self._t8_fetch_mode = "single"
+        self._t8_fetch_target_slot = slot_label
         self._t8_btn.config(state=tk.DISABLED, text="Loading...")
+        self._t8_play_btn.config(state=tk.DISABLED)
         self._t8_status.config(text="Fetching prices & flows...", foreground=C_MUTED)
         # Clear diagnostic pane while loading
         self._t8_diag.config(state='normal')
@@ -1976,84 +3187,239 @@ class App:
         self.canvas8.draw()
         self.root.update_idletasks()
 
-        threading.Thread(target=self._plot_tab8_thread,
-                         args=(date_str, mtu_h, mtu_m), daemon=True).start()
+        # Single-shot only ever needs the From date's own data -- fetch
+        # just that one day, not the whole period, even if To is set.
+        threading.Thread(target=self._fetch_tab8_period_thread,
+                         args=(start_str, start_str), daemon=True).start()
 
-    def _plot_tab8_thread(self, date_str, mtu_h, mtu_m):
-        """Fetch NordPool DA prices + scheduled physical flows, pass results to the UI thread."""
-        mtu_label  = f"{mtu_h:02d}:{mtu_m:02d}"
-        diag_lines = []
-
-        def _diag(msg):
-            diag_lines.append(msg)
-
-        token = get_np_access_token()
-        if not token:
-            self.root.after(0, self._tab8_done, None, None, date_str, mtu_label,
-                            "AUTH FAILED: could not obtain NordPool access token.",
-                            diag_lines)
+    def _t8_play(self):
+        """Start slow-motion playback: fetch (or reuse cached) prices/flows
+        for every MTU across the WHOLE [From, To] period, then step
+        through them on a timer. If a session is currently PAUSED (see
+        _t8_pause_play), this instead RESUMES it from the exact frame it
+        was paused at, without touching the From/To fields or re-fetching
+        -- a fresh Play-period click (period fields edited, or Stop was
+        pressed since) always still restarts at slot 0, only a paused
+        session skips that reset."""
+        if self._t8_playing:
+            return
+        if self._t8_paused and self._t8_play_mtus:
+            self._t8_paused = False
+            self._t8_playing = True
+            self._t8_btn.config(state=tk.DISABLED)
+            self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
+            self._t8_pause_btn.config(state=tk.NORMAL)
+            self._t8_stop_btn.config(state=tk.NORMAL)
+            self._t8_play_step()
+            return
+        period = self._t8_parse_period()
+        if period is None:
+            return
+        start_str, end_str, n_days = period
+        if (self._t8_period_cache and self._t8_period_cache["start"] == start_str
+                and self._t8_period_cache["end"] == end_str):
+            self._t8_start_playback()
             return
 
-        hdrs         = self._np_headers(token)
-        areas_params = [('areas', z) for z in NORDIC_ZONES]
+        if n_days > self._T8_MAX_PERIOD_DAYS and not messagebox.askyesno(
+                "Nordic Map",
+                f"{n_days} days means {n_days} sequential Nord Pool request "
+                f"pairs -- this can take a while. Continue?"):
+            return
 
-        # Prices
-        prices      = {}
+        self._t8_fetch_mode = "play"
+        self._t8_btn.config(state=tk.DISABLED)
+        self._t8_play_btn.config(state=tk.DISABLED, text="Loading...")
+        self._t8_status.config(
+            text=f"Fetching {n_days} day(s) for playback..." if n_days > 1
+                 else "Fetching full day for playback...",
+            foreground=C_MUTED)
+        self._t8_diag.config(state='normal')
+        self._t8_diag.delete('1.0', tk.END)
+        self._t8_diag.config(state='disabled')
+
+        threading.Thread(target=self._fetch_tab8_period_thread,
+                         args=(start_str, end_str), daemon=True).start()
+
+    def _t8_start_playback(self):
+        all_prices = self._t8_period_cache["prices"]
+        all_flows  = self._t8_period_cache["flows"]
+        slots = sorted(set(all_prices) | set(all_flows))
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
+        if not slots:
+            messagebox.showinfo("Play", "No price/flow data available for this period.")
+            return
+
+        # Always start from the beginning of the period. (Previously this
+        # started from whatever MTU was showing in the combobox -- but
+        # _t8_play_step() itself updates the displayed date/MTU to the
+        # currently-playing slot every frame, so after a full playback
+        # they're left on the LAST slot of the period; a second "Play"
+        # click would then "resume" one frame from the end and stop
+        # immediately, looking broken. Ignoring it and always starting at
+        # index 0 removes that accidental coupling between the display
+        # fields and playback state.)
+        self._t8_play_mtus = slots
+        self._t8_play_idx  = 0
+        self._t8_playing = True
+        self._t8_paused = False
+        self._t8_btn.config(state=tk.DISABLED)
+        self._t8_play_btn.config(state=tk.DISABLED, text="▶ Playing…")
+        self._t8_pause_btn.config(state=tk.NORMAL)
+        self._t8_stop_btn.config(state=tk.NORMAL)
+        self._t8_play_step()
+
+    def _t8_show_slot(self, slot_label):
+        """Draw one slot ("YYYY-MM-DD HH:MM") from the current period cache
+        -- shared by the single-shot cache-hit path and each playback
+        frame."""
+        prices    = self._t8_period_cache["prices"].get(slot_label, {})
+        flows     = self._t8_period_cache["flows"].get(slot_label, {})
+        ext_flows = self._t8_period_cache["external_flows"].get(slot_label, {})
+        self._draw_tab8_map(prices, flows, slot_label, ext_flows)
+
+    def _t8_play_step(self):
+        if not self._t8_playing or self._t8_play_idx >= len(self._t8_play_mtus):
+            self._t8_stop_play()
+            return
+        slot_label = self._t8_play_mtus[self._t8_play_idx]
+        self._t8_show_slot(slot_label)
+        # draw_idle() (not the toolbar-rebuilding _add_toolbar) -- cheap
+        # enough to call every frame without visible lag or flicker.
+        self.canvas8.draw_idle()
+        date_str, mtu_label = slot_label.split(" ", 1)
+        self._t8_date.delete(0, tk.END); self._t8_date.insert(0, date_str)
+        self._t8_mtu.set(mtu_label)
+        self._t8_status.config(
+            text=f"Playing {self._t8_play_idx + 1}/{len(self._t8_play_mtus)}: {slot_label} CET",
+            foreground=C_PRIMARY)
+        self._t8_play_idx += 1
+        interval_ms = self._T8_SPEED_MS.get(self._t8_speed.get(), 1200)
+        self._t8_play_after_id = self.root.after(interval_ms, self._t8_play_step)
+
+    def _t8_pause_play(self):
+        """Freezes playback at the CURRENT frame -- unlike _t8_stop_play,
+        _t8_play_idx is left exactly where it is (not reset to 0), so the
+        next "▶ Resume" click (_t8_play's own paused-session branch)
+        continues from this same point instead of restarting the period.
+        A no-op if nothing is actively playing."""
+        if not self._t8_playing:
+            return
+        self._t8_playing = False
+        self._t8_paused = True
+        if self._t8_play_after_id is not None:
+            try:
+                self.root.after_cancel(self._t8_play_after_id)
+            except Exception:
+                pass
+            self._t8_play_after_id = None
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Resume")
+        self._t8_pause_btn.config(state=tk.DISABLED)
+        self._t8_stop_btn.config(state=tk.NORMAL)
+        self._t8_status.config(
+            text=f"Paused at {self._t8_play_idx}/{len(self._t8_play_mtus)}.",
+            foreground=C_MUTED)
+        self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _t8_stop_play(self):
+        """Full reset -- unlike _t8_pause_play, a subsequent "▶ Play"
+        always restarts the period from slot 0 (see _t8_start_playback's
+        own comment on why that's deliberate), never resumes."""
+        was_active = self._t8_playing or self._t8_paused
+        self._t8_playing = False
+        self._t8_paused = False
+        if self._t8_play_after_id is not None:
+            try:
+                self.root.after_cancel(self._t8_play_after_id)
+            except Exception:
+                pass
+            self._t8_play_after_id = None
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
+        self._t8_pause_btn.config(state=tk.DISABLED)
+        self._t8_stop_btn.config(state=tk.DISABLED)
+        if was_active:
+            self._t8_status.config(text="Stopped.", foreground=C_MUTED)
+            self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _fetch_tab8_one_day(self, date_str, hdrs, areas_params, _diag, fetch_prices=True):
+        """Fetch NordPool DA prices + scheduled physical flows for ONE
+        calendar day, bucketed per bare MTU slot ("HH:MM" -> {...}, no date
+        prefix -- the caller adds that). Returns (day_prices, day_flows_raw,
+        price_error, flow_error). Factored out of what used to be the
+        whole fetch thread so _fetch_tab8_period_thread can call it once
+        per day in a [From, To] range without duplicating the Nord Pool
+        response parsing. `fetch_prices=False` skips the price request+
+        parse entirely (day_prices/price_error stay {}/"") -- for a caller
+        that only wants this day's flows (e.g. the Core tab's own
+        external-flow fetch, which gets its prices from a separate Core-
+        zone-only request), there's no reason to pay for an extra HTTP
+        round-trip plus a full response parse whose result would just be
+        discarded."""
+        day_prices  = {}
         price_error = ""
-        try:
-            price_params = [('date', date_str), ('currency', 'EUR'),
-                            ('market', 'DayAhead')] + areas_params
-            rp = requests.get(NP_PRICE_URL, headers=hdrs,
-                              params=price_params, timeout=20)
-            _diag(f"[PRICE] status={rp.status_code}  url={rp.url}")
-            if rp.status_code != 200:
-                price_error = f"Price API HTTP {rp.status_code}: {rp.text[:200]}"
-                _diag(f"[PRICE] ERROR body: {rp.text[:400]}")
-            else:
-                raw_json = rp.json()
-                if raw_json and isinstance(raw_json, list):
-                    _diag(f"[PRICE] top-level keys: {list(raw_json[0].keys())}")
-                    if raw_json[0].get('prices'):
-                        _diag(f"[PRICE] prices[0] keys: "
-                              f"{list(raw_json[0]['prices'][0].keys())}")
-                for area_data in raw_json:
-                    zone = area_data.get('deliveryArea')
-                    if zone not in NORDIC_ZONES:
-                        continue
-                    for p in area_data.get('prices', []):
-                        ts = p.get('deliveryStart', '')
-                        if not ts:
+        if fetch_prices:
+            try:
+                price_params = [('date', date_str), ('currency', 'EUR'),
+                                ('market', 'DayAhead')] + areas_params
+                rp = requests.get(NP_PRICE_URL, headers=hdrs,
+                                  params=price_params, timeout=20)
+                _diag(f"[PRICE {date_str}] status={rp.status_code}  url={rp.url}")
+                if rp.status_code != 200:
+                    price_error = f"Price API HTTP {rp.status_code} ({date_str}): {rp.text[:200]}"
+                    _diag(f"[PRICE {date_str}] ERROR body: {rp.text[:400]}")
+                else:
+                    raw_json = rp.json()
+                    if raw_json and isinstance(raw_json, list):
+                        _diag(f"[PRICE {date_str}] top-level keys: {list(raw_json[0].keys())}")
+                        if raw_json[0].get('prices'):
+                            _diag(f"[PRICE {date_str}] prices[0] keys: "
+                                  f"{list(raw_json[0]['prices'][0].keys())}")
+                    for area_data in raw_json:
+                        zone = area_data.get('deliveryArea')
+                        if zone not in NORDIC_ZONES:
                             continue
-                        try:
-                            cet_dt = _utc_to_cet(ts)
-                            if (cet_dt.strftime('%Y-%m-%d') == date_str
-                                    and cet_dt.hour   == mtu_h
-                                    and cet_dt.minute == mtu_m):
-                                prices[zone] = p.get('price')
-                                break
-                        except Exception as e:
-                            _diag(f"[PRICE] ts-parse error zone={zone} ts={ts!r}: {e}")
-                _diag(f"[PRICE] matched zones: {sorted(prices.keys())} "
-                      f"(target {mtu_h:02d}:{mtu_m:02d} CET)")
-        except Exception as e:
-            price_error = f"Price API exception: {e}"
-            _diag(f"[PRICE] EXCEPTION: {e}")
+                        for p in area_data.get('prices', []):
+                            ts = p.get('deliveryStart', '')
+                            if not ts:
+                                continue
+                            try:
+                                cet_dt = _utc_to_cet(ts)
+                                if cet_dt.strftime('%Y-%m-%d') != date_str:
+                                    continue
+                                mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
+                                day_prices.setdefault(mtu_label, {})[zone] = p.get('price')
+                            except Exception as e:
+                                _diag(f"[PRICE {date_str}] ts-parse error zone={zone} ts={ts!r}: {e}")
+                    _diag(f"[PRICE {date_str}] MTU slots with data: {len(day_prices)}")
+            except Exception as e:
+                price_error = f"Price API exception ({date_str}): {e}"
+                _diag(f"[PRICE {date_str}] EXCEPTION: {e}")
 
-        # Scheduled Physical Flows
-        flows_raw  = {}
-        flow_error = ""
+        # Scheduled Physical Flows, per MTU: {"HH:MM": {(area,other): MW}}.
+        # `other` is kept as whatever counterpart area code Nord Pool
+        # reports, WITHOUT filtering it to NORDIC_ZONES -- a Nordic area's
+        # own scheduled-flow response already reports every interconnector
+        # it clears on, Core/Baltic ones included, so no separate request
+        # or area list is needed to surface those; only the final
+        # aggregation below (net flows vs. external flows) decides what to
+        # do with a non-Nordic counterpart.
+        day_flows_raw = {}
+        flow_error    = ""
         try:
             flow_params = [('date', date_str), ('market', 'DayAhead')] + areas_params
             rf = requests.get(NP_FLOW_URL, headers=hdrs,
                               params=flow_params, timeout=20)
-            _diag(f"[FLOW] status={rf.status_code}  url={rf.url}")
+            _diag(f"[FLOW {date_str}] status={rf.status_code}  url={rf.url}")
             if rf.status_code != 200:
-                flow_error = f"Flow API HTTP {rf.status_code}: {rf.text[:200]}"
-                _diag(f"[FLOW] ERROR body: {rf.text[:400]}")
+                flow_error = f"Flow API HTTP {rf.status_code} ({date_str}): {rf.text[:200]}"
+                _diag(f"[FLOW {date_str}] ERROR body: {rf.text[:400]}")
             else:
                 raw_flow = rf.json()
                 if raw_flow and isinstance(raw_flow, list):
-                    _diag(f"[FLOW] top-level keys: {list(raw_flow[0].keys())}")
+                    _diag(f"[FLOW {date_str}] top-level keys: {list(raw_flow[0].keys())}")
 
                 def _get_flow_list(ad):
                     for k in ('flows', 'scheduledFlows', 'entries', 'values'):
@@ -2071,86 +3437,187 @@ class App:
                         continue
                     fl_key, flow_list = _get_flow_list(area_data)
                     if fl_key and conn_key_resolved is None:
-                        _diag(f"[FLOW] flow-list key: '{fl_key}'. "
+                        _diag(f"[FLOW {date_str}] flow-list key: '{fl_key}'. "
                               f"Sample slot keys: {list(flow_list[0].keys())}")
 
-                    matched = None
                     for fl in flow_list:
                         ts = fl.get('deliveryStart', '')
                         if not ts:
                             continue
                         try:
                             cet_dt = _utc_to_cet(ts)
-                            if (cet_dt.strftime('%Y-%m-%d') == date_str
-                                    and cet_dt.hour   == mtu_h
-                                    and cet_dt.minute == mtu_m):
-                                matched = fl
-                                break
                         except Exception as e:
-                            _diag(f"[FLOW] ts-parse error area={area} ts={ts!r}: {e}")
-
-                    if matched is None:
-                        continue
-
-                    connections = None
-                    for ck in ('byConnections', 'connections',
-                               'counterpartAreas', 'scheduledExchanges'):
-                        connections = matched.get(ck)
-                        if isinstance(connections, list) and connections:
-                            if conn_key_resolved != ck:
-                                conn_key_resolved = ck
-                                _diag(f"[FLOW] connection-list key: '{ck}'. "
-                                      f"Sample: {list(connections[0].keys())}")
-                            break
-                    if not connections:
-                        _diag(f"[FLOW] WARNING: no connection list in slot "
-                              f"area={area}. Slot keys: {list(matched.keys())}")
-                        continue
-
-                    for conn in connections:
-                        other = (conn.get('area')
-                                 or conn.get('deliveryArea')
-                                 or conn.get('counterpart')
-                                 or conn.get('toArea')
-                                 or conn.get('deliveryAreaCode'))
-                        exp_raw = (conn.get('export')
-                                   or conn.get('exportFlow')
-                                   or conn.get('scheduledExport')
-                                   or conn.get('value')
-                                   or 0)
-                        if not other:
+                            _diag(f"[FLOW {date_str}] ts-parse error area={area} ts={ts!r}: {e}")
                             continue
-                        try:
-                            exp = float(exp_raw or 0)
-                        except (TypeError, ValueError):
-                            exp = 0.0
-                        flows_raw[(area, other)] = flows_raw.get((area, other), 0) + exp
+                        if cet_dt.strftime('%Y-%m-%d') != date_str:
+                            continue
+                        mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
 
-                _diag(f"[FLOW] raw pairs: {len(flows_raw)}  "
-                      f"e.g. {list(flows_raw.items())[:4]}")
+                        connections = None
+                        for ck in ('byConnections', 'connections',
+                                   'counterpartAreas', 'scheduledExchanges'):
+                            connections = fl.get(ck)
+                            if isinstance(connections, list) and connections:
+                                if conn_key_resolved != ck:
+                                    conn_key_resolved = ck
+                                    _diag(f"[FLOW {date_str}] connection-list key: '{ck}'. "
+                                          f"Sample: {list(connections[0].keys())}")
+                                break
+                        if not connections:
+                            continue
+
+                        bucket = day_flows_raw.setdefault(mtu_label, {})
+                        for conn in connections:
+                            other = (conn.get('area')
+                                     or conn.get('deliveryArea')
+                                     or conn.get('counterpart')
+                                     or conn.get('toArea')
+                                     or conn.get('deliveryAreaCode'))
+                            if not other:
+                                continue
+                            if conn_key_resolved and not getattr(self, '_t8_logged_conn_sample', False):
+                                self._t8_logged_conn_sample = True
+                                _diag(f"[FLOW {date_str}] first connection entry, full: {conn}")
+                            # Nordic-internal pairs came out net-correct before
+                            # this fix too, because we query BOTH sides of
+                            # those borders as delivery areas and net their
+                            # two independently-reported "export" figures
+                            # against each other (see below) -- that only
+                            # works by construction when both directions are
+                            # actually observed. For an EXTERNAL zone we
+                            # never request as its own delivery area, so we
+                            # only ever see ITS Nordic counterpart's side of
+                            # the connection; if that side reports export
+                            # and import as two separate, always-nonnegative
+                            # fields (a plausible "scheduled physical flow"
+                            # shape) rather than one already-signed value,
+                            # reading 'export' alone -- as this used to --
+                            # silently produces a value that is >= 0 on
+                            # every row, which is exactly why every external
+                            # arrow was rendering as "exporting" regardless
+                            # of the real direction. Reading both sides and
+                            # netting them fixes that case too, and is a
+                            # no-op (falls back to whichever single field is
+                            # actually populated) wherever the API really
+                            # does report one already-signed value.
+                            exp_raw = (conn.get('export')
+                                       or conn.get('exportFlow')
+                                       or conn.get('scheduledExport')
+                                       or conn.get('export_mw'))
+                            imp_raw = (conn.get('import')
+                                       or conn.get('importFlow')
+                                       or conn.get('scheduledImport')
+                                       or conn.get('import_mw'))
+                            if exp_raw is None and imp_raw is None:
+                                exp_raw = (conn.get('value') or conn.get('flow')
+                                           or conn.get('netFlow') or 0)
+                            try:
+                                exp = float(exp_raw or 0)
+                            except (TypeError, ValueError):
+                                exp = 0.0
+                            try:
+                                imp = float(imp_raw or 0)
+                            except (TypeError, ValueError):
+                                imp = 0.0
+                            net = exp - imp
+                            bucket[(area, other)] = bucket.get((area, other), 0) + net
+
+                _diag(f"[FLOW {date_str}] MTU slots with data: {len(day_flows_raw)}")
         except Exception as e:
-            flow_error = f"Flow API exception: {e}"
-            _diag(f"[FLOW] EXCEPTION: {e}")
+            flow_error = f"Flow API exception ({date_str}): {e}"
+            _diag(f"[FLOW {date_str}] EXCEPTION: {e}")
 
-        # Net flow per canonical border pair (positive = A→B)
-        net_flows = {}
-        for A, B in ZONE_CONNECTIONS:
-            net = flows_raw.get((A, B), 0) - flows_raw.get((B, A), 0)
-            if abs(net) >= 1:
-                net_flows[(A, B)] = net
+        return day_prices, day_flows_raw, price_error, flow_error
 
-        _diag(f"[RESULT] prices={len(prices)} zones  net_flows={len(net_flows)} borders")
+    def _fetch_tab8_period_thread(self, start_str, end_str):
+        """Fetch NordPool DA prices + scheduled physical flows across every
+        calendar day in [start_str, end_str] (inclusive), one request pair
+        per day (Nord Pool's own API is day-scoped), merged into ONE set of
+        dicts keyed by the full slot label "YYYY-MM-DD HH:MM" -- a single
+        key format that works identically whether the caller asked for one
+        day or many, so the rest of Tab 8 (cache, playback stepping,
+        drawing) never needs to branch on "is this a period or a day."""
+        diag_lines = []
 
-        combined_error = "  |  ".join(filter(None, [price_error, flow_error]))
-        self.root.after(0, self._tab8_done, prices, net_flows,
-                        date_str, mtu_label,
+        def _diag(msg):
+            diag_lines.append(msg)
+
+        token = get_np_access_token()
+        if not token:
+            self.root.after(0, self._tab8_period_fetch_done, {}, {}, {},
+                            start_str, end_str,
+                            "AUTH FAILED: could not obtain NordPool access token.",
+                            diag_lines)
+            return
+
+        hdrs         = self._np_headers(token)
+        areas_params = [('areas', z) for z in NORDIC_ZONES]
+
+        d0 = datetime.strptime(start_str, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end_str, "%Y-%m-%d").date()
+        n_days = (d1 - d0).days + 1
+
+        all_prices    = {}   # {"YYYY-MM-DD HH:MM": {zone: price}}
+        all_flows_raw = {}   # {"YYYY-MM-DD HH:MM": {(area,other): MW}}
+        price_errors, flow_errors = [], []
+        for i in range(n_days):
+            date_str = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
+            if n_days > 1:
+                self.root.after(0, self._t8_status.config,
+                                {"text": f"Fetching day {i + 1}/{n_days} ({date_str})...",
+                                 "foreground": C_MUTED})
+            day_prices, day_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
+                date_str, hdrs, areas_params, _diag)
+            for mtu_label, zone_prices in day_prices.items():
+                all_prices[f"{date_str} {mtu_label}"] = zone_prices
+            for mtu_label, flows_raw in day_flows_raw.items():
+                all_flows_raw[f"{date_str} {mtu_label}"] = flows_raw
+            if price_err:
+                price_errors.append(price_err)
+            if flow_err:
+                flow_errors.append(flow_err)
+
+        # Net flow per canonical Nordic-internal border pair (positive =
+        # A→B), per slot.
+        all_net_flows = {}
+        # External flows: any (Nordic zone, non-Nordic counterpart) pair
+        # Nord Pool reported -- Core (Germany, Poland, the Netherlands,
+        # Great Britain, ...), Baltic (Estonia, Lithuania, ...), or
+        # anything else, entirely as returned by the API (see
+        # _fetch_tab8_one_day's own comment on why `other` isn't filtered
+        # there). Only ONE direction's report is available (we only ever
+        # request the Nordic side as `areas`), unlike Nordic-internal pairs
+        # where both sides are requested and netted against each other --
+        # so this is that Nordic zone's own reported export, not a
+        # two-sided net.
+        all_external_flows = {}
+        for slot_label, flows_raw in all_flows_raw.items():
+            net_flows = {}
+            for A, B in ZONE_CONNECTIONS:
+                net = flows_raw.get((A, B), 0) - flows_raw.get((B, A), 0)
+                if abs(net) >= 1:
+                    net_flows[(A, B)] = net
+            if net_flows:
+                all_net_flows[slot_label] = net_flows
+
+            ext_flows = {}
+            for (area, other), mw in flows_raw.items():
+                if area in NORDIC_ZONES and other not in NORDIC_ZONES and abs(mw) >= 1:
+                    ext_flows[(area, other)] = mw
+            if ext_flows:
+                all_external_flows[slot_label] = ext_flows
+
+        _diag(f"[RESULT] {n_days} day(s), {len(all_prices)} slot(s) with prices, "
+              f"{len(all_net_flows)} slot(s) with Nordic-internal flows, "
+              f"{len(all_external_flows)} slot(s) with external flows")
+
+        combined_error = "  |  ".join(price_errors + flow_errors)
+        self.root.after(0, self._tab8_period_fetch_done, all_prices, all_net_flows,
+                        all_external_flows, start_str, end_str,
                         combined_error or None, diag_lines)
 
-    def _tab8_done(self, prices, net_flows, date_str, mtu_label,
-                   error=None, diag_lines=None):
-        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
-        self._t8_status.config(text="")
-
+    def _tab8_period_fetch_done(self, all_prices, all_net_flows, all_external_flows,
+                                start_str, end_str, error=None, diag_lines=None):
         # ── Write diagnostic lines to the log pane ────────────────────
         if diag_lines:
             self._t8_diag.config(state='normal')
@@ -2159,13 +3626,39 @@ class App:
             self._t8_diag.see(tk.END)
             self._t8_diag.config(state='disabled')
 
-        if error:
+        if error and not all_prices and not all_net_flows:
+            self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+            self._t8_play_btn.config(state=tk.NORMAL, text="▶ Play")
             self._t8_status.config(text=f"⚠ {error}", foreground=C_RED)
-            # Still render the map with whatever partial data we have
-            if prices is None and net_flows is None:
-                messagebox.showerror("Tab 8 Error", error)
-                return
+            messagebox.showerror("Tab 8 Error", error)
+            return
 
+        self._t8_period_cache = {"start": start_str, "end": end_str,
+                                 "prices": all_prices, "flows": all_net_flows,
+                                 "external_flows": all_external_flows}
+        self._t8_status.config(
+            text=f"⚠ {error}" if error else "", foreground=C_RED if error else C_MUTED)
+
+        if self._t8_fetch_mode == "play":
+            self._t8_start_playback()
+            return
+
+        # single-shot
+        self._t8_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        self._t8_play_btn.config(state=tk.NORMAL)
+        self._t8_show_slot(self._t8_fetch_target_slot)
+        self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    def _draw_tab8_map(self, prices, net_flows, slot_label, ext_flows=None):
+        """Render one frame (one slot's prices + flows) onto fig8. Called
+        both for a single "Fetch & Plot" snapshot and once per frame during
+        "Play" animation. `slot_label` is the full "YYYY-MM-DD HH:MM" CET
+        slot. `ext_flows` ({(nordic_zone, other_zone): mw}) are drawn as a
+        volume-sized circle per external link, planted out from its Nordic
+        anchor zone -- see "External flow arrows" below for the direction/
+        fill/size encoding -- since the background image only depicts the
+        12 Nordic zones, there's no real position to point TO and no price
+        there to color by, just the zone name and MW."""
         self.fig8.clear()
         ax = self.fig8.add_subplot(111)
 
@@ -2180,7 +3673,7 @@ class App:
                 ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
         else:
             ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0)
-            ax.set_facecolor('#d0e8f0')
+            ax.set_facecolor('#DCE3EA')
 
         # ── Price colour scale ────────────────────────────────────────
         valid_prices = [v for v in prices.values() if v is not None]
@@ -2246,6 +3739,76 @@ class App:
                     bbox=dict(facecolor='white', edgecolor='none',
                               alpha=0.75, pad=1.2))
 
+        # ── External flow arrows (Nordic → Core/Baltic/other) ───────────
+        # No position on this map to point TO (it only depicts the 12
+        # Nordic zones) and no price there to color by -- each link is a
+        # small circle tagged with the external zone's code + MW, planted
+        # OUTWARD from its Nordic anchor zone (away from the Nordic-zone
+        # centroid, a direction-agnostic "leaving the Nordic area"
+        # heuristic that needs no per-zone geography). Grouped by anchor
+        # zone and fanned out by angle so a zone with several external
+        # links (e.g. NO2: NordLink→DE, NorNed→NL, North Sea Link→GB)
+        # doesn't draw them stacked on top of each other.
+        #
+        # Direction and volume are both encoded, not just labelled:
+        #   - the ARROW points the way the energy actually flows -- outward
+        #     (zone -> circle) when the Nordic zone is EXPORTING (mw >= 0,
+        #     the sign convention _fetch_tab8_period_thread's own
+        #     `bucket[(area, other)] = ... exp` already uses), inward
+        #     (circle -> zone) when it's IMPORTING (mw < 0). This is the
+        #     ONLY direction signal -- the circle itself always looks the
+        #     same (solid purple fill, white label) regardless of export
+        #     vs. import, rather than ALSO toggling solid-vs-outline, since
+        #     that doubled up on what the arrow direction already says;
+        #   - the CIRCLE'S RADIUS scales with |mw| relative to the largest
+        #     external flow in this slot, same "line width scales with
+        #     volume" idea the Nordic-internal arrows above already use.
+        has_external = False
+        if ext_flows:
+            has_external = True
+            cx = sum(nx for nx, ny in ZONE_POS_NORM.values()) / len(ZONE_POS_NORM)
+            cy = sum(ny for nx, ny in ZONE_POS_NORM.values()) / len(ZONE_POS_NORM)
+            by_anchor = {}
+            for (nordic, other), mw in ext_flows.items():
+                by_anchor.setdefault(nordic, []).append((other, mw))
+            max_ext = max((abs(mw) for mw in ext_flows.values()), default=1) or 1
+            ext_len_px  = 0.125 * img_w
+            r_min, r_max = 0.020 * img_w, 0.052 * img_w
+            fan_spread = math.radians(32)
+            for nordic, links in sorted(by_anchor.items()):
+                if nordic not in ZONE_POS_NORM:
+                    continue
+                nx0, ny0 = ZONE_POS_NORM[nordic]
+                x0, y0 = nx0 * img_w, ny0 * img_h
+                base_angle = math.atan2(y0 - cy * img_h, x0 - cx * img_w)
+                links.sort(key=lambda t: t[0])
+                n = len(links)
+                for i, (other, mw) in enumerate(links):
+                    angle = base_angle if n == 1 else (
+                        base_angle - fan_spread / 2 + fan_spread * i / (n - 1))
+                    ca, sa = math.cos(angle), math.sin(angle)
+                    r = r_min + (r_max - r_min) * (abs(mw) / max_ext)
+                    cxp, cyp = x0 + ext_len_px * ca, y0 + ext_len_px * sa   # circle center
+                    near_x, near_y = x0 + pad_px * ca, y0 + pad_px * sa     # just off the zone box
+                    edge_x, edge_y = cxp - r * ca, cyp - r * sa             # circle edge nearest the zone
+                    exporting = mw >= 0
+                    if exporting:
+                        arrow_from, arrow_to = (near_x, near_y), (edge_x, edge_y)
+                    else:
+                        arrow_from, arrow_to = (edge_x, edge_y), (near_x, near_y)
+                    lw = 0.8 + 2.2 * (abs(mw) / max_ext)
+                    ax.annotate("", xy=arrow_to, xytext=arrow_from, zorder=4,
+                                arrowprops=dict(arrowstyle='->', color=C_PURPLE,
+                                                lw=lw, mutation_scale=9,
+                                                linestyle=(0, (4, 2))))
+                    circle = Circle((cxp, cyp), r, zorder=5,
+                                     facecolor=C_PURPLE, edgecolor=C_PURPLE,
+                                     linewidth=1.3)
+                    ax.add_patch(circle)
+                    ax.text(cxp, cyp, f"{other}\n{abs(mw):.0f}",
+                            fontsize=5.8, ha='center', va='center', zorder=6,
+                            color='white', fontweight='bold')
+
         # Flow legend
         legend_handles = [
             Line2D([0], [0], color=C_PRIMARY, lw=2,
@@ -2255,6 +3818,12 @@ class App:
             legend_handles.append(
                 Line2D([0], [0], color=C_RED, lw=2,
                        label="Counter-intuitive (expensive → cheap)"))
+        if has_external:
+            legend_handles.append(
+                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
+                       markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
+                       linestyle=(0, (4, 2)), lw=1.5,
+                       label="External (Core/Baltic/other) -- arrow shows direction"))
         ax.legend(handles=legend_handles, loc='lower right', fontsize=7,
                   framealpha=0.88, edgecolor=C_BORDER, facecolor=C_PANEL,
                   labelcolor=C_TEXT)
@@ -2274,22 +3843,820 @@ class App:
 
         ax.axis('off')
         ax.set_title(
-            f"Nordic Map  —  {date_str}  {mtu_label} CET  |  "
+            f"Nordic Map  —  {slot_label} CET  |  "
             f"Price (DayAhead, EUR/MWh) + Flow (MW)",
             fontsize=9.5, fontweight='bold', color=C_ACCENT, pad=8)
         self.fig8.tight_layout(pad=1.5)
-        self._add_toolbar(self.canvas8, self.toolbar_f8)
+
+    # ------------------------------------------------------------------
+    #  TAB 8b – Core (schematic, single snapshot)
+    # ------------------------------------------------------------------
+    def _create_tab8_core_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ctrl = ttk.Frame(main, style='Card.TFrame')
+        ctrl.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(ctrl, text="Date (CET):").pack(side=tk.LEFT)
+        self._t8c_date = ttk.Entry(ctrl, width=12)
+        self._t8c_date.insert(0, self.today_str)
+        self._t8c_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+        ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
+        self._t8c_mtu = ttk.Combobox(ctrl, values=_mtu_slots, width=7, state='readonly')
+        self._t8c_mtu.set("12:00")
+        self._t8c_mtu.pack(side=tk.LEFT, padx=(4, 16))
+
+        self._t8c_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
+                                   command=self._plot_tab8_core)
+        self._t8c_btn.pack(side=tk.LEFT)
+
+        self._t8c_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
+        self._t8c_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
+                  text=("Nord Pool's flow endpoint reports no scheduled physical flow "
+                        "data for Core zones themselves (status=\"Missing\" on every "
+                        "date tried), so CCR-internal borders are shown as plain "
+                        "reference lines, not flow arrows. Import/export to OUTSIDE "
+                        "Core (Nordic for now) is shown the same way as the Nordic "
+                        "tab's own external arrows -- sourced from the Nordic side's "
+                        "OWN report, the only side that publishes it. Not every Core "
+                        "CCR zone may be on this account's Nord Pool subscription -- a "
+                        "zone with no access or no published price this slot is simply "
+                        "left off the map, not shown as a gray or N/A box.")
+                  ).pack(fill=tk.X, pady=(0, 6))
+
+        self.toolbar_f8c = ttk.Frame(main, style='Card.TFrame')
+        self.toolbar_f8c.pack(fill=tk.X)
+        self.fig8c = Figure(figsize=(8, 8), dpi=95)
+        self._style_figure(self.fig8c)
+        self.canvas8c = FigureCanvasTkAgg(self.fig8c, main)
+        self.canvas8c.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
+        diag_f.pack(fill=tk.X, pady=(4, 0))
+        self._t8c_diag = tk.Text(
+            diag_f, font=('Consolas', 8), background=C_INK, foreground=C_TINT,
+            height=4, relief='flat', borderwidth=0, padx=8, pady=4, state='disabled')
+        sb = tk.Scrollbar(diag_f, command=self._t8c_diag.yview, bg='#18181B')
+        self._t8c_diag.config(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._t8c_diag.pack(fill=tk.X)
+
+    def _t8c_log(self, msg):
+        self._t8c_diag.config(state='normal')
+        self._t8c_diag.insert(tk.END, msg + "\n")
+        self._t8c_diag.see(tk.END)
+        self._t8c_diag.config(state='disabled')
+
+    def _plot_tab8_core(self):
+        date_str = self._t8c_date.get().strip()
+        mtu_label = self._t8c_mtu.get().strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Core Map", "Enter Date as YYYY-MM-DD.")
+            return
+        self._t8c_btn.config(state=tk.DISABLED, text="Fetching…")
+        self._t8c_status.config(text="Fetching prices…", foreground=C_MUTED)
+        self._show_chart_loading(self.fig8c, self.canvas8c)
+        threading.Thread(target=self._fetch_tab8_core_thread,
+                         args=(date_str, mtu_label), daemon=True).start()
+
+    def _fetch_tab8_core_thread(self, date_str, mtu_label):
+        def _diag(msg):
+            self.root.after(0, self._t8c_log, msg)
+        token = get_np_access_token()
+        if not token:
+            self.root.after(0, self._tab8_core_fetch_done, None, None, None, date_str, mtu_label,
+                            "AUTH FAILED: could not obtain NordPool access token.")
+            return
+        hdrs = self._np_headers(token)
+        price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
+        r, accessible, missing = _np_request_with_access_fallback(
+            NP_PRICE_URL, CORE_ZONES, price_params, hdrs, _diag)
+        if r is None:
+            self.root.after(0, self._tab8_core_fetch_done, None, None, missing, date_str, mtu_label,
+                            "Price API: no accessible Core zone returned data "
+                            f"({', '.join(missing) if missing else 'unknown error'}).")
+            return
+        prices = _parse_np_prices_at_mtu(r.json(), CORE_ZONES, date_str, mtu_label)
+
+        # Core zones' OWN flow report is always empty (status="Missing" --
+        # see CORE_CONNECTIONS' own comment on why), so the only way to
+        # show a Core zone's import/export to "outside" is the same
+        # workaround _fetch_tab8_whole_thread's cross_flows already uses:
+        # fetch the NORDIC side's own report, which does carry each
+        # Nordic zone's cleared interconnector flow to its Core
+        # counterpart, re-keyed to the Core zone's own perspective (see
+        # _extract_cross_region_flows' own comment on the sign flip).
+        # Mirrors the original Nordic tab's own external-flow treatment,
+        # just anchored on the Core zone instead of the Nordic one.
+        # Core<->Baltic isn't included here -- neither side publishes
+        # that one (Baltic's own report is empty too, the same as
+        # Core's), so there's no source for it at all, not just a
+        # missing one.
+        nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
+        _, nordic_flows_raw, _, flow_err = self._fetch_tab8_one_day(
+            date_str, hdrs, nordic_areas_params, _diag, fetch_prices=False)
+        if flow_err:
+            _diag(f"[CORE] Nordic flow fetch (for external arrows) error: {flow_err}")
+        raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
+        ext_flows = _extract_cross_region_flows(raw_at_mtu, CORE_ZONES, flip_sign=True)
+
+        self.root.after(0, self._tab8_core_fetch_done, prices, ext_flows, missing,
+                        date_str, mtu_label, None)
+
+    def _tab8_core_fetch_done(self, prices, ext_flows, missing_zones, date_str, mtu_label, error):
+        self._t8c_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        if error:
+            self._t8c_status.config(text=f"⚠ {error}", foreground=C_RED)
+            messagebox.showerror("Core Map", error)
+            return
+        self._draw_tab8_core_map(prices or {}, missing_zones or [], f"{date_str} {mtu_label}",
+                                 ext_flows or {})
+        self.canvas8c.draw()
+        self._add_toolbar(self.canvas8c, self.toolbar_f8c)
+        n_na = len(missing_zones or [])
+        self._t8c_status.config(
+            text=f"Done. {n_na} zone(s) unavailable (no API access)." if n_na else "Done.",
+            foreground=C_MUTED)
+
+    # External-flow circle geometry (see the "External flow arrows" block
+    # below) -- module-level constants, not inline magic numbers, because
+    # the axis margin just below is DERIVED from them: a circle can sit
+    # EXT_LEN + R_MAX beyond a zone position at the edge of the main
+    # layout circle, so that's exactly how far the axis limits need to
+    # extend to avoid clipping it. Keeping them here means a future
+    # change to the circle sizing can't silently reopen the clipping bug
+    # this margin exists to fix.
+    _EXT_LEN = 0.17
+    _EXT_R_MIN, _EXT_R_MAX = 0.024, 0.052
+
+    def _draw_tab8_core_map(self, prices, missing_zones, slot_label, ext_flows):
+        self.fig8c.clear()
+        ax = self.fig8c.add_subplot(111)
+        # Flush [0,1] normally -- _schematic_hub_positions' own cx/rx
+        # bounds (0.46 +/- 0.35) never leave that range on their own.
+        # Margin is only added when there are external-flow circles to
+        # plant outward from a zone, which can push past a flush edge.
+        margin = (self._EXT_LEN + self._EXT_R_MAX + 0.01) if ext_flows else 0.0
+        ax.set_xlim(-margin, 1 + margin); ax.set_ylim(1 + margin, -margin)
+        ax.set_facecolor('#F3F2EE')
+
+        # A zone is drawn only if it has a REAL price this slot -- no API
+        # access and "accessible but no price published yet" both result
+        # in the zone (and any reference line touching it) being left off
+        # the chart entirely, rather than shown as a gray or "NaN" box.
+        visible_zones = [z for z in CORE_ZONES
+                         if z not in missing_zones and prices.get(z) is not None]
+        if not visible_zones:
+            ax.text(0.5, 0.5, "No Core zone has usable price data for this "
+                    "slot (no API access, or not published yet).",
+                    ha='center', va='center', fontsize=10, color=C_MUTED,
+                    transform=ax.transAxes, wrap=True)
+            ax.axis('off')
+            ax.set_title(f"Core CCR  —  {slot_label} CET", fontsize=9,
+                         fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+            self.fig8c.tight_layout(pad=1.5)
+            return
+
+        # Hub-and-spoke rather than a plain circle: Core CCR's real
+        # topology has GER bordering nearly every other zone, which on a
+        # plain circle draws as a dense crossing star for no reason other
+        # than the layout -- see _schematic_hub_positions' own comment.
+        pos = _schematic_hub_positions(visible_zones, CORE_CONNECTIONS,
+                                       cx=0.46, cy=0.48, rx=0.35, ry=0.33)
+
+        # Reference topology only -- never a flow arrow, see this tab's
+        # own on-screen note and CORE_CONNECTIONS' comment on why. Kept
+        # light and low-zorder so it recedes behind the zone boxes rather
+        # than competing with them.
+        for A, B in CORE_CONNECTIONS:
+            if A not in pos or B not in pos:
+                continue
+            xA, yA = pos[A]; xB, yB = pos[B]
+            ax.plot([xA, xB], [yA, yB], color='#D5D3C9', linewidth=0.9,
+                    linestyle='-', zorder=1, alpha=0.8, solid_capstyle='round')
+
+        valid_prices = [prices[z] for z in visible_zones]
+        p_min = min(valid_prices)
+        p_max = max(valid_prices)
+        p_span = max(p_max - p_min, 1.0)
+        cmap = mpl.colormaps['RdYlGn_r']
+
+        for zone in visible_zones:
+            x, y = pos[zone]
+            price = prices[zone]
+            fc = cmap((price - p_min) / p_span)
+            ax.text(x, y, f"{zone}\n{price:.1f} EUR", ha='center', va='center',
+                    fontsize=7.5, fontweight='bold', color='white', zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.4,rounding_size=0.5', facecolor=fc,
+                             edgecolor='white', linewidth=1.4, alpha=0.95))
+
+        # ── External flow arrows (Core → Nordic/outside) ────────────────
+        # Same device the Nordic tab uses for its own external links (see
+        # _draw_tab8_map's "External flow arrows" comment): no position on
+        # THIS chart to point to (only Core zones have one here) and no
+        # price on the other end to color by, so each link is a small
+        # circle tagged with the other zone's code + MW, planted outward
+        # from its Core anchor zone, fanned by angle when a zone has more
+        # than one external link. `ext_flows` is already keyed/signed from
+        # the CORE zone's own perspective (positive = that Core zone
+        # exporting) -- see _fetch_tab8_core_thread's own comment on the
+        # sign flip this required, since the underlying API only ever
+        # reports the Nordic side's own value.
+        if ext_flows:
+            by_anchor = {}
+            for (core_zone, other), mw in ext_flows.items():
+                if core_zone not in pos:
+                    continue
+                by_anchor.setdefault(core_zone, []).append((other, mw))
+            max_ext = max((abs(mw) for mw in ext_flows.values()), default=1) or 1
+            cx0 = sum(x for x, y in pos.values()) / len(pos)
+            cy0 = sum(y for x, y in pos.values()) / len(pos)
+            ext_len = self._EXT_LEN
+            r_min, r_max = self._EXT_R_MIN, self._EXT_R_MAX
+            for core_zone, links in sorted(by_anchor.items()):
+                x0, y0 = pos[core_zone]
+                dx0, dy0 = x0 - cx0, y0 - cy0
+                # The hub zone sits AT the centroid by construction (see
+                # _schematic_hub_positions), so "direction away from the
+                # centroid" is undefined for it -- pick a fixed reference
+                # direction (straight up) instead of an arbitrary/unstable
+                # atan2(~0, ~0).
+                if (dx0 ** 2 + dy0 ** 2) ** 0.5 < 0.01:
+                    base_angle = -math.pi / 2
+                else:
+                    base_angle = math.atan2(dy0, dx0)
+                links.sort(key=lambda t: t[0])
+                n = len(links)
+                # Scales with the number of links on this one anchor --
+                # a fixed 32° spread (fine for 2 links) put 3+ links' MW
+                # circles close enough to visibly overlap at this radius.
+                fan_spread = math.radians(min(340, 55 * max(1, n - 1)))
+                for i, (other, mw) in enumerate(links):
+                    angle = base_angle if n == 1 else (
+                        base_angle - fan_spread / 2 + fan_spread * i / (n - 1))
+                    ca, sa = math.cos(angle), math.sin(angle)
+                    r = r_min + (r_max - r_min) * (abs(mw) / max_ext)
+                    cxp, cyp = x0 + ext_len * ca, y0 + ext_len * sa
+                    near_x, near_y = x0 + 0.045 * ca, y0 + 0.045 * sa
+                    edge_x, edge_y = cxp - r * ca, cyp - r * sa
+                    exporting = mw >= 0
+                    if exporting:
+                        arrow_from, arrow_to = (near_x, near_y), (edge_x, edge_y)
+                    else:
+                        arrow_from, arrow_to = (edge_x, edge_y), (near_x, near_y)
+                    lw = 0.8 + 2.2 * (abs(mw) / max_ext)
+                    ax.annotate("", xy=arrow_to, xytext=arrow_from, zorder=4,
+                                arrowprops=dict(arrowstyle='->', color=C_PURPLE,
+                                                lw=lw, mutation_scale=9,
+                                                linestyle=(0, (4, 2))))
+                    circle = Circle((cxp, cyp), r, zorder=5,
+                                     facecolor=C_PURPLE, edgecolor=C_PURPLE,
+                                     linewidth=1.3)
+                    ax.add_patch(circle)
+                    ax.text(cxp, cyp, f"{other}\n{abs(mw):.0f}",
+                            fontsize=5.8, ha='center', va='center', zorder=6,
+                            color='white', fontweight='bold')
+
+        legend_handles = [
+            Line2D([0], [0], color='#B8B6AE', lw=1.5,
+                   label="Core-internal border (no flow data)"),
+        ]
+        if ext_flows:
+            legend_handles.append(
+                Line2D([0], [0], marker='o', markersize=7, color=C_PURPLE,
+                       markerfacecolor=C_PURPLE, markeredgecolor=C_PURPLE,
+                       linestyle=(0, (4, 2)), lw=1.5,
+                       label="Import/export to outside Core (Nordic) -- arrow shows direction"))
+        ax.legend(handles=legend_handles, loc='lower right', fontsize=6.3,
+                  framealpha=0.9, edgecolor=C_BORDER, facecolor=C_PANEL, labelcolor=C_TEXT)
+
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
+        sm.set_array([])
+        cbar = self.fig8c.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
+        cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
+        cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
+        for lbl in cbar.ax.yaxis.get_ticklabels():
+            lbl.set_color(C_MUTED)
+
+        ax.axis('off')
+        # loc='left' (not the default centered) -- a long title at this
+        # fontsize otherwise overflows past the left edge of this axes,
+        # which tight_layout has already inset to make room for the
+        # colorbar; left-aligned, it starts inside the visible area
+        # regardless of axes width or title length.
+        ax.set_title(f"Core CCR  —  {slot_label} CET  |  schematic, not geographic",
+                     fontsize=9, fontweight='bold', color=C_ACCENT, pad=8, loc='left')
+        self.fig8c.tight_layout(pad=1.5)
+
+    # ------------------------------------------------------------------
+    #  TAB 8c – Whole (Nordic + Core + Baltic, schematic, single snapshot)
+    # ------------------------------------------------------------------
+    def _create_tab8_whole_widgets(self, parent):
+        main = ttk.Frame(parent, style='Card.TFrame', padding=12)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ctrl = ttk.Frame(main, style='Card.TFrame')
+        ctrl.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(ctrl, text="Date (CET):").pack(side=tk.LEFT)
+        self._t8w_date = ttk.Entry(ctrl, width=12)
+        self._t8w_date.insert(0, self.today_str)
+        self._t8w_date.pack(side=tk.LEFT, padx=(4, 10))
+
+        _mtu_slots = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 15, 30, 45)]
+        ttk.Label(ctrl, text="MTU (CET):").pack(side=tk.LEFT)
+        self._t8w_mtu = ttk.Combobox(ctrl, values=_mtu_slots, width=7, state='readonly')
+        self._t8w_mtu.set("12:00")
+        self._t8w_mtu.pack(side=tk.LEFT, padx=(4, 16))
+
+        self._t8w_btn = ttk.Button(ctrl, text="Fetch & Plot", style='Accent.TButton',
+                                   command=self._plot_tab8_whole)
+        self._t8w_btn.pack(side=tk.LEFT)
+
+        self._t8w_status = ttk.Label(ctrl, text="", style='Muted.TLabel')
+        self._t8w_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
+                  text=("Real-geography choropleth (zone shapes from a local "
+                        "electricitymaps-contrib extract, AGPLv3 -- see "
+                        "BIDDING_ZONE_GEOJSON_PATH's own comment). ENTSO-E is the PRIMARY "
+                        "price/flow source for every zone shown here -- Nordic, Core CCR, "
+                        "Baltic, plus Spain/Ireland/Portugal/Italy (6 price zones)/"
+                        "Switzerland/the Western Balkans, none of which Nord Pool reaches "
+                        "(see WHOLE_EXTRA_ZONES' own comment for the few candidates tried "
+                        "and genuinely excluded: GB, Iceland, Bosnia, Moldova, Ukraine) -- "
+                        "fetched in parallel per zone/border, including Core-internal and "
+                        "Baltic-internal borders (AT-CZ, EE-LV, ...), which never had a flow "
+                        "source at all before ENTSO-E. Nord Pool's own combined-request fetch "
+                        "still runs too and fills in anywhere ENTSO-E itself didn't resolve "
+                        "this slot. Gray (\"No price data\") covers both a zone this app "
+                        "doesn't track at all and one it does but with no price this slot -- "
+                        "one color/legend row for both now, not two.")
+                  ).pack(fill=tk.X, pady=(0, 6))
+
+        self.toolbar_f8w = ttk.Frame(main, style='Card.TFrame')
+        self.toolbar_f8w.pack(fill=tk.X)
+        self.fig8w = Figure(figsize=(9, 9), dpi=95)
+        self._style_figure(self.fig8w)
+        self.canvas8w = FigureCanvasTkAgg(self.fig8w, main)
+        self.canvas8w.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        diag_f = tk.Frame(main, bg=C_INK, padx=2, pady=2)
+        diag_f.pack(fill=tk.X, pady=(4, 0))
+        self._t8w_diag = tk.Text(
+            diag_f, font=('Consolas', 8), background=C_INK, foreground=C_TINT,
+            height=4, relief='flat', borderwidth=0, padx=8, pady=4, state='disabled')
+        sb = tk.Scrollbar(diag_f, command=self._t8w_diag.yview, bg='#18181B')
+        self._t8w_diag.config(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._t8w_diag.pack(fill=tk.X)
+
+    def _t8w_log(self, msg):
+        self._t8w_diag.config(state='normal')
+        self._t8w_diag.insert(tk.END, msg + "\n")
+        self._t8w_diag.see(tk.END)
+        self._t8w_diag.config(state='disabled')
+
+    def _plot_tab8_whole(self):
+        date_str = self._t8w_date.get().strip()
+        mtu_label = self._t8w_mtu.get().strip()
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            messagebox.showerror("Whole Map", "Enter Date as YYYY-MM-DD.")
+            return
+        self._t8w_btn.config(state=tk.DISABLED, text="Fetching…")
+        self._t8w_status.config(text="Fetching prices & flows…", foreground=C_MUTED)
+        self._show_chart_loading(self.fig8w, self.canvas8w)
+        threading.Thread(target=self._fetch_tab8_whole_thread,
+                         args=(date_str, mtu_label), daemon=True).start()
+
+    def _fetch_tab8_whole_thread(self, date_str, mtu_label):
+        def _diag(msg):
+            self.root.after(0, self._t8w_log, msg)
+
+        # Nord Pool is the FALLBACK layer for the Whole tab now (see the
+        # ENTSO-E section's own comment on why ENTSO-E is primary here) --
+        # its own token/access failures are no longer fatal to this
+        # fetch, just a reason to skip straight to ENTSO-E-only data.
+        nordic_prices, nordic_flows_raw = {}, {}
+        cb_prices_at_mtu = {}
+        token = get_np_access_token()
+        if not token:
+            _diag("[WHOLE] Nord Pool auth failed -- continuing with ENTSO-E only.")
+        else:
+            hdrs = self._np_headers(token)
+            nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
+            nordic_prices, nordic_flows_raw, price_err, flow_err = self._fetch_tab8_one_day(
+                date_str, hdrs, nordic_areas_params, _diag)
+            if price_err:
+                _diag(f"[WHOLE] Nordic price error: {price_err}")
+            if flow_err:
+                _diag(f"[WHOLE] Nordic flow error: {flow_err}")
+
+            core_baltic_zones = CORE_ZONES + BALTIC_ZONES
+            price_params = [('date', date_str), ('currency', 'EUR'), ('market', 'DayAhead')]
+            r, accessible, np_missing = _np_request_with_access_fallback(
+                NP_PRICE_URL, core_baltic_zones, price_params, hdrs, _diag)
+            cb_prices_at_mtu = (_parse_np_prices_at_mtu(r.json(), core_baltic_zones, date_str, mtu_label)
+                               if r is not None else {})
+
+        nordic_prices_at_mtu = nordic_prices.get(mtu_label, {})
+        nordpool_prices = dict(nordic_prices_at_mtu)
+        nordpool_prices.update(cb_prices_at_mtu)
+
+        # ENTSO-E is the PRIMARY source for the Whole tab -- fetched for
+        # EVERY zone this tab tracks (not just whatever Nord Pool
+        # couldn't reach), and merged OVER nordpool_prices (a later dict
+        # update wins) so an ENTSO-E value always takes priority when
+        # both sources have one; Nord Pool's value survives only where
+        # ENTSO-E itself didn't resolve that zone this slot.
+        entsoe_prices = _fetch_entsoe_prices_parallel(WHOLE_ALL_ZONES, date_str, mtu_label, _diag)
+        all_prices = dict(nordpool_prices)
+        all_prices.update(entsoe_prices)
+        _diag(f"[WHOLE] prices: {len(nordpool_prices)} from Nord Pool, "
+              f"{len(entsoe_prices)} from ENTSO-E, {len(all_prices)} combined.")
+
+        if not all_prices:
+            self.root.after(0, self._tab8_whole_fetch_done, None, None, None, None, None,
+                            date_str, mtu_label,
+                            "Could not fetch any price data (Nord Pool or ENTSO-E).")
+            return
+
+        raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
+        np_net_flows = {}
+        for A, B in ZONE_CONNECTIONS:
+            net = raw_at_mtu.get((A, B), 0) - raw_at_mtu.get((B, A), 0)
+            if abs(net) >= 1:
+                np_net_flows[(A, B)] = net
+
+        # Cross-region flows: Nord Pool's own report is the only source
+        # that tells us WHICH Nordic<->Core/Baltic interconnectors exist
+        # in the first place (every counterpart code it uses now matches
+        # CORE_ZONES/BALTIC_ZONES directly, including "GER" -- see
+        # CORE_ZONES' own comment -- so no code-mapping is needed;
+        # anything that still doesn't match a known zone, like an
+        # internal/metering counterpart "DK1_VL", is dropped, not guessed
+        # at). When Nord Pool is down entirely (no token above), fall
+        # back to a short hand-curated list of the real, well-known
+        # interconnectors instead, so ENTSO-E flows below still have
+        # SOME border list to work from.
+        known_cb = set(CORE_ZONES) | set(BALTIC_ZONES)
+        np_cross_flows = _extract_cross_region_flows(raw_at_mtu, known_cb)
+        cross_border_pairs = list(np_cross_flows.keys()) or WHOLE_KNOWN_CROSS_BORDERS
+
+        # ENTSO-E flows get the SAME "primary, merged over Nord Pool"
+        # treatment as prices: Nordic-internal borders (ZONE_CONNECTIONS,
+        # a fixed, known topology) always get tried; cross-region borders
+        # use cross_border_pairs above.
+        entsoe_net_flows = _fetch_entsoe_flows_parallel(
+            ZONE_CONNECTIONS, date_str, mtu_label, _diag)
+        entsoe_cross_flows = _fetch_entsoe_flows_parallel(
+            cross_border_pairs, date_str, mtu_label, _diag)
+        net_flows = dict(np_net_flows)
+        net_flows.update(entsoe_net_flows)
+        cross_flows = dict(np_cross_flows)
+        cross_flows.update(entsoe_cross_flows)
+
+        # Core-internal and Baltic-internal flows (AT<->CZ, CZ<->SK, ...,
+        # EE<->LV, LV<->LT): Nord Pool's own report NEVER carried these --
+        # no source existed for them at all before ENTSO-E became
+        # available, so the Whole tab used to show these borders as a
+        # plain reference line with no arrow (or, after the real-
+        # geography rewrite, nothing at all -- adjacent zone shapes just
+        # visually touch). Verified live that ENTSO-E's
+        # query_crossborder_flows covers this topology too (AT<->CZ,
+        # CZ<->SK, SK<->HU, HU<->HR, AT<->SI all confirmed), so these are
+        # now real flow arrows, not a visual gap.
+        internal_flows = _fetch_entsoe_flows_parallel(
+            CORE_CONNECTIONS + BALTIC_CONNECTIONS, date_str, mtu_label, _diag)
+        _diag(f"[WHOLE] flows: {len(net_flows)} Nordic-internal, {len(cross_flows)} "
+              f"cross-region ({len(entsoe_net_flows) + len(entsoe_cross_flows)} from ENTSO-E), "
+              f"{len(internal_flows)} Core/Baltic-internal (ENTSO-E only).")
+
+        # A zone with no price from EITHER source this slot -- genuinely
+        # covered by neither, not the old, narrower "wasn't on Nord
+        # Pool's own subscription" meaning `missing` had before ENTSO-E
+        # became the primary source for every Whole-tab zone (Nordic
+        # included, which never had a `missing` concept before this).
+        missing = [z for z in WHOLE_ALL_ZONES if z not in all_prices]
+
+        self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
+                        internal_flows, missing, date_str, mtu_label, None)
+
+    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, internal_flows, missing_cb,
+                               date_str, mtu_label, error):
+        self._t8w_btn.config(state=tk.NORMAL, text="Fetch & Plot")
+        if error:
+            self._t8w_status.config(text=f"⚠ {error}", foreground=C_RED)
+            messagebox.showerror("Whole Map", error)
+            return
+        self._draw_tab8_whole_map(prices or {}, net_flows or {}, cross_flows or {},
+                                  internal_flows or {}, f"{date_str} {mtu_label}")
+        self.canvas8w.draw()
+        self._add_toolbar(self.canvas8w, self.toolbar_f8w)
+        n_na = len(missing_cb or [])
+        self._t8w_status.config(
+            text=f"Done. {n_na} zone(s) have no price from Nord Pool or ENTSO-E this slot." if n_na else "Done.",
+            foreground=C_MUTED)
+
+    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, internal_flows, slot_label):
+        """Real-geography choropleth, styled after VoltPath's own Nordic+
+        Core+Baltic "Flows & prices" dashboard view (dark theme, zones
+        filled by their own real shape and shaded by price, thin flow
+        arrows along real borders) -- replaces this tab's earlier
+        schematic circle layout. Zone shapes come from a local extract of
+        electricitymaps-contrib's own bidding-zone GeoJSON -- see
+        BIDDING_ZONE_GEOJSON_PATH's own comment for the source/license
+        note, and CORE_ZONES'/BALTIC_ZONES' own comment for why a
+        schematic layout existed here in the first place (no such
+        position data used to be available in this repo)."""
+        self.fig8w.clear()
+        ax = self.fig8w.add_subplot(111)
+        self.fig8w.patch.set_facecolor(C_GEO_BG)
+        ax.set_facecolor(C_GEO_BG)
+
+        geo_paths = _load_bidding_zone_paths()
+        if geo_paths is None:
+            ax.text(0.5, 0.5, "Zone boundary data (bidding_zones_europe.geojson) "
+                    "not found next to this script.", ha='center', va='center',
+                    fontsize=10, color=C_GEO_MUTED, transform=ax.transAxes, wrap=True)
+            ax.axis('off')
+            self.fig8w.tight_layout(pad=1.0)
+            return
+
+        cmap = _price_geo_cmap()
+        p_min, p_max = PRICE_GEO_VMIN, PRICE_GEO_VMAX
+        p_span = p_max - p_min
+
+        # Path geometry + the overall bounding box are cached (pure
+        # functions of the static GeoJSON, never of this click's own
+        # price data) -- only each zone's fill color is computed fresh
+        # per draw, via a fresh lightweight PathPatch wrapper around the
+        # same cached Path (a Patch artist can't be reused once added to
+        # an Axes, unlike the Path geometry it wraps).
+        label_points = {}
+        for zinfo in geo_paths["zones"]:
+            zone, tracked, path = zinfo["zone"], zinfo["tracked"], zinfo["path"]
+            if not tracked or prices.get(zone) is None:
+                fc = C_GEO_NODATA
+            else:
+                fc = cmap((prices[zone] - p_min) / p_span)
+            patch = PathPatch(path, facecolor=fc, edgecolor=C_GEO_BORDER,
+                              linewidth=0.7, zorder=2)
+            ax.add_patch(patch)
+            if tracked:
+                label_points[zone] = zinfo["label_point"]
+
+        x0, y0, x1, y1 = geo_paths["bounds"]
+        margin_x = (x1 - x0) * 0.02
+        margin_y = (y1 - y0) * 0.02
+        ax.set_xlim(x0 - margin_x, x1 + margin_x)
+        ax.set_ylim(y0 - margin_y, y1 + margin_y)
+        mean_lat = (y0 + y1) / 2
+        # Degrees of longitude cover less real ground than degrees of
+        # latitude the further from the equator -- without this, the map
+        # looks visibly stretched east-west at Nordic latitudes.
+        ax.set_aspect(1.0 / max(math.cos(math.radians(mean_lat)), 0.1))
+
+        # ── Zone labels: a small rounded white chip behind the text,
+        # not just a stroke/halo -- reads cleanly against turbo's full
+        # saturated range (a text-only halo, the previous approach,
+        # still thinned out over the colormap's darkest and lightest
+        # ends; a solid chip doesn't depend on the fill color at all). ──
+        for zone, (lx, ly) in label_points.items():
+            price = prices.get(zone)
+            if price is None:
+                label = zone
+            else:
+                label = f"{zone}\n{price:.1f}"
+            ax.text(lx, ly, label, ha='center', va='center', fontsize=5.6,
+                    fontweight='bold', color=C_GEO_TEXT, zorder=5,
+                    bbox=dict(boxstyle='round,pad=0.28,rounding_size=0.4',
+                             facecolor='#FFFFFF', edgecolor=C_GEO_MUTED,
+                             linewidth=0.4, alpha=0.9))
+
+        # ── Flow arrows: Nordic-internal + cross-region + Core/Baltic-
+        # internal (all real, all via ENTSO-E, see _fetch_tab8_whole_
+        # thread's own comment on internal_flows). ───────────────────────
+        all_flow_mags = ([abs(v) for v in net_flows.values()]
+                         + [abs(v) for v in cross_flows.values()]
+                         + [abs(v) for v in internal_flows.values()])
+        max_flow = max(all_flow_mags, default=1) or 1
+        pad = (x1 - x0) * 0.012
+
+        def _draw_flow_arrow(A, B, mw):
+            if A not in label_points or B not in label_points:
+                return
+            src, dst, mw2 = (A, B, mw) if mw >= 0 else (B, A, -mw)
+            x1a, y1a = label_points[src]; x2a, y2a = label_points[dst]
+            p_src, p_dst = prices.get(src), prices.get(dst)
+            counter = (p_src is not None and p_dst is not None and p_src > p_dst)
+            color = C_GEO_COUNTER if counter else C_GEO_FLOW
+            dx, dy = x2a - x1a, y2a - y1a
+            dist = (dx ** 2 + dy ** 2) ** 0.5 or 1
+            xs, ys = x1a + dx / dist * pad, y1a + dy / dist * pad
+            xe, ye = x2a - dx / dist * pad, y2a - dy / dist * pad
+            lw = 0.5 + 1.6 * (mw2 / max_flow)
+            # A white halo arrow drawn first, slightly thicker and one
+            # zorder behind the real one -- keeps the (often dark-gray or
+            # red) arrow visible against turbo's full saturated range,
+            # the same "chip, not just contrast-hoping" reasoning as the
+            # zone-label bbox above, applied to arrows instead of text.
+            ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=3,
+                        arrowprops=dict(arrowstyle='->', color='#FFFFFF',
+                                        lw=lw + 1.6, mutation_scale=6, alpha=0.85))
+            ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
+                        arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=6))
+
+        for (A, B), mw in net_flows.items():
+            _draw_flow_arrow(A, B, mw)
+        for (A, B), mw in cross_flows.items():
+            _draw_flow_arrow(A, B, mw)
+        for (A, B), mw in internal_flows.items():
+            _draw_flow_arrow(A, B, mw)
+
+        ax.axis('off')
+
+        # ── Stats panel, top-LEFT -- average price per region + average
+        # cross-border flow magnitude, computed from this slot's own
+        # data (not a running/historical average). Top-left falls over
+        # open sea above Iceland -- no zone shape sits there regardless
+        # of which zones are present this slot. Computed/positioned
+        # before the legend below so the legend can stack directly under
+        # it using its own sx0/sw_. ─────────────────────────────────────
+        def _avg(vals):
+            vals = [v for v in vals if v is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        price_rows = [
+            ("Whole", _avg(prices.get(z) for z in WHOLE_ALL_ZONES)),
+            ("Nordic", _avg(prices.get(z) for z in NORDIC_ZONES)),
+            ("Core CCR", _avg(prices.get(z) for z in CORE_ZONES)),
+            ("Baltic", _avg(prices.get(z) for z in BALTIC_ZONES)),
+        ]
+        all_flow_vals = (list(net_flows.values()) + list(cross_flows.values())
+                        + list(internal_flows.values()))
+        flow_avg = _avg(abs(v) for v in all_flow_vals)
+
+        sw_ = 0.225
+        sh_ = 0.024 + 0.0235 * len(price_rows) + 0.018 + 0.0235 + 0.012
+        sx0, sy0 = 0.015, 1 - 0.015 - sh_
+        s_shadow = FancyBboxPatch((sx0 + 0.005, sy0 - 0.005), sw_, sh_,
+                                  boxstyle="round,pad=0.006,rounding_size=0.012",
+                                  transform=ax.transAxes, facecolor='#00000020',
+                                  edgecolor='none', zorder=9)
+        ax.add_patch(s_shadow)
+        s_panel = FancyBboxPatch((sx0, sy0), sw_, sh_,
+                                 boxstyle="round,pad=0.006,rounding_size=0.012",
+                                 transform=ax.transAxes, facecolor=C_GEO_PANEL,
+                                 edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
+        ax.add_patch(s_panel)
+        s_pad = 0.014
+        ax.text(sx0 + s_pad, sy0 + sh_ - 0.022, "Averages this slot",
+                transform=ax.transAxes, fontsize=6.5, fontweight='bold',
+                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
+        srow_y = sy0 + sh_ - 0.046
+        for label, avg in price_rows:
+            val_str = f"{avg:.1f} EUR/MWh" if avg is not None else "n/a"
+            ax.text(sx0 + s_pad, srow_y, label, transform=ax.transAxes, fontsize=5.8,
+                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+            ax.text(sx0 + sw_ - s_pad, srow_y, val_str, transform=ax.transAxes,
+                    fontsize=5.8, color=C_GEO_TEXT, fontweight='bold',
+                    ha='right', va='center', zorder=11)
+            srow_y -= 0.0235
+        ax.plot([sx0 + s_pad, sx0 + sw_ - s_pad], [srow_y + 0.009, srow_y + 0.009],
+                color=C_GEO_MUTED, lw=0.5, alpha=0.5, transform=ax.transAxes, zorder=11)
+        srow_y -= 0.018
+        flow_str = f"{flow_avg:.0f} MW" if flow_avg is not None else "n/a"
+        ax.text(sx0 + s_pad, srow_y, "Avg cross-border flow", transform=ax.transAxes,
+                fontsize=5.8, color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+        ax.text(sx0 + sw_ - s_pad, srow_y, flow_str, transform=ax.transAxes,
+                fontsize=5.8, color=C_GEO_TEXT, fontweight='bold',
+                ha='right', va='center', zorder=11)
+
+        # ── Legend panel, stacked directly BELOW the stats panel (same
+        # left column, same width) -- price gradient + flow/coverage
+        # swatches, styled after VoltPath's own legend box. Every spot
+        # tried on its own corner eventually collided with real map
+        # content as the tracked-zone set grew (bottom-left: Spain;
+        # bottom-right: Montenegro/N.Macedonia; mid-left on its own:
+        # clipped Great Britain/Ireland at this panel's old, larger
+        # size) -- stacking it under the stats panel instead of finding
+        # it a fourth corner keeps both panels in the one column that's
+        # reliably open water (north Atlantic, west of Scandinavia/
+        # Ireland), and shrinking it (0.30x0.178 -> 0.225x~0.125, now
+        # matching the stats panel's own width) was needed to still fit
+        # above Ireland/Great Britain's landmass at this stacked position.
+        # Gap below the stats panel is intentionally generous (0.022) so
+        # rounding/shadow edges from the two panels never visibly touch.
+        lw_ = sw_
+        lx0 = sx0
+        pad_in = 0.012
+        row_h = 0.0205
+        n_swatch_rows = 3
+        top_pad, title_h, gap1 = 0.010, 0.016, 0.005
+        grad_h, gap2, minmax_h, gap3 = 0.013, 0.004, 0.014, 0.008
+        bottom_pad = 0.008
+        lh_ = (top_pad + title_h + gap1 + grad_h + gap2 + minmax_h + gap3
+               + row_h * n_swatch_rows + bottom_pad)
+        ly0 = sy0 - 0.022 - lh_
+        # Soft drop shadow -- a second, slightly offset panel in a muted
+        # dark tone behind the real one, zorder just below it. C_GEO_BORDER
+        # is white now (see its own comment, for the zone-outline look),
+        # so the panel's own edge uses C_GEO_MUTED instead -- a white
+        # border on a white panel would be invisible.
+        shadow = FancyBboxPatch((lx0 + 0.004, ly0 - 0.004), lw_, lh_,
+                                boxstyle="round,pad=0.005,rounding_size=0.010",
+                                transform=ax.transAxes, facecolor='#00000020',
+                                edgecolor='none', zorder=9)
+        ax.add_patch(shadow)
+        panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
+                               boxstyle="round,pad=0.005,rounding_size=0.010",
+                               transform=ax.transAxes, facecolor=C_GEO_PANEL,
+                               edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
+        ax.add_patch(panel)
+        ax.text(lx0 + pad_in, ly0 + lh_ - top_pad, "Price (EUR/MWh)",
+                transform=ax.transAxes, fontsize=6.0, fontweight='bold',
+                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
+        grad_y0 = ly0 + lh_ - top_pad - title_h - gap1 - grad_h
+        grad_ax = ax.inset_axes(
+            [lx0 + pad_in, grad_y0, lw_ - 2 * pad_in, grad_h],
+            transform=ax.transAxes)
+        # Inset axes default to zorder=5 -- BELOW the legend panel's own
+        # zorder=10 FancyBboxPatch, so without this the gradient image
+        # rendered fully hidden behind the (opaque, white) panel: the bar
+        # was there, just invisible, which is exactly what looked like "a
+        # blank white legend" with only the title/number labels showing.
+        # Confirmed both the bug and the fix with an isolated repro before
+        # touching this file. Must clear the panel's own zorder (10).
+        grad_ax.set_zorder(11)
+        grad_ax.imshow([[i / 255 for i in range(256)]], aspect='auto', cmap=cmap)
+        grad_ax.set_xticks([]); grad_ax.set_yticks([])
+        for spine in grad_ax.spines.values():
+            spine.set_visible(False)
+        minmax_y = grad_y0 - gap2
+        ax.text(lx0 + pad_in, minmax_y, f"{p_min:.0f}",
+                transform=ax.transAxes, fontsize=5.4, color=C_GEO_MUTED,
+                ha='left', va='top', zorder=11)
+        ax.text(lx0 + lw_ - pad_in, minmax_y, f"{p_max:.0f}",
+                transform=ax.transAxes, fontsize=5.4, color=C_GEO_MUTED,
+                ha='right', va='top', zorder=11)
+
+        swatch_rows = [
+            ("line", C_GEO_COUNTER, "Counter-intuitive flow"),
+            ("line", C_GEO_FLOW, "Other flow"),
+            ("box", C_GEO_NODATA, "No price data"),
+        ]
+        row_y = minmax_y - minmax_h - gap3
+        for kind, color, label in swatch_rows:
+            sx = lx0 + pad_in
+            if kind == "line":
+                ax.plot([sx, sx + 0.020], [row_y, row_y], color=color, lw=1.4,
+                        transform=ax.transAxes, zorder=11, solid_capstyle='round')
+            else:
+                ax.add_patch(FancyBboxPatch(
+                    (sx, row_y - 0.005), 0.018, 0.010,
+                    boxstyle="round,pad=0.001,rounding_size=0.002",
+                    transform=ax.transAxes, facecolor=color, edgecolor='none', zorder=11))
+            ax.text(sx + 0.028, row_y, label, transform=ax.transAxes, fontsize=5.4,
+                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+            row_y -= row_h
+
+        # loc='left' -- see _draw_tab8_core_map's identical comment on why.
+        # "European" rather than "Nordic + Core + Baltic" now that
+        # WHOLE_EXTRA_ZONES reaches well past those three (Iberia, Italy,
+        # the Western Balkans) -- the old title undersold what's actually
+        # on the map once ENTSO-E became the primary source.
+        ax.set_title(f"European Flows & Prices  —  {slot_label} CET",
+                     fontsize=9, fontweight='bold', color=C_GEO_TEXT, pad=8, loc='left')
+        self.fig8w.tight_layout(pad=1.0)
 
     # ------------------------------------------------------------------
     #  TAB 9 – Maintenance Analysis  (FB_CODE integration)
     # ------------------------------------------------------------------
     def _create_tab9_widgets(self):
-        # lazy-import propagation backend
+        # lazy-import propagation backend. The bare except here used to
+        # discard the real reason (missing pandas/numpy, a broken
+        # statsmodels/numpy version pairing, propagation.py itself failing
+        # to import, etc.), leaving only the generic "propagation module
+        # not loaded" dialog with no way to diagnose it -- same failure
+        # shape as the matplotlib import above. Keep the actual error so
+        # both Tab 9 guard points below can show it.
         try:
             import propagation as _prop
             self._prop = _prop
-        except Exception:
+            self._prop_import_error = None
+        except Exception as e:
             self._prop = None
+            self._prop_import_error = str(e)
 
         # state shared across sub-tabs
         self._ma_jao_df      = None   # pd.DataFrame built from Tab 1 data
@@ -2385,10 +4752,18 @@ class App:
         self._ma_src_country.pack(side=tk.LEFT, padx=(4,20))
 
         ttk.Label(row1, text="Target CNEC:").pack(side=tk.LEFT)
-        self._ma_target_cnec = ttk.Combobox(row1, values=[], width=36, state='readonly')
+        # Editable (not readonly) so typing filters the dropdown live -- with
+        # ~1500+ CNECs in a real JAO export, scrolling a flat readonly list
+        # to find one by eye was the actual complaint this was built for.
+        # self._ma_cnec_all_values holds the full unfiltered list; the
+        # combobox's own ['values'] is narrowed to matches while typing (see
+        # _ma_filter_target_cnec) and restored to the full list on blur/clear.
+        self._ma_cnec_all_values = []
+        self._ma_target_cnec = ttk.Combobox(row1, values=[], width=36)
         self._ma_target_cnec.set("")
         self._ma_target_cnec.pack(side=tk.LEFT, padx=(4,6))
-        ttk.Label(row1, text="(auto-filled from Tab 1 data)",
+        self._ma_target_cnec.bind('<KeyRelease>', self._ma_filter_target_cnec)
+        ttk.Label(row1, text="(auto-filled from Tab 1 data; type to search)",
                   style='Muted.TLabel').pack(side=tk.LEFT)
 
         row2 = ttk.Frame(scope_f, style='Card.TFrame')
@@ -2443,6 +4818,13 @@ class App:
         if self._ma_fig_single is not None and self._ma_canvas_single is not None:
             self._ma_fig_single.clear(); self._ma_canvas_single.draw()
         self._ma_fig_decomp.clear(); self._ma_canvas_decomp.draw()
+        self._ma_spread_cnec.config(values=[]); self._ma_spread_cnec.set('')
+        self._ma_spread_tgt_zone.config(values=[]); self._ma_spread_tgt_zone.set('')
+        self._ma_spread_date.delete(0, tk.END)
+        self._ma_spread_time.delete(0, tk.END)
+        self._ma_spread_result_txt.config(state='normal')
+        self._ma_spread_result_txt.delete('1.0', tk.END)
+        self._ma_spread_result_txt.config(state='disabled')
         self._ma_setup_status.config(text="All data cleared. Apply Setup to reload.",
                                      foreground=C_AMBER)
 
@@ -2475,6 +4857,7 @@ class App:
                            if d.get('cneName', '').strip()))
         if cnecs:
             tab2_cnec = self._get_selected_cnec() or ''
+            self._ma_cnec_all_values = cnecs
             self._ma_target_cnec.config(values=cnecs)
             if tab2_cnec and tab2_cnec in cnecs:
                 self._ma_target_cnec.set(tab2_cnec)
@@ -2498,8 +4881,10 @@ class App:
         cnec = self._get_selected_cnec() or ''
         if not cnec:
             return
-        current_values = list(self._ma_target_cnec['values'])
-        if cnec in current_values:
+        # Check against the full master list, not whatever subset is
+        # currently shown in the dropdown -- that's narrowed to search
+        # matches while the user is typing (see _ma_filter_target_cnec).
+        if cnec in self._ma_cnec_all_values:
             self._ma_target_cnec.set(cnec)
 
     def _ma_browse_dir(self):
@@ -2518,11 +4903,43 @@ class App:
             return
         # Default: use Tab 2's currently selected CNEC if it exists in the data
         tab2_cnec = self._get_selected_cnec() or ""
+        self._ma_cnec_all_values = cnecs
         self._ma_target_cnec.config(values=cnecs)
         if tab2_cnec and tab2_cnec in cnecs:
             self._ma_target_cnec.set(tab2_cnec)
         elif self._ma_target_cnec.get() not in cnecs:
             self._ma_target_cnec.set(cnecs[0])
+
+    def _ma_filter_target_cnec(self, event=None):
+        """Live search-as-you-type for the Target CNEC combobox: narrows the
+        dropdown to names containing what's typed, prefix matches (closest)
+        first, then other substring matches, each group alphabetical. Real
+        JAO exports carry 1000+ CNECs -- scrolling a flat list to find one by
+        eye was the actual complaint this replaces."""
+        # Let normal combobox/entry navigation and selection keys behave
+        # exactly as before -- only re-filter on keys that changed the text.
+        if event is not None and event.keysym in (
+                'Up', 'Down', 'Left', 'Right', 'Return', 'KP_Enter',
+                'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R'):
+            return
+        typed = self._ma_target_cnec.get().strip().lower()
+        all_values = self._ma_cnec_all_values
+        if not typed:
+            filtered = all_values
+        else:
+            starts_with = sorted(v for v in all_values if v.lower().startswith(typed))
+            contains    = sorted(v for v in all_values
+                                 if typed in v.lower() and not v.lower().startswith(typed))
+            filtered = starts_with + contains
+        self._ma_target_cnec['values'] = filtered
+        # Best-effort: pop the dropdown open so matches are visible without
+        # an extra click. Never let this break typing if it misbehaves on
+        # some Tk/platform combination.
+        if filtered:
+            try:
+                self._ma_target_cnec.event_generate('<Down>')
+            except tk.TclError:
+                pass
 
     def _ma_apply_setup(self):
         # Guard: don't start a second run while one is in progress
@@ -2757,9 +5174,54 @@ class App:
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
+    def _prop_not_loaded_message(self) -> str:
+        detail = (f"Import error: {self._prop_import_error}"
+                  if self._prop_import_error else
+                  "No error was recorded, but propagation.py's import "
+                  "didn't succeed.")
+        return ("The propagation.py analysis backend could not be "
+                "loaded, so Tab 9 (Maintenance Analysis) can't run.\n\n"
+                f"{detail}\n\n"
+                "Fix: install this project's dependencies into the SAME "
+                "Python/venv you're running this script with, e.g.:\n"
+                "    python -m pip install pandas numpy statsmodels "
+                "linearmodels entsoe-py\n"
+                "or from the repo root:\n"
+                "    python -m pip install -e .[dev]")
+
+    def _regression_libs_missing(self) -> list:
+        """Names of required regression libraries that failed to import
+        into propagation.py (statsmodels/linearmodels are both optional
+        imports there, guarded so the module itself still loads without
+        them). Every panel regression, the IVA logit, and the DiD estimate
+        silently return empty ({}/pd.DataFrame()) when either is missing --
+        run_panel_regression() logs "linearmodels/statsmodels missing;
+        skip" when this happens, but that's one line buried in a scrolling
+        log, while Results/Single Event just show a generic "no regression
+        detail"/"No DiD data available" with nothing pointing back to why."""
+        if not self._prop:
+            return []
+        missing = []
+        if getattr(self._prop, "sm", None) is None:
+            missing.append("statsmodels")
+        if getattr(self._prop, "PanelOLS", None) is None:
+            missing.append("linearmodels")
+        return missing
+
+    def _regression_libs_missing_message(self, missing: list) -> str:
+        return (f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
+                "not installed/importable in this Python/venv, so every panel "
+                "regression, the IVA logit, and the DiD estimate will come "
+                "back empty — that's why Results shows \"no regression "
+                "detail\" and Single Event shows \"No DiD data available\", "
+                "not a data problem.\n\n"
+                f"Fix:  python -m pip install {' '.join(m.lower() for m in missing)}\n\n"
+                "Continue anyway? Covariates and non-regression outputs "
+                "(CNEC table, plots of raw values) will still be built.")
+
     def _ma_fetch_entsoe(self):
         if not self._prop:
-            messagebox.showerror("Error", "propagation module not loaded.")
+            messagebox.showerror("Error", self._prop_not_loaded_message())
             return
         start_raw = self._ma_ent_start.get().strip()
         end_raw   = self._ma_ent_end.get().strip()
@@ -2800,6 +5262,11 @@ class App:
 
     def _ma_entsoe_done(self, df):
         import pandas as pd
+        # Capture before concat/dedup -- .attrs isn't reliably preserved
+        # through those, and an empty result means something very different
+        # depending on whether every ENTSO-E query actually failed (bad
+        # network/proxy/token) vs. this window genuinely having zero events.
+        failures = df.attrs.get("entsoe_fetch_failures")
         if self._ma_outages_df is not None and not self._ma_outages_df.empty:
             df = self._prop.deduplicate_outages(
                 pd.concat([self._ma_outages_df, df], ignore_index=True))
@@ -2807,8 +5274,27 @@ class App:
         self._ma_populate_outage_tree(df)
         self._ma_refresh_single_list()
         msg = f"{len(df)} outage events after deduplication."
-        self._ma_outage_status.config(text=msg, foreground=C_GREEN)
-        self._update_status(f"[Tab9] ENTSO-E fetch done — {msg}")
+        if failures and failures.get("library_missing"):
+            warn = ("⚠ the 'entsoe-py' library isn't installed in this Python/venv "
+                    "— 0 is not a real result. Run:  pip install entsoe-py  "
+                    "then fetch again.")
+            self._ma_outage_status.config(text=f"{msg}  {warn}", foreground=C_AMBER)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg} {warn}")
+        elif failures and (failures["a77_failed"] or failures["a78_borders_failed"] > 0):
+            n_failed = failures["a78_borders_failed"]
+            n_total  = failures["a78_borders_total"]
+            parts = []
+            if failures["a77_failed"]:
+                parts.append("production outages (A77) query failed")
+            if n_failed:
+                parts.append(f"{n_failed}/{n_total} transmission border (A78) queries failed")
+            warn = f"⚠ {'; '.join(parts)} — this count may be understated, not a confirmed zero. " \
+                   "Check your network/proxy/ENTSO-E token, or the main status log above for details."
+            self._ma_outage_status.config(text=f"{msg}  {warn}", foreground=C_AMBER)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg} {warn}")
+        else:
+            self._ma_outage_status.config(text=msg, foreground=C_GREEN)
+            self._update_status(f"[Tab9] ENTSO-E fetch done — {msg}")
 
     def _ma_populate_outage_tree(self, df):
         self._ma_out_tree.delete(*self._ma_out_tree.get_children())
@@ -2835,12 +5321,12 @@ class App:
         self._ma_progress = ttk.Progressbar(f, mode='indeterminate', length=400)
         self._ma_progress.pack(anchor='w', pady=(8,0))
 
-        log_frame = tk.Frame(f, bg='#0f172a', padx=2, pady=2)
+        log_frame = tk.Frame(f, bg=C_INK, padx=2, pady=2)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(8,0))
-        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background='#0f172a',
-                               foreground='#94e2d5', insertbackground='white',
+        self._ma_log = tk.Text(log_frame, font=FONT_MONO, background=C_INK,
+                               foreground=C_TINT, insertbackground='white',
                                relief='flat', borderwidth=0, padx=10, pady=8)
-        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#1e293b')
+        sb = tk.Scrollbar(log_frame, command=self._ma_log.yview, bg='#18181B')
         self._ma_log.config(yscrollcommand=sb.set)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_log.pack(fill=tk.BOTH, expand=True)
@@ -2870,7 +5356,12 @@ class App:
             messagebox.showwarning("Run", "Load outages first (Outage Sources tab).")
             return
         if not self._prop:
-            messagebox.showerror("Run", "propagation module not available.")
+            messagebox.showerror("Run", self._prop_not_loaded_message())
+            return
+        missing = self._regression_libs_missing()
+        if missing and not messagebox.askyesno(
+                "Missing regression libraries",
+                self._regression_libs_missing_message(missing)):
             return
         self._ma_pipeline_running = True
         self._ma_run_btn.config(state=tk.DISABLED, text="Running…")
@@ -2903,8 +5394,16 @@ class App:
                 return
 
             log("Building covariates…")
+            # build_covariates() defaults src="fi" -- without passing the
+            # user's actual "Outage source country" selection through here,
+            # covariates (outage filtering, dose variables) were always
+            # built for FI regardless of what was picked in Setup, even
+            # though every _reg(...) call below already correctly used
+            # src.lower() for the regression spec/column selection. That
+            # mismatch is exactly why selecting SE still logged "Filtered
+            # outages to FI source" and "Building covariates ... (src=FI)".
             cov_df = self._prop.build_covariates(no3_df, self._ma_outages_df,
-                                                  log_cb=log)
+                                                  log_cb=log, src=src.lower())
             self._ma_covariates = cov_df
             log(f"  Covariates built: {len(cov_df):,} rows")
 
@@ -3006,20 +5505,20 @@ class App:
         for col, w in zip(cols, widths):
             self._ma_res_tree.heading(col, text=col.replace('_',' ').title())
             self._ma_res_tree.column(col, width=w, anchor='center')
-        self._ma_res_tree.tag_configure('support',  background='#dcfce7')
-        self._ma_res_tree.tag_configure('reject',   background='#fee2e2')
-        self._ma_res_tree.tag_configure('inconc',   background='#fef9c3')
+        self._ma_res_tree.tag_configure('support',  background='#E8F3EC')
+        self._ma_res_tree.tag_configure('reject',   background='#FBEAEA')
+        self._ma_res_tree.tag_configure('inconc',   background='#FDF3E4')
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_tree.pack(fill=tk.BOTH, expand=True)
 
         # Regression detail text
         ttk.Label(f, text="Regression Detail", style='H1.TLabel').pack(anchor='w', pady=(10,4))
-        det_f = tk.Frame(f, bg='#0f172a')
+        det_f = tk.Frame(f, bg=C_INK)
         det_f.pack(fill=tk.BOTH, expand=True)
-        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background='#0f172a',
-                                       foreground='#94e2d5', relief='flat',
+        self._ma_res_detail = tk.Text(det_f, font=FONT_MONO, background=C_INK,
+                                       foreground=C_TINT, relief='flat',
                                        borderwidth=0, padx=10, pady=8, height=10)
-        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#1e293b')
+        sb2 = tk.Scrollbar(det_f, command=self._ma_res_detail.yview, bg='#18181B')
         self._ma_res_detail.config(yscrollcommand=sb2.set)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self._ma_res_detail.pack(fill=tk.BOTH, expand=True)
@@ -3160,10 +5659,19 @@ class App:
                     ax.set_title(f"{label} — not available"); continue
                 agg = cov.groupby("dateTimeUtc")[col].mean().reset_index()
                 agg = agg.sort_values("dateTimeUtc")
-                ax.plot(range(len(agg)), agg[col], color=color, linewidth=0.9)
-                ax.fill_between(range(len(agg)), agg[col], alpha=0.08, color=color)
+                x_idx = range(len(agg))
+                # CET-formatted tick labels, same convention (and same
+                # index+labels pattern _setup_ax expects) as every other
+                # dated chart in this file -- was previously plotted on a
+                # bare index with no date shown anywhere, on the ticks OR
+                # on hover, since _setup_ax(ax, []) got an empty label list.
+                xs = ([self._prop.utc_to_cet_str(ts, "%m-%d %H:%M") for ts in agg["dateTimeUtc"]]
+                      if self._prop else [str(ts) for ts in agg["dateTimeUtc"]])
+                ax.plot(x_idx, agg[col], color=color, linewidth=0.9)
+                ax.fill_between(x_idx, agg[col], alpha=0.08, color=color)
                 ax.set_title(label, fontsize=8.5, color=C_ACCENT)
-                self._setup_ax(ax, [])
+                ax.set_xticks(list(x_idx)); ax.set_xticklabels(xs)
+                self._setup_ax(ax, xs)
 
         elif "violin" in ptype.lower() or "PTDF" in ptype:
             ax = self._ma_fig_plots.add_subplot(111)
@@ -3201,13 +5709,13 @@ class App:
                         .apply(lambda s: (s > 0.01).mean() * 100)
                         .sort_values(ascending=False).head(20))
                 bars = ax.bar(range(len(freq)), freq.values, color=C_PRIMARY, alpha=0.8)
+                bar_labels = [c[:16] for c in freq.index]
                 ax.set_xticks(range(len(freq)))
-                ax.set_xticklabels([c[:16] for c in freq.index],
-                                   rotation=40, ha='right', fontsize=6)
+                ax.set_xticklabels(bar_labels, rotation=40, ha='right', fontsize=6)
                 ax.set_ylabel("Binding frequency (%)", fontsize=8.5)
                 ax.set_title("CNEC Binding Frequency (shadow price > 0)",
                              color=C_ACCENT)
-                self._setup_ax(ax, [])
+                self._setup_ax(ax, bar_labels)
 
         self._ma_fig_plots.tight_layout(pad=2.0)
         self._add_toolbar(self._ma_canvas_plots, self._ma_toolbar_f5)
@@ -3260,7 +5768,17 @@ class App:
             "stl":            "STL Decomposition        [min 7 days]",
             "arima":          "ARIMA on residuals       [min 14 days, rec. 30]",
             "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
-            "all":            "All five  [run & compare side-by-side]",
+            "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
+            "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
+            "ridge":          "Ridge (lag + calendar)   [min 7 days]",
+            "structural":     "Structural TS / Kalman (daily+weekly) [min 14 days]",
+            "tbats":          "TBATS (daily+weekly)     [min 14 days]",
+            "theta":          "Theta method              [min 7 days]",
+            "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
+            "ram_identity":   "RAM Identity (physics-informed)   [min 7 days]",
+            "ptdf_flow":      "PTDF x Net Position (physics-informed) [min 7 days]",
+            "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
+            "all":            "All fifteen  [run & compare side-by-side]",
         }
         _prop = getattr(self, '_prop', None)
         _method_keys = (list(_prop.ITS_METHOD_NAMES) + ["all"]) if _prop else list(_method_labels)
@@ -3286,7 +5804,7 @@ class App:
                 cur_bl = 14
             _p = getattr(self, '_prop', None)
             if key == "all":
-                hint = ("Runs all five models and overlays their projected counterfactuals "
+                hint = ("Runs every registered model and overlays their projected counterfactuals "
                         "on the ITS plot so you can compare them directly. "
                         "Summary metrics use Seasonal Naive as primary. "
                         "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
@@ -3340,8 +5858,18 @@ class App:
         sf1 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf1, text='  ITS — before/after trend  ')
         sf1.columnconfigure(0, weight=1); sf1.rowconfigure(2, weight=1)
+        # Full Screen button lives in its OWN column, as a sibling of the
+        # toolbar frame, not a child of it -- _add_toolbar() destroys every
+        # child of the frame it's given (to rebuild NavigationToolbar2Tk on
+        # each analysis run), so a button placed INSIDE that frame would
+        # vanish the moment a second event is analysed.
+        sf1.columnconfigure(1, weight=0)
         self._ma_toolbar_its = ttk.Frame(sf1, style='Card.TFrame')
         self._ma_toolbar_its.grid(row=0, column=0, sticky='ew')
+        ttk.Button(sf1, text="⛶ Full Screen",
+                   command=lambda: self._open_figure_fullscreen(
+                       self._ma_fig_single, "ITS — Before/After Trend")
+                   ).grid(row=0, column=1, sticky='e', padx=4, pady=2)
         # Legend row — populated dynamically in _ma_single_done
         self._ma_its_legend_bar = ttk.Frame(sf1, style='Card.TFrame', padding=(8, 3))
         self._ma_its_legend_bar.grid(row=1, column=0, sticky='ew')
@@ -3367,16 +5895,28 @@ class App:
         self._ma_canvas_single = None
         self._ma_its_win_id    = None
 
-        # RAM Decomposition tab
+        # RAM Decomposition tab -- wrapped in a scrollable pane (same
+        # helper as Price Spread below) so the chart is never clipped on a
+        # short window, plus a Full Screen popout for a closer look.
         sf2 = ttk.Frame(snb, style='Card.TFrame')
         snb.add(sf2, text='  ΔRAM decomposition  ')
         sf2.columnconfigure(0, weight=1); sf2.rowconfigure(1, weight=1)
+        # Full Screen button is a SIBLING of the toolbar frame (column 1),
+        # not a child of it -- _add_toolbar() destroys every child of the
+        # frame it's given, so a button placed inside it would vanish after
+        # the first analysis run (same reasoning as the ITS tab above).
         self._ma_toolbar_decomp = ttk.Frame(sf2, style='Card.TFrame')
         self._ma_toolbar_decomp.grid(row=0, column=0, sticky='ew')
+        ttk.Button(sf2, text="⛶ Full Screen",
+                   command=lambda: self._open_figure_fullscreen(
+                       self._ma_fig_decomp, "ΔRAM Decomposition")
+                   ).grid(row=0, column=1, sticky='e', padx=4, pady=2)
+        sf2_outer, sf2_inner = self._make_scrollable_pane(sf2)
+        sf2_outer.grid(row=1, column=0, sticky='nsew')
         self._ma_fig_decomp = Figure(figsize=(11, 5), dpi=90)
         self._style_figure(self._ma_fig_decomp)
-        self._ma_canvas_decomp = FigureCanvasTkAgg(self._ma_fig_decomp, sf2)
-        self._ma_canvas_decomp.get_tk_widget().grid(row=1, column=0, sticky='nsew')
+        self._ma_canvas_decomp = FigureCanvasTkAgg(self._ma_fig_decomp, sf2_inner)
+        self._ma_canvas_decomp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         # DiD text tab
         sf3 = ttk.Frame(snb, style='Card.TFrame')
@@ -3413,6 +5953,266 @@ class App:
         ct_hsb.grid(row=1, column=0, sticky='ew')
         self._ma_cnec_tree.grid(row=0, column=0, sticky='nsew')
 
+        # Price Spread tab -- optional "result": how much has this CNEC's
+        # contribution to a TARGET zone's price moved, at one timestamp,
+        # relative to what it would have been without the outage --
+        #   impact = (shadowPrice_actual * PTDF_target_actual)
+        #            - (shadowPrice_cf   * PTDF_target_cf)
+        # where "_cf" is the ITS counterfactual (Y(0), fit on this event's
+        # own pre-period) for BOTH shadow price and PTDF. An earlier design
+        # compared this CNEC's contribution to TWO zones' prices at once
+        # (needing a user-typed reference-zone price as an anchor); this
+        # answers a different, better-fitting question -- how the OUTAGE
+        # changed this CNEC's effect on ONE zone -- so there's no reference
+        # zone/price here at all, see propagation.estimate_cnec_price_impact()'s
+        # own docstring for the full reasoning. Backed by that function.
+        # Scoped to the CURRENTLY analysed event on purpose (CNEC/timestamp
+        # choices come from this event's own window, and the counterfactual
+        # method reuses whatever's picked in the "Counterfactual model"
+        # selector above) -- see MAINTENANCE_TAB_GUIDE.md.
+        # The whole pane (controls + results) is wrapped in a scrollable
+        # pane -- previously ctrl5 (5 rows of pickers) and det5 (the result
+        # text) both fought for a short window's fixed vertical space, with
+        # no way to reach det5's content once ctrl5 ate the visible area.
+        # Now everything is reachable by scrolling regardless of window size.
+        sf5 = ttk.Frame(snb, style='Card.TFrame')
+        snb.add(sf5, text='  Price Spread  ')
+        sf5.columnconfigure(0, weight=1)
+        sf5.rowconfigure(0, weight=1)
+        sf5_outer, sf5_inner = self._make_scrollable_pane(sf5)
+        sf5_outer.grid(row=0, column=0, sticky='nsew')
+        sf5_inner.columnconfigure(0, weight=1)
+
+        ctrl5 = ttk.LabelFrame(
+            sf5_inner, text=" This CNEC's price impact on a target zone "
+                      "(actual vs. counterfactual) ", padding=10)
+        ctrl5.grid(row=0, column=0, sticky='ew', padx=8, pady=8)
+        ctrl5.columnconfigure(1, weight=1)
+
+        ttk.Label(ctrl5, text="CNEC:").grid(row=0, column=0, sticky='w')
+        self._ma_spread_cnec = ttk.Combobox(ctrl5, width=42, state='readonly')
+        self._ma_spread_cnec.grid(row=0, column=1, columnspan=3, sticky='ew', padx=6)
+        self._ma_spread_cnec.bind(
+            '<<ComboboxSelected>>', lambda e: self._ma_refresh_spread_timestamps())
+
+        ttk.Label(ctrl5, text="Target zone:").grid(row=1, column=0, sticky='w', pady=(8, 0))
+        self._ma_spread_tgt_zone = ttk.Combobox(ctrl5, width=10, state='readonly')
+        self._ma_spread_tgt_zone.grid(row=1, column=1, sticky='w', padx=6, pady=(8, 0))
+
+        # Date + Time as two separate, plain TYPED fields (ttk.Entry), both
+        # CET -- matching Tab 2's own "Date (CET):" / "Time (CET):" filter
+        # row exactly: the user types over a pre-filled default rather than
+        # picking from a dropdown. Auto-filled with this event's own outage
+        # start time in CET (see _ma_refresh_spread_timestamps) every time a
+        # new event is analysed or the CNEC changes -- same "never leave it
+        # blank if a default is derivable" philosophy as Setup's own
+        # auto-filled Target CNEC field, just via a typed default instead of
+        # a selected one.
+        ttk.Label(ctrl5, text="Date (CET):").grid(row=2, column=0, sticky='w', pady=(6, 0))
+        self._ma_spread_date = ttk.Entry(ctrl5, width=12)
+        self._ma_spread_date.grid(row=2, column=1, sticky='w', padx=6, pady=(6, 0))
+
+        ttk.Label(ctrl5, text="Time (CET):").grid(row=2, column=2, sticky='w', padx=(12, 0), pady=(6, 0))
+        self._ma_spread_time = ttk.Entry(ctrl5, width=10)
+        self._ma_spread_time.grid(row=2, column=3, sticky='w', padx=6, pady=(6, 0))
+        ttk.Label(ctrl5, text="(auto-filled from this event's outage start; type to change, format YYYY-MM-DD / HH:MM)",
+                  style='Muted.TLabel').grid(row=2, column=4, sticky='w', padx=(8, 0), pady=(6, 0))
+
+        ttk.Button(ctrl5, text="Estimate Impact", style='Accent.TButton',
+                   command=self._ma_run_price_spread).grid(
+            row=3, column=0, sticky='w', pady=(10, 0))
+        ttk.Label(ctrl5, text="Uses this event's own pre-period as the "
+                             "counterfactual baseline, and the same "
+                             "counterfactual model selected above.",
+                  style='Muted.TLabel').grid(
+            row=3, column=1, columnspan=3, sticky='w', pady=(10, 0))
+
+        det5 = tk.Frame(sf5_inner, bg=C_INK)
+        det5.grid(row=1, column=0, sticky='nsew', padx=8, pady=(0, 8))
+        sf5_inner.rowconfigure(1, weight=1)
+        self._ma_spread_result_txt = tk.Text(
+            det5, font=FONT_MONO, background=C_INK, foreground=C_TINT,
+            relief='flat', borderwidth=0, padx=10, pady=8, height=18,
+            wrap='none', state='disabled')
+        sb5v = tk.Scrollbar(det5, command=self._ma_spread_result_txt.yview, bg='#18181B')
+        # Horizontal scrollbar too -- the result panel's aligned-column table
+        # formatting (fixed-width f-strings) garbles if the Text widget ever
+        # wraps a line instead of letting it run off the side, so wrap='none'
+        # above is paired with this rather than reflowing those rows.
+        sb5h = tk.Scrollbar(det5, orient='horizontal',
+                             command=self._ma_spread_result_txt.xview, bg='#18181B')
+        self._ma_spread_result_txt.config(yscrollcommand=sb5v.set, xscrollcommand=sb5h.set)
+        sb5v.pack(side=tk.RIGHT, fill=tk.Y)
+        sb5h.pack(side=tk.BOTTOM, fill=tk.X)
+        self._ma_spread_result_txt.pack(fill=tk.BOTH, expand=True)
+
+    def _ma_refresh_spread_controls(self, res):
+        """Populate the Price Spread pane's CNEC/zone/timestamp pickers from
+        the event that was JUST analysed -- called from _ma_single_done().
+        CNECs come from this event's own per-CNEC table (not the whole
+        dataset), zones come from whichever ptdf_<ZONE> columns are actually
+        present (never a hardcoded zone list -- real JAO exports don't all
+        carry the same zones), and timestamps come from this event's own
+        pre/during/post window for the FIRST of those CNECs so the dropdown
+        starts non-empty without requiring a CNEC pick first."""
+        cnec_df = res.get('cnec_table')
+        cnecs = (sorted(str(c) for c in cnec_df['cnec'].dropna().unique())
+                if cnec_df is not None and not cnec_df.empty and 'cnec' in cnec_df.columns
+                else [])
+        self._ma_spread_cnec.config(values=cnecs)
+        if cnecs:
+            self._ma_spread_cnec.set(cnecs[0])
+        else:
+            self._ma_spread_cnec.set('')
+
+        zones = []
+        if self._ma_jao_df is not None:
+            zones = sorted(c[len('ptdf_'):] for c in self._ma_jao_df.columns
+                           if c.startswith('ptdf_'))
+        self._ma_spread_tgt_zone.config(values=zones)
+        if zones:
+            self._ma_spread_tgt_zone.set(zones[0])
+
+        self._ma_refresh_spread_timestamps()
+
+    def _ma_refresh_spread_timestamps(self):
+        """Auto-fill the Date (CET) / Time (CET) entries with this event's
+        own outage start time -- the most meaningful single default instant
+        for "impact at the moment of the outage" -- converted to CET via
+        propagation.utc_to_cet_str (this app's convention for anything a
+        person reads). Falls back to the earliest timestamp in this CNEC's
+        own pre/during/post window if the outage's own start_utc is missing
+        or unparseable. Always overwrites current contents, the same
+        "reset to a sensible default" behavior Setup's own auto-filled
+        Target CNEC field already uses -- the fields stay freely typeable
+        afterward (ttk.Entry, not a restricted dropdown; see the widget
+        comment above), matching Tab 2's Date (CET):/Time (CET): fields.
+        _ma_run_price_spread converts whatever ends up in these fields
+        (default or hand-edited) back to UTC via propagation.cet_input_to_utc
+        before calling estimate_cnec_price_impact, which still matches rows
+        in UTC internally."""
+        res = getattr(self, '_ma_single_res', None)
+        cnec = self._ma_spread_cnec.get().strip()
+        if not res or not cnec or self._ma_jao_df is None or not self._prop:
+            return
+        import pandas as pd
+        default_utc = None
+        start_utc = res.get('summary', {}).get('start_utc')
+        if start_utc:
+            try:
+                default_utc = pd.Timestamp(start_utc)
+            except (ValueError, TypeError):
+                default_utc = None
+        if default_utc is None and 'cneName' in self._ma_jao_df.columns:
+            its = res.get('its')
+            if its is not None and not its.empty and 'dateTimeUtc' in its.columns:
+                t0, t1 = its['dateTimeUtc'].min(), its['dateTimeUtc'].max()
+                sub = self._ma_jao_df[
+                    (self._ma_jao_df['cneName'] == cnec) &
+                    (self._ma_jao_df['dateTimeUtc'] >= t0) &
+                    (self._ma_jao_df['dateTimeUtc'] <= t1)]
+                ts_values = sorted(sub['dateTimeUtc'].dropna().unique())
+                if ts_values:
+                    default_utc = ts_values[0]
+        if default_utc is None:
+            return
+        date_str = self._prop.utc_to_cet_str(default_utc, "%Y-%m-%d")
+        time_str = self._prop.utc_to_cet_str(default_utc, "%H:%M")
+        self._ma_spread_date.delete(0, tk.END); self._ma_spread_date.insert(0, date_str)
+        self._ma_spread_time.delete(0, tk.END); self._ma_spread_time.insert(0, time_str)
+
+    def _ma_run_price_spread(self):
+        if not self._prop:
+            messagebox.showerror("Price Spread", self._prop_not_loaded_message())
+            return
+        if self._ma_jao_df is None:
+            messagebox.showwarning("Price Spread", "Apply Setup first.")
+            return
+        res = getattr(self, '_ma_single_res', None)
+        if not res or not res.get('summary', {}).get('start_utc'):
+            messagebox.showwarning(
+                "Price Spread", "Run Single Event analysis first — the "
+                "outage's own start time is used as the counterfactual "
+                "pre-period cutoff.")
+            return
+        cnec = self._ma_spread_cnec.get().strip()
+        tgt_zone = self._ma_spread_tgt_zone.get().strip()
+        date_raw = self._ma_spread_date.get().strip()
+        time_raw = self._ma_spread_time.get().strip()
+        if not (cnec and tgt_zone and date_raw and time_raw):
+            messagebox.showwarning(
+                "Price Spread",
+                "Select a CNEC, target zone, and date/time (run Single "
+                "Event analysis first to populate these).")
+            return
+        # Date and Time are entered/picked as CET/CEST wall-clock -- this
+        # app's convention for anything a person types or reads (see Tab 2's
+        # own Date (CET):/Time (CET): fields) -- then converted to UTC via
+        # propagation.cet_input_to_utc, the same conversion point every
+        # other CET input in this app goes through, so a DST edge case is
+        # handled identically everywhere rather than reimplemented here.
+        import pandas as pd
+        try:
+            ts = self._prop.cet_input_to_utc(f"{date_raw} {time_raw}")
+        except (ValueError, TypeError):
+            messagebox.showerror(
+                "Price Spread",
+                f"Could not parse date/time: {date_raw!r} {time_raw!r}")
+            return
+        try:
+            pre_end = pd.Timestamp(res['summary']['start_utc'])
+        except (ValueError, TypeError):
+            messagebox.showerror(
+                "Price Spread",
+                f"Could not parse this event's start time: "
+                f"{res['summary']['start_utc']!r}")
+            return
+
+        # Reuse whichever counterfactual model is selected above (the same
+        # one Single Event's own ITS run used) -- "all" isn't a real,
+        # fittable method on its own, so fall back to the default in that
+        # case.
+        label = self._ma_its_method_var.get()
+        its_method = self._ma_its_method_map.get(label, "seasonal_naive")
+        if its_method == "all":
+            its_method = self._prop.ITS_DEFAULT_METHOD
+
+        r = self._prop.estimate_cnec_price_impact(
+            self._ma_jao_df, cnec, tgt_zone, pre_end, ts, its_method=its_method)
+
+        self._ma_spread_result_txt.config(state='normal')
+        self._ma_spread_result_txt.delete('1.0', tk.END)
+        if not r["ok"]:
+            self._ma_spread_result_txt.insert(tk.END, f"Could not estimate: {r['error']}")
+        else:
+            sign = "+" if r['impact'] >= 0 else ""
+            matched_cet = self._prop.utc_to_cet_str(r['matched_timestamp'], "%Y-%m-%d %H:%M")
+            pre_end_cet = self._prop.utc_to_cet_str(pre_end, "%Y-%m-%d %H:%M")
+            lines = [
+                f"CNEC:               {r['cnec']}",
+                f"Target zone:        {r['tgt_zone']}",
+                f"Matched timestamp:  {matched_cet} CET",
+                f"Counterfactual model: {r['its_method']}"
+                f"  (pre-period ends at this event's outage start, {pre_end_cet} CET)",
+                "",
+                f"{'':22s}{'Actual':>14s}{'Counterfactual':>18s}",
+                f"Shadow price:       {r['shadow_price_actual']:>14.4f}{r['shadow_price_cf']:>18.4f}",
+                f"PTDF[{tgt_zone}]:{'':<{max(1, 15-len(tgt_zone))}}{r['ptdf_target_actual']:>14.5f}{r['ptdf_target_cf']:>18.5f}",
+                "",
+                f"Contribution to {tgt_zone}'s price (shadowPrice x PTDF):",
+                f"  actual:          {r['actual_contribution']:+.4f}",
+                f"  counterfactual:  {r['counterfactual_contribution']:+.4f}",
+                "",
+                f"IMPACT (actual - counterfactual):  {sign}{r['impact']:.4f}",
+                "",
+                "This is ONE CNEC's own change in contribution to the "
+                "target zone's price, not the full zonal price change --",
+                "the real total is the sum of this same term over every "
+                "binding CNEC affected by the outage.",
+            ]
+            self._ma_spread_result_txt.insert(tk.END, "\n".join(lines))
+        self._ma_spread_result_txt.config(state='disabled')
+
     def _ma_refresh_single_list(self):
         if self._ma_outages_df is not None and not self._ma_outages_df.empty:
             ids = self._ma_outages_df['outage_id'].dropna().unique().tolist()
@@ -3432,6 +6232,16 @@ class App:
         oid = self._ma_single_id.get().strip()
         if not oid:
             messagebox.showwarning("Single Event", "Select an outage ID.")
+            return
+        if not self._prop:
+            messagebox.showerror("Single Event", self._prop_not_loaded_message())
+            return
+        missing = self._regression_libs_missing()
+        if missing and not messagebox.askyesno(
+                "Missing regression libraries",
+                self._regression_libs_missing_message(missing) +
+                "\n\n(The DiD estimate specifically needs statsmodels; "
+                "ITS/decomposition plots don't and will still work.)"):
             return
         bd = int(self._ma_baseline_days.get())
         pd_days = int(self._ma_post_days.get())
@@ -3570,6 +6380,18 @@ class App:
             "seasonal_naive": (C_RED,    "--"),
             "fourier_trend":  (C_PRIMARY, "-."),
             "stl":            (C_GREEN,   ":"),
+            "arima":          (C_PURPLE,  "-."),
+            "sarima":         ("#4A6FA5", ":"),
+            "lightgbm":       ("#8C6A4A", "--"),
+            "catboost":       ("#5C8A8A", "-."),
+            "ridge":          ("#B08968", ":"),
+            "structural":     ("#6B8E9E", "-."),
+            "tbats":          ("#9E6B8E", ":"),
+            "theta":          ("#8EA05A", "--"),
+            "hurdle":         ("#C97B4A", "-."),
+            "ram_identity":   ("#4A7A6B", "-"),
+            "ptdf_flow":      ("#7A5A9C", "-"),
+            "ensemble":       ("#2E2E2E", "-"),
         }
         # Clear and rebuild the tkinter legend bar above the canvas
         for w in self._ma_its_legend_bar.winfo_children():
@@ -3638,6 +6460,20 @@ class App:
                         lbl.set_rotation(15); lbl.set_fontsize(7)
                 except Exception:
                     pass
+                # This chart plots real dateTimeUtc values directly (unlike
+                # _setup_ax's index+labels charts), so the mouse-position
+                # readout otherwise shows a raw matplotlib date float
+                # ("x=19692.34") -- convert it back to a CET wall-clock
+                # string instead, matching this app's convention that
+                # anything a person reads is CET, not UTC and not a float.
+                def _fmt_coord_dt(x, y):
+                    try:
+                        dt_cet = mdates.num2date(x).astimezone(_CET)
+                        xs = dt_cet.strftime("%Y-%m-%d %H:%M") + " CET"
+                    except (ValueError, OverflowError):
+                        xs = f"{x:.2f}"
+                    return f"x={xs}   y={y:,.3f}"
+                ax.format_coord = _fmt_coord_dt
         else:
             ax = self._ma_fig_single.add_subplot(1, 1, 1)
             ax.text(0.5, 0.5, 'No ITS data', ha='center', va='center',
@@ -3745,6 +6581,9 @@ class App:
                     else:
                         vals.append(str(v)[:50])
                 self._ma_cnec_tree.insert('', tk.END, values=vals)
+
+        # ── Price Spread tab controls ────────────────────────────────
+        self._ma_refresh_spread_controls(res)
 
         # Switch to Summary sub-tab automatically
         self._ma_single_nb.select(0)
@@ -3927,12 +6766,12 @@ class App:
 <meta charset="utf-8">
 <title>Maintenance Analysis Report</title>
 <style>
-body{{font-family:Segoe UI,sans-serif;margin:40px;color:#1e293b;}}
-h1{{color:#1e3a5f;}} h2{{color:#2563eb;border-bottom:1px solid #d1d9e6;padding-bottom:4px;}}
+body{{font-family:Segoe UI,sans-serif;margin:40px;color:#18181B;}}
+h1{{color:#111113;}} h2{{color:#163C2C;border-bottom:1px solid #E6E6E9;padding-bottom:4px;}}
 table{{border-collapse:collapse;width:100%;margin-bottom:24px;}}
-th{{background:#1e3a5f;color:white;padding:8px;text-align:left;}}
-td{{padding:6px 8px;border-bottom:1px solid #e2e8f0;}}
-pre{{background:#f1f5f9;padding:16px;border-radius:4px;overflow:auto;}}
+th{{background:#111113;color:white;padding:8px;text-align:left;}}
+td{{padding:6px 8px;border-bottom:1px solid #E6E6E9;}}
+pre{{background:#F6F6F7;padding:16px;border-radius:4px;overflow:auto;}}
 </style></head><body>
 <h1>Maintenance Analysis Report</h1>
 <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>

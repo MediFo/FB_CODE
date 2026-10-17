@@ -62,6 +62,13 @@ try:
 except (ImportError, AttributeError, Exception):
     EntsoePandasClient = None
 
+try:
+    from entsoe.exceptions import NoMatchingDataError as _EntsoeNoDataError
+except (ImportError, AttributeError, Exception):
+    class _EntsoeNoDataError(Exception):
+        """Placeholder used only for isinstance() checks when entsoe-py
+        isn't installed -- never actually raised."""
+
 
 LogCallback = Callable[[str], None]
 def _noop(msg: str) -> None: ...
@@ -574,7 +581,18 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         log_cb("ENTSO-E: 'entsoe-py' library NOT INSTALLED.")
         log_cb("           Run:  pip install entsoe-py")
         log_cb("           Then restart the dashboard.")
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        # Set the same entsoe_fetch_failures marker the full function sets
+        # at the end (see below) -- this early return skips straight past
+        # that point, so without this a missing entsoe-py install produces
+        # an empty DataFrame indistinguishable from "genuinely zero events
+        # this window", and a caller showing that as a plain green success
+        # (as Tab 9 used to) hides the real, easily-fixed cause.
+        result.attrs["entsoe_fetch_failures"] = {
+            "library_missing": True,
+            "a77_failed": False, "a78_borders_failed": 0, "a78_borders_total": 0,
+        }
+        return result
     log_cb(f"ENTSO-E: fetching with token {ENTSOE_TOKEN[:8]}...{ENTSOE_TOKEN[-4:]}")
 
     client = EntsoePandasClient(api_key=ENTSOE_TOKEN)
@@ -599,17 +617,39 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         except Exception:
             return None
 
+    def _is_no_matching_data(e: Exception) -> bool:
+        """True if e signals "this query genuinely has no data" rather than
+        a real failure. entsoe-py itself parses ENTSO-E's XML acknowledgement
+        body for "No matching data found" and re-raises a CLEAN, EMPTY-
+        MESSAGE entsoe.exceptions.NoMatchingDataError (str(e) == '') -- it
+        does not surface the original text, so a plain string check for
+        "400"/"No matching data found" against str(e) (still checked below,
+        for a raw requests.HTTPError that hasn't gone through entsoe-py's own
+        parsing) never matches entsoe-py's own exception. Confirmed live:
+        several genuinely-unpublished NO/SE/DE/GB A78 border pairs each
+        raised NoMatchingDataError with an empty message, which fell through
+        to 2 wasted retries per border and got counted as a real fetch
+        failure (surfacing as a false "N/M borders failed" warning) before
+        this check existed."""
+        if isinstance(e, _EntsoeNoDataError):
+            return True
+        err_str = str(e)
+        return "400" in err_str or "No matching data found" in err_str
+
     def _with_retry(fn, label: str, retries: int = 2, delay_s: float = 2.0):
         """Retry a transient ENTSO-E query failure (timeout, connection
         reset, 5xx) instead of dropping that query's events for the whole
-        run after a single blip. A 4xx/"no data" response is not transient
-        (retrying it wastes time and gets the same answer), so the caller
-        is expected to have already excluded those before calling this."""
+        run after a single blip. A "no data" response is not transient
+        (retrying it wastes time and gets the same answer) and is not a
+        failure either -- it's short-circuited here as an empty success."""
         last_exc = None
         for attempt in range(1, retries + 1):
             try:
                 return fn(), None
             except Exception as e:
+                if _is_no_matching_data(e):
+                    log_cb(f"  {label}: no data in ENTSO-E TP (skipped)")
+                    return pd.DataFrame(), None
                 last_exc = e
                 if attempt < retries:
                     log_cb(f"  {label}: attempt {attempt} failed ({e}); retrying...")
@@ -680,10 +720,12 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
         try:
             df = _query_this_border()
         except Exception as e:
-            err_str = str(e)
-            if "400" in err_str or "No matching data found" in err_str:
-                # 400 = border not published in ENTSO-E TP (normal for many
-                # FI borders) -- not transient, retrying gets the same answer.
+            if _is_no_matching_data(e):
+                # Border not published in ENTSO-E TP (normal for many FI
+                # borders) -- not transient, retrying gets the same answer.
+                # (_with_retry() below also catches this, but checking here
+                # too avoids one redundant network round-trip for a border
+                # we already know is no-data from this very attempt.)
                 log_cb(f"  A78 {fr}->{to}: no data in ENTSO-E TP (skipped)")
                 continue
             df, retry_err = _with_retry(_query_this_border, label=f"ENTSO-E A78 {fr}->{to}",
@@ -758,7 +800,225 @@ def fetch_entsoe_outages(start_utc: str, end_utc: str,
                f"outages on these routes are NOT included below.")
 
     log_cb(f"ENTSO-E events recorded: {len(events)}")
-    return pd.DataFrame(events)
+    result = pd.DataFrame(events)
+    # A caller sees an empty (or half-empty) DataFrame either way whether
+    # this window genuinely had zero events, or every query to ENTSO-E
+    # failed (bad network/proxy, expired token, 403 from this IP, etc.) --
+    # those are very different situations for a user to act on, but look
+    # identical without this. Attach failure counts via .attrs (the same
+    # mechanism build_covariates() already uses for planned_forced_confound)
+    # so a caller can tell "confirmed zero" from "fetch mostly/entirely
+    # failed" instead of treating both as a clean, trustworthy zero.
+    result.attrs["entsoe_fetch_failures"] = {
+        "library_missing": False,
+        "a77_failed": a77_err is not None,
+        "a78_borders_failed": len(failed_borders),
+        "a78_borders_total": len(borders),
+    }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Nord Pool net position fetch — feeds the "ptdf_flow" physics-informed ITS
+# method (see _its_ptdf_flow() in the ITS COUNTERFACTUAL MODELS section):
+# flow_t ≈ Σ_zone PTDF_{zone,CNEC,t} × NetPosition_{zone,t}. Nothing else in
+# propagation.py currently consumes Nord Pool data — this is new plumbing,
+# not a refactor of anything existing.
+# ---------------------------------------------------------------------------
+# These credentials/URLs deliberately DUPLICATE app_jao_NP_API_fix_d14.py's
+# own NORDPOOL_USER/NORDPOOL_PASSWORD/NP_VOL_URL rather than importing them —
+# same reasoning as every other "independent copy, not shared" surface in
+# this codebase (see CLAUDE.md's JAO-timestamp-zone entry): the GUI's own
+# Tab 5-8 fetch code already works for its own single-CNEC/single-day
+# display use case, and this module's version exists for a different one
+# (fetching every relevant zone over a full analysis window, for the
+# analytical pipeline) — sharing code between them would risk regressing
+# four already-working tabs to avoid duplicating ~10 lines of constants.
+# Same known, out-of-scope credential-hardcoding limitation CLAUDE.md
+# already documents for ENTSOE_TOKEN.
+NORDPOOL_USER     = "API_DATA_MEHDI"
+NORDPOOL_PASSWORD = "OsloNordpool@123"
+NP_TOKEN_URL = "https://sts.nordpoolgroup.com/connect/token"
+NP_VOL_URL   = "https://data-api.nordpoolgroup.com/api/v2/Auction/Volumes/ByAreas"
+
+
+def get_nordpool_access_token(log_cb: LogCallback = _noop) -> Optional[str]:
+    """Authenticate against the Nord Pool market-data API. Returns the
+    bearer token, or None on any failure (network, credentials, or a
+    non-2xx response) — callers treat None as "Nord Pool unavailable" and
+    degrade gracefully, the same posture as a missing/failed ENTSO-E
+    fetch."""
+    if requests is None:
+        log_cb("  Nord Pool fetch skipped: requests library not installed.")
+        return None
+    headers = {
+        "Authorization": "Basic Y2xpZW50X21hcmtldGRhdGFfYXBpOmNsaWVudF9tYXJrZXRkYXRhX2FwaQ==",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {"grant_type": "password", "scope": "marketdata_api",
+            "username": NORDPOOL_USER, "password": NORDPOOL_PASSWORD}
+    try:
+        r = requests.post(NP_TOKEN_URL, headers=headers, data=data, timeout=10)
+        r.raise_for_status()
+        token = r.json().get("access_token")
+        if not token:
+            log_cb("  Nord Pool auth succeeded but returned no access_token.")
+        return token
+    except Exception as exc:
+        log_cb(f"  Nord Pool auth failed: {exc}")
+        return None
+
+
+def fetch_nordpool_net_positions(zones: Sequence[str], start_date, end_date,
+                                 log_cb: LogCallback = _noop) -> pd.DataFrame:
+    """
+    Fetch day-ahead net position (sell − buy, MW) for every zone in
+    `zones`, for every calendar day in [start_date, end_date] (inclusive),
+    from Nord Pool's Auction Volumes endpoint. One request per day, ALL
+    zones in that one request via repeated `areas` query params — the
+    same multi-area request shape app_jao_NP_API_fix_d14.py's Tab 8
+    animation already uses for prices/flows — not one request per
+    (day, zone) pair.
+
+    Returns a WIDE dataframe: `dateTimeUtc` (tz-aware UTC) plus one
+    `netpos_<ZONE>` column per requested zone, at whatever native
+    resolution Nord Pool published for that delivery day (historically
+    hourly, moving to 15-minute across the Nordic market on a schedule
+    that varies by zone/vintage). This function does NOT resample or
+    forward-fill anything — see merge_nordpool_net_positions() for the
+    as-of join that reconciles this against JAO's own MTU grid.
+
+    Never raises: returns an empty (zero-row, right-columns) dataframe if
+    authentication fails or every request fails, mirroring
+    fetch_entsoe_outages()'s "confirmed zero vs fetch failed" posture.
+    Per-day fetch failures are logged via log_cb and counted in the
+    returned dataframe's `.attrs["nordpool_fetch_failures"]` — the same
+    disambiguation mechanism fetch_entsoe_outages() already uses (and for
+    the same reason: "0 events"/an empty net-position table looks
+    identical whether nothing was ever wrong or the fetch never worked).
+    """
+    empty_cols = ["dateTimeUtc"] + [f"netpos_{z}" for z in zones]
+
+    def _empty_with_failure(**failure_kwargs) -> pd.DataFrame:
+        result = pd.DataFrame(columns=empty_cols)
+        result.attrs["nordpool_fetch_failures"] = failure_kwargs
+        return result
+
+    if requests is None:
+        log_cb("  Nord Pool net-position fetch skipped: requests library not installed.")
+        return _empty_with_failure(library_missing=True, auth_failed=False,
+                                   days_failed=0, days_total=0)
+
+    token = get_nordpool_access_token(log_cb)
+    if not token:
+        return _empty_with_failure(library_missing=False, auth_failed=True,
+                                   days_failed=0, days_total=0)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    dates = pd.date_range(pd.Timestamp(start_date).normalize(),
+                          pd.Timestamp(end_date).normalize(), freq="1D")
+
+    def _to_utc_ts(ts_str: str) -> pd.Timestamp:
+        ts = pd.Timestamp(ts_str)
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+    rows = []
+    days_failed = 0
+    for d in dates:
+        date_str = d.strftime("%Y-%m-%d")
+        params = [("market", "DayAhead"), ("date", date_str)] + [("areas", z) for z in zones]
+        try:
+            r = requests.get(NP_VOL_URL, headers=headers, params=params, timeout=20)
+            if r.status_code != 200:
+                log_cb(f"  Nord Pool volumes {date_str}: HTTP {r.status_code}")
+                days_failed += 1
+                continue
+            payload = r.json()
+            if not isinstance(payload, list):
+                log_cb(f"  Nord Pool volumes {date_str}: unexpected response shape")
+                days_failed += 1
+                continue
+            for area_data in payload:
+                zone = area_data.get("deliveryArea")
+                if zone not in zones:
+                    continue
+                for v in area_data.get("volumes", []):
+                    ts = v.get("deliveryStart")
+                    if not ts:
+                        continue
+                    try:
+                        sell = float(v.get("sell") or 0.0)
+                        buy  = float(v.get("buy")  or 0.0)
+                        rows.append({"dateTimeUtc": _to_utc_ts(ts), "zone": zone,
+                                    "net_position_mw": sell - buy})
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:
+            log_cb(f"  Nord Pool volumes {date_str}: {exc}")
+            days_failed += 1
+            continue
+
+    if rows:
+        raw = pd.DataFrame(rows)
+        result = (raw.pivot_table(index="dateTimeUtc", columns="zone",
+                                  values="net_position_mw", aggfunc="mean")
+                 .reset_index())
+        result.columns = ["dateTimeUtc"] + [f"netpos_{z}" for z in result.columns[1:]]
+        result = result.sort_values("dateTimeUtc").reset_index(drop=True)
+    else:
+        result = pd.DataFrame(columns=empty_cols)
+
+    result.attrs["nordpool_fetch_failures"] = {
+        "library_missing": False, "auth_failed": False,
+        "days_failed": days_failed, "days_total": len(dates),
+    }
+    if days_failed:
+        log_cb(f"  Nord Pool net positions: {days_failed}/{len(dates)} day(s) failed to fetch")
+    return result
+
+
+def merge_nordpool_net_positions(no3_df: pd.DataFrame, net_pos_df: pd.DataFrame,
+                                 max_gap_minutes: int = 90) -> pd.DataFrame:
+    """
+    Left-join netpos_<ZONE> columns from fetch_nordpool_net_positions()
+    onto a JAO covariate dataframe (no3_df, at 15-min MTU resolution),
+    matching each JAO row to the most recent Nord Pool settlement period
+    AT OR BEFORE it (forward-fill via merge_asof), bounded by
+    `max_gap_minutes`. Nord Pool auction products have historically
+    settled hourly (moving to 15-minute across the Nordic market on a
+    schedule that varies by zone/vintage), so an exact-timestamp join
+    would silently drop most JAO rows whenever Nord Pool is still on
+    hourly settlement — the same "nearest earlier, bounded gap" treatment
+    app_jao_NP_API_fix_d14.py's own `_asof_value()` already uses for its
+    single-CNEC GUI display, reimplemented here as a vectorized
+    `pd.merge_asof` over the whole dataframe (that GUI version loops
+    per-row in pure Python — fine for one CNEC's worth of rows on a
+    chart, far too slow for a full multi-CNEC analytical dataframe).
+
+    A JAO row with no Nord Pool value within max_gap_minutes gets NaN in
+    every netpos_<ZONE> column — never a silently-substituted 0 (see
+    `_asof_value()`'s own docstring for why that would be indistinguishable
+    from a genuine zero, and so worse than a visible gap). _its_ptdf_flow()
+    already treats a NaN-heavy netpos_<ZONE> column as unusable for that
+    zone (excluded from its reconstruction) rather than letting it corrupt
+    the result.
+
+    Returns `no3_df` UNCHANGED (a copy) if `net_pos_df` is empty — e.g.
+    because fetch_nordpool_net_positions() itself failed — so a missing
+    Nord Pool fetch degrades this merge step to a no-op rather than an
+    error, consistent with "ptdf_flow" itself falling back gracefully
+    when no netpos_<ZONE> columns are present at all.
+    """
+    if net_pos_df.empty:
+        return no3_df.copy()
+
+    left  = no3_df.sort_values("dateTimeUtc")
+    right = net_pos_df.sort_values("dateTimeUtc")
+    merged = pd.merge_asof(left, right, on="dateTimeUtc", direction="backward",
+                           tolerance=pd.Timedelta(minutes=max_gap_minutes))
+    if "cneName" in merged.columns:
+        return merged.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
+    return merged.reset_index(drop=True)
 
 
 def load_manual_outages(path: str, log_cb: LogCallback = _noop) -> pd.DataFrame:
@@ -1159,10 +1419,29 @@ def build_covariates(jao: pd.DataFrame, outages: pd.DataFrame,
     # produces "no lagged value available" (falls back to 0.0, same as
     # before) rather than silently pulling in the wrong point in time.
     jao = jao.sort_values(["cneName", "dateTimeUtc"]).reset_index(drop=True)
+    _lag_key_idx = pd.MultiIndex.from_arrays(
+        [jao["cneName"].to_numpy(), jao["dateTimeUtc"].to_numpy()])
+    # A real JAO export can carry more than one row for the same
+    # (cneName, dateTimeUtc) pair (e.g. distinct contingency-scenario rows
+    # sharing the same CNEC label and MTU timestamp). Series.reindex()
+    # requires a unique index and raises "cannot handle a non-unique
+    # multi-index!" otherwise -- keep the first occurrence of each pair for
+    # this lookup rather than crashing. Safe to do: every column here is an
+    # outage-active/dose covariate keyed off source-country-level outage
+    # overlap, not anything row-specific, so duplicate (CNEC, timestamp)
+    # rows already share the same value.
+    _lag_dedup_mask = None
+    if _lag_key_idx.has_duplicates:
+        n_dupe = int(_lag_key_idx.duplicated().sum())
+        log_cb(f"  ⚠ {n_dupe} duplicate (CNEC, timestamp) row(s) in JAO data — "
+               f"keeping the first occurrence of each for lag-feature lookups")
+        _lag_dedup_mask = ~_lag_key_idx.duplicated(keep="first")
     for col in bin_cols + (f"{p}_gen_outage_mw_lost",):
-        _series = pd.Series(jao[col].to_numpy(),
-                            index=pd.MultiIndex.from_arrays(
-                                [jao["cneName"].to_numpy(), jao["dateTimeUtc"].to_numpy()]))
+        if _lag_dedup_mask is not None:
+            _series = pd.Series(jao[col].to_numpy()[_lag_dedup_mask],
+                                index=_lag_key_idx[_lag_dedup_mask])
+        else:
+            _series = pd.Series(jao[col].to_numpy(), index=_lag_key_idx)
         for _label, _delta in (("lag1h", pd.Timedelta(hours=1)),
                                ("lag24h", pd.Timedelta(hours=24))):
             _target_idx = pd.MultiIndex.from_arrays(
@@ -2798,6 +3077,38 @@ def run_event_study(df: pd.DataFrame, dep_var: str,
 # project into during and post without ever touching those observations.
 # ===========================================================================
 
+ITS_TUNE_HYPERPARAMS = True
+# Module-level on/off switch for the lightgbm/catboost/ridge internal
+# hyperparameter search (_tune_lag_hyperparams(), consumed inside
+# _its_gbm()/_its_ridge()). Default True: each of those three methods
+# grades a small candidate grid on a held-out slice of the pre-period
+# before fitting its real projection (see CLAUDE.md's tuning/ensemble
+# domain-facts entry for why this was added). Set to False -- e.g.
+# `propagation.ITS_TUNE_HYPERPARAMS = False` from a GUI checkbox, a CLI
+# flag, or a test, before calling into single_event_analysis()/
+# run_pipeline() -- to skip tuning and use each method's original fixed
+# configuration (candidates[0]) instead. Meaningfully faster, especially
+# for "ensemble"/"all" mode, which calls these three methods several
+# times each (once per rolling-origin backtest window, once for the real
+# projection) and multiplies the tuning cost accordingly on every one of
+# those calls. Read fresh on every _its_gbm()/_its_ridge() call, not
+# cached anywhere, so flipping it takes effect on the very next ITS call
+# -- no restart, no re-fit of anything already computed.
+#
+# A plain module attribute rather than a parameter threaded through
+# _build_its_for_col()/single_event_analysis()/_ensemble_backtest_weights()
+# deliberately: those all dispatch to any of the 13 methods through one
+# shared, fixed call signature (pre_agg, all_agg, col, mtu_minutes=...),
+# and only 3 of the 13 methods have anything to tune -- adding a
+# tuning-specific kwarg to that shared signature would mean every other
+# method's function silently ignoring an argument that means nothing to
+# it. A toggle only the tuning-aware methods read keeps that dispatch
+# contract untouched, matches this module's existing style for global
+# analysis constants (ENTSOE_TOKEN, ITS_DEFAULT_METHOD, etc.), and is
+# already how the ensemble reaches every member uniformly, so ensemble
+# calls respect this toggle automatically with no extra plumbing.
+
+
 def _its_seasonal_naive(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
                         col: str) -> pd.Series:
     """
@@ -3148,6 +3459,639 @@ def _its_sarima(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
     return pd.Series(projected, index=all_agg.index)
 
 
+def _hourly_pre_series(pre_agg: pd.DataFrame, col: str) -> pd.Series:
+    """Resample a pre-period DataFrame to hourly, interpolating gaps.
+    Shared by every ITS method that fits on hourly-aggregated data
+    (_its_structural, _its_tbats — _its_sarima keeps its own copy of this
+    step, written before this helper existed) before expanding back to
+    MTU resolution via _expand_hourly_forecast_to_mtu()."""
+    return (pre_agg.set_index("dateTimeUtc")[col]
+            .resample("1h").mean()
+            .interpolate("time"))
+
+
+def _expand_hourly_forecast_to_mtu(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                                   col: str, mtu_minutes: int,
+                                   pre_end_h: pd.Timestamp,
+                                   hourly_fc_series: pd.Series) -> pd.Series:
+    """
+    Reconstruct an MTU-level counterfactual from an hourly forecast:
+    pre-period rows use the in-sample (hour, dow) seasonal mean; during/
+    post rows use the nearest hourly forecast value plus the average
+    within-hour deviation pattern observed in the pre-period for that
+    (hour, dow, mtu-within-hour) triple — MTU-level detail an hourly model
+    can't itself provide, since it never saw sub-hourly variation. Shared
+    by _its_structural and _its_tbats (mirrors _its_sarima's own inline
+    Step 5/6, which predates this helper and is left untouched to avoid
+    any regression risk to that already-shipped, well-tested method).
+    """
+    pre_detailed = pre_agg.copy()
+    pre_detailed["hour"] = pre_detailed["dateTimeUtc"].dt.hour
+    pre_detailed["dow"]  = pre_detailed["dateTimeUtc"].dt.dayofweek
+    pre_detailed["mtu_in_hour"] = pre_detailed["dateTimeUtc"].dt.minute // mtu_minutes
+    pre_hrly = (pre_detailed.set_index("dateTimeUtc")[col]
+                .resample("1h").transform("mean"))
+    pre_detailed["hourly_mean"] = pre_hrly.values
+    pre_detailed["within_hour_dev"] = pre_detailed[col] - pre_detailed["hourly_mean"]
+    sub_hour_mean = (pre_detailed.groupby(["hour", "dow", "mtu_in_hour"])
+                     ["within_hour_dev"].mean())
+
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+
+    projected = []
+    for _, row in all_agg.iterrows():
+        ts = row["dateTimeUtc"]
+        if ts <= pre_end_h:
+            seas = float(seas_mean.get((int(row["hour"]), int(row["dow"])), fallback))
+            projected.append(seas)
+        else:
+            hour_ts = ts.floor("1h")
+            if hour_ts in hourly_fc_series.index:
+                h_fc = float(hourly_fc_series[hour_ts])
+            else:
+                nearest = hourly_fc_series.index.get_indexer([hour_ts], method="nearest")[0]
+                h_fc = float(hourly_fc_series.iloc[nearest]) if nearest >= 0 else float(hourly_fc_series.iloc[-1])
+            mtu_in_h = int(ts.minute // mtu_minutes)
+            dev_key  = (int(row["hour"]), int(row["dow"]), mtu_in_h)
+            dev      = float(sub_hour_mean.get(dev_key, 0.0))
+            projected.append(h_fc + dev)
+
+    return pd.Series(projected, index=all_agg.index)
+
+
+def _its_structural(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                    col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    Structural time series / Kalman filter (statsmodels
+    UnobservedComponents) with local linear trend plus daily AND weekly
+    seasonality in a SINGLE state-space model, on hourly-aggregated data,
+    expanded back to MTU resolution. See _ITS_METHODS["structural"]
+    ["description"] for full docs.
+
+    This exists specifically because SARIMA above only models one seasonal
+    period (m=24, hourly) and bolts the weekly pattern on afterward via a
+    separate within-hour-deviation lookup (Step 5 in _its_sarima) — it
+    never lets the weekly cycle inform the trend/level estimate itself.
+    UnobservedComponents' `freq_seasonal` accepts multiple periods (here
+    24 AND 168, trigonometric/harmonic seasonal components) in one
+    coherent model, so daily and weekly structure are estimated jointly
+    with the trend via the Kalman filter, rather than layered on
+    afterward. Also yields proper forecast confidence intervals (not
+    currently surfaced by this pipeline, but available on the fitted
+    result if a future caller wants them).
+
+    Falls back to SARIMA if UnobservedComponents can't be imported (not
+    expected — it's part of the already-required statsmodels — this
+    mirrors the same defensive pattern as every other statsmodels-backed
+    method here), if there's under 48 hours of pre-period, or if fitting
+    fails. The weekly seasonal component itself is only added once there
+    are ≥336 hours (2 full weekly cycles) of pre-period; below that it
+    fits daily seasonality only rather than an unidentified weekly one.
+    """
+    try:
+        from statsmodels.tsa.statespace.structural import UnobservedComponents as _UC
+    except ImportError:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_ts = _hourly_pre_series(pre_agg, col)
+    if len(pre_ts) < 48:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    endog = pre_ts.values.astype(float)
+    freq_seasonal = [{"period": 24, "harmonics": 4}]
+    if len(endog) >= 336:
+        freq_seasonal.append({"period": 168, "harmonics": 2})
+
+    try:
+        # No explicit irregular=True: the "local linear trend" preset
+        # already implies its own observation-noise term, and passing
+        # irregular explicitly on top just triggers a SpecificationWarning
+        # about it being overridden -- noise, not a real config choice.
+        model = _UC(endog, level="local linear trend",
+                   freq_seasonal=freq_seasonal).fit(disp=False)
+    except Exception:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_end_h  = pre_ts.index[-1]
+    all_end    = all_agg["dateTimeUtc"].max()
+    n_hours_fc = int(np.ceil((all_end - pre_end_h).total_seconds() / 3600)) + 1
+    if n_hours_fc <= 0:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        fc_hourly = model.forecast(steps=n_hours_fc)
+    except Exception:
+        return _its_sarima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    hourly_fc_idx = pd.date_range(start=pre_end_h + pd.Timedelta(hours=1),
+                                  periods=n_hours_fc, freq="1h", tz="UTC")
+    hourly_fc_series = pd.Series(np.asarray(fc_hourly), index=hourly_fc_idx)
+
+    return _expand_hourly_forecast_to_mtu(pre_agg, all_agg, col, mtu_minutes,
+                                          pre_end_h, hourly_fc_series)
+
+
+def _its_tbats(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+               col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    TBATS (Box-Cox transform, ARMA errors, Trend, multiple Seasonal
+    components) with daily AND weekly seasonal periods, on
+    hourly-aggregated data, expanded back to MTU resolution. See
+    _ITS_METHODS["tbats"]["description"] for full docs.
+
+    Like _its_structural(), this targets the same gap (SARIMA only models
+    one seasonal period) with a model purpose-built for exactly this
+    "multiple seasonal periods on one series" shape, rather than
+    approximating it with harmonics inside a general state-space model.
+
+    Box-Cox, damped trend, and ARMA-error model selection are all fixed
+    explicitly (use_box_cox=False, use_damped_trend=False,
+    use_arma_errors=True) rather than left to TBATS' own automatic search
+    over combinations of those — that search is expensive (many candidate
+    fits), and SARIMA's own AIC grid search here is already flagged as the
+    slowest of the non-ensemble methods; letting TBATS run its full
+    default search on top would make it slower still for a GUI a person
+    is waiting on.
+
+    Falls back to _its_structural() (the other dual-seasonality method) if
+    the `tbats` package isn't installed (optional — see requirements.txt/
+    pyproject.toml), if there's under 48 hours of pre-period, or if
+    fitting fails. The weekly seasonal period is only included once there
+    are ≥336 hours (2 full weekly cycles) of pre-period, same threshold
+    and reasoning as _its_structural().
+    """
+    try:
+        from tbats import TBATS
+    except ImportError:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_ts = _hourly_pre_series(pre_agg, col)
+    if len(pre_ts) < 48:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    endog = pre_ts.values.astype(float)
+    seasonal_periods = [24]
+    if len(endog) >= 336:
+        seasonal_periods.append(168)
+
+    try:
+        estimator = TBATS(seasonal_periods=seasonal_periods, use_box_cox=False,
+                          use_trend=True, use_damped_trend=False,
+                          use_arma_errors=True, n_jobs=1)
+        model = estimator.fit(endog)
+    except Exception:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    pre_end_h  = pre_ts.index[-1]
+    all_end    = all_agg["dateTimeUtc"].max()
+    n_hours_fc = int(np.ceil((all_end - pre_end_h).total_seconds() / 3600)) + 1
+    if n_hours_fc <= 0:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        fc_hourly = model.forecast(steps=n_hours_fc)
+    except Exception:
+        return _its_structural(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    hourly_fc_idx = pd.date_range(start=pre_end_h + pd.Timedelta(hours=1),
+                                  periods=n_hours_fc, freq="1h", tz="UTC")
+    hourly_fc_series = pd.Series(np.asarray(fc_hourly), index=hourly_fc_idx)
+
+    return _expand_hourly_forecast_to_mtu(pre_agg, all_agg, col, mtu_minutes,
+                                          pre_end_h, hourly_fc_series)
+
+
+def _its_theta(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+               col: str, mtu_minutes: int = 15) -> pd.Series:
+    """
+    Theta method on deseasonalized residuals — mirrors _its_arima()'s own
+    "deseasonalize via seasonal_naive, then model the residual" structure
+    exactly, swapping ARIMA-on-residuals for the Theta method. See
+    _ITS_METHODS["theta"]["description"] for full docs.
+
+    The Theta method (Assimakopoulos & Nikolopoulos, top-tier in the M3/M4
+    forecasting competitions) decomposes a series into "theta lines" —
+    here just a trend/level extrapolation on the deseasonalized residual,
+    since seasonality is already stripped out before it sees the data —
+    and is known for punching above its weight specifically on SHORT
+    series, where ARIMA/SARIMA's own order-search and the lag-feature
+    methods' need for several weeks of lag7d examples both struggle (see
+    CLAUDE.md's "Backtested accuracy" note). No AIC-style grid search, so
+    it's also one of the cheapest methods to fit here.
+
+    Falls back to seasonal_naive if statsmodels (already required) is
+    unavailable, or below the same length/deseasonalization guards
+    _its_arima() uses (len(pre_agg) < 32, or < 20 valid deseasonalized
+    points) — Theta's short-series strength still needs a floor of usable
+    data, it isn't magic.
+    """
+    if sm is None:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+    try:
+        from statsmodels.tsa.forecasting.theta import ThetaModel
+    except ImportError:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    if len(pre_agg) < 32:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+
+    def _seas(h, d):
+        return float(seas_mean.get((int(h), int(d)), fallback))
+
+    deseas = np.array([pre_agg[col].values[i] - _seas(pre_agg["hour"].values[i],
+                                                        pre_agg["dow"].values[i])
+                       for i in range(len(pre_agg))], dtype=float)
+    deseas = deseas[np.isfinite(deseas)]
+    if len(deseas) < 20:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    try:
+        theta_res = ThetaModel(deseas, deseasonalize=False).fit()
+    except Exception:
+        return _its_seasonal_naive(pre_agg, all_agg, col)
+
+    pre_end  = pre_agg["dateTimeUtc"].max()
+    n_future = int((all_agg["dateTimeUtc"] > pre_end).sum())
+
+    try:
+        fc = np.asarray(theta_res.forecast(steps=n_future)) if n_future > 0 else np.array([])
+    except Exception:
+        fc = np.zeros(n_future)
+
+    projected = []
+    fc_iter   = iter(fc)
+    for _, row in all_agg.iterrows():
+        seas  = _seas(row["hour"], row["dow"])
+        resid = float(next(fc_iter, 0.0)) if row["dateTimeUtc"] > pre_end else 0.0
+        projected.append(seas + resid)
+
+    return pd.Series(projected, index=all_agg.index)
+
+
+def _its_hurdle(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                mtu_minutes: int = 15, zero_tol: float = 1e-9) -> pd.Series:
+    """
+    Two-part 'hurdle' counterfactual for zero-inflated series — built for
+    shadow price specifically (exactly 0 on a non-binding CNEC, positive
+    only when binding), but works on any column with a real point mass at
+    zero. See _ITS_METHODS["hurdle"]["description"] for the full
+    rationale.
+
+    Every OTHER method in this section implicitly fits a continuous,
+    roughly-Gaussian-shaped model to whatever column it's given — a poor
+    match for a series that is genuinely a point mass at zero PLUS a
+    separate positive-value distribution when binding, not just
+    "occasionally small". Projecting one of those methods directly onto
+    shadow price risks a smooth trend/seasonal projection landing on some
+    small positive baseline the real quantity structurally cannot take
+    except when the CNEC is actually binding.
+
+    This instead estimates two (hour, weekday) tables from the pre-period
+    — same zero-estimation-variance philosophy as seasonal_naive:
+      1. P(binding) = fraction of pre-period rows with a nonzero value,
+         grouped by (hour, dow).
+      2. E[value | binding] = mean of the NONZERO pre-period rows, grouped
+         by (hour, dow) — falling back to the overall nonzero mean for a
+         (hour, dow) cell that saw no binding examples in the pre-period.
+    The projected value at every during/post timestamp is
+    P(binding) x E[value | binding] — the expected value under this
+    two-part model, giving the same "single continuous Series" contract
+    every other ITS method returns, while respecting that most hours'
+    expectation is genuinely dominated by the zero mass rather than a
+    smeared-out small positive value.
+
+    No lag features, no recursion, no extra leak-avoidance machinery
+    needed — like seasonal_naive, every projected value is a
+    deterministic (hour, dow) lookup from pre-period-only statistics, so
+    it can't read a during/post observation by construction.
+    """
+    is_nonzero = (pre_agg[col].abs() > zero_tol).astype(float)
+    p_bind = (pre_agg.assign(_is_nonzero=is_nonzero)
+              .groupby(["hour", "dow"])["_is_nonzero"].mean())
+    p_bind_fallback = float(is_nonzero.mean())
+
+    nonzero_rows = pre_agg[pre_agg[col].abs() > zero_tol]
+    if not nonzero_rows.empty:
+        mag_mean = nonzero_rows.groupby(["hour", "dow"])[col].mean()
+        mag_fallback = float(nonzero_rows[col].mean())
+    else:
+        mag_mean = pd.Series(dtype=float)
+        mag_fallback = 0.0
+
+    def _project(row) -> float:
+        key = (int(row["hour"]), int(row["dow"]))
+        p = float(p_bind.get(key, p_bind_fallback))
+        m = float(mag_mean.get(key, mag_fallback))
+        return p * m
+
+    return all_agg.apply(_project, axis=1)
+
+
+# RAM = Fmax - FRM - fall + fnrao + AMR - FAAC - IVA (see build_covariates()'s
+# ram_check and decompose_delta_ram() -- this is the SAME formula, same sign
+# convention, verified on real data to balance within 1 MW on ~100% of rows
+# whenever the export carries all seven terms). _its_ram_identity() below is
+# the counterfactual-forecasting use of that identity: componentwise sign map
+# shared with both of those, so a bug fixed in one can't silently drift out
+# of sync with the others.
+_RAM_IDENTITY_TERMS: dict = {
+    "fmax": +1.0, "frm": -1.0, "fnrao": +1.0,
+    "amr": +1.0, "faac": -1.0, "fall": -1.0, "iva": -1.0,
+}
+
+# Which ITS method forecasts each RAM component's own counterfactual, chosen
+# for that component's actual dynamics rather than one blanket method for
+# all seven -- see _its_ram_identity()'s docstring for the reasoning behind
+# each pick. Originally an all-theta choice for fnrao/amr/faac and
+# seasonal_naive for frm, picked on domain-story grounds alone; re-picked
+# from a pre-period-only backtest (fit N days, project a held-out
+# continuation, compare to known truth -- same method as CLAUDE.md's
+# "Backtested accuracy"/"ACCURACY REALITY CHECK" notes) once synthetic.py
+# started giving these terms genuine day-level structure to actually
+# distinguish candidates on (see synthetic.py's _ar1_day_regime()). theta
+# turned out ~2x worse than seasonal_naive on fnrao and consistently worse
+# than hurdle on the zero-inflated amr; seasonal_naive turned out to
+# catastrophically mis-forecast frm (MAE 42.8 vs ridge's 2.2 at a 60-day
+# pre-period) whenever the fit window straddles the Dec-2024 structural
+# step, because its hour/dow lookup table averages pre- and post-step
+# values together into a contaminated mean -- ridge instead tracks the
+# CURRENT level via lag1d/lag7d, which contain no outage information, so
+# this doesn't reintroduce the outage-sensitivity H6's placebo exists to
+# rule out, it just stops the projection from lagging behind a known
+# calibration change. faac (theta) and fall (catboost) backtested as
+# already-correct; iva (hurdle) ties for best and keeps its zero-inflation
+# rationale.
+_RAM_COMPONENT_METHOD: dict = {
+    "fmax": "seasonal_naive", "frm": "ridge",
+    "fnrao": "seasonal_naive", "amr": "hurdle", "faac": "theta",
+    "fall": "catboost", "iva": "hurdle",
+}
+
+
+def _its_ram_identity(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                      mtu_minutes: int = 15) -> pd.Series:
+    """
+    Physics-informed counterfactual: instead of forecasting RAM as an
+    independent black-box target, forecast each of the seven terms in
+    the Nordic RAM identity separately and COMPUTE the counterfactual RAM
+    from them. See _ITS_METHODS["ram_identity"]["description"] for the
+    full rationale.
+
+    RAM is not an independently observed physical quantity here — it is
+    an accounting identity of fmax/frm/fnrao/amr/faac/fall/iva (see
+    _RAM_IDENTITY_TERMS, and build_covariates()'s ram_check, which
+    verifies this on real data). Every OTHER ITS method in this section
+    treats "ram" as just another opaque column, which means nothing stops
+    a projected RAM from being inconsistent with what its own components
+    would imply. This method makes that impossible by construction: the
+    returned Series IS Σ (sign × projected component), so it satisfies
+    the identity exactly, not approximately.
+
+    Each component gets the sub-method suited to its own dynamics
+    (_RAM_COMPONENT_METHOD), not one blanket choice -- picked from an
+    actual pre-period-only backtest per component (fit N days, project a
+    held-out continuation, compare to known truth), not domain-story
+    guesswork alone; see _RAM_COMPONENT_METHOD's own comment for the
+    backtest numbers that justified each pick:
+      fmax       — seasonal_naive. Structural/near-constant per CNEC —
+                   every candidate method backtests at ~0 MAE here, so the
+                   cheapest correct one wins.
+      frm        — ridge. Structural like fmax, and frm is the H6
+                   placebo's own null hypothesis (should NOT move with
+                   individual outages) -- but seasonal_naive's (hour, dow)
+                   lookup table turned out to catastrophically mis-forecast
+                   frm whenever the pre-period straddles the Dec-2024
+                   structural step (it averages pre- and post-step values
+                   into one contaminated mean; backtested MAE 42.8 vs
+                   ridge's 2.2 at a 60-day pre-period spanning the step).
+                   ridge's lag1d/lag7d features track the CURRENT level
+                   instead, without carrying any outage information, so
+                   this doesn't reopen the door to the spurious
+                   outage-sensitivity the placebo rules out — it only
+                   stops the projection from lagging behind a known,
+                   outage-independent calibration change.
+      fnrao      — seasonal_naive. Backtested ~2x more accurate than
+                   theta (the original pick) on synthetic data once
+                   fnrao carried genuine day-level structure to
+                   distinguish candidates on — theta's ARIMA-on-residual
+                   machinery added noise here rather than signal.
+      amr        — hurdle. AMR is zero most of the time by construction
+                   (see synthetic.py) — a genuinely zero-inflated series,
+                   the exact shape "hurdle" targets, and it backtested at
+                   or near the best MAE of any candidate at every
+                   pre-period length tested; theta (the original pick)
+                   was consistently worse.
+      faac       — theta. Backtested as already the best candidate —
+                   faac is small but continuous with a persistent
+                   day-level drift, not zero-inflated, which suits
+                   theta's short-series residual modeling better than a
+                   zero-inflation table (hurdle) or a pure lookup
+                   (seasonal_naive) would.
+      fall       — catboost. The term outages actually move (H1's own
+                   dependent variable) — deserves the richest per-column
+                   method available, and backtests as the best or
+                   statistically-tied-for-best candidate. catboost, not
+                   the slower "ensemble", to keep this method's own
+                   runtime reasonable, since it already fits 7 sub-models
+                   per call.
+      iva        — hurdle. IVA is TSO-discretionary and documented as
+                   "expected to be nonzero exactly during forced outages"
+                   (decompose_delta_ram()) / "zero on NO3 CNECs in short
+                   windows" (CLAUDE.md known limitations) — a genuinely
+                   zero-inflated series, the exact shape "hurdle" targets.
+                   Fit on the pre-period, hurdle's (hour, dow) P(binding)
+                   table naturally captures the BASELINE (mostly
+                   outage-free) rate at which IVA activates — precisely
+                   the right Y(0) to project forward. Backtests at or
+                   near the best MAE of any candidate.
+
+    Falls back to _its_theta() for any column other than "ram" (the
+    identity has nothing to decompose for a different target — this
+    method's whole value is specific to RAM), and to _its_ensemble() for
+    "ram" itself if any of the seven component columns isn't present in
+    pre_agg/all_agg (computing RAM from an INCOMPLETE subset of the
+    formula would silently produce a different, wrong quantity, not a
+    degraded RAM — exactly the AMR/IVA-dropping bug this formula's own
+    history in CLAUDE.md warns about). Requires pre_agg/all_agg to carry
+    the raw component columns alongside `col` — see
+    single_event_analysis()'s _run_its_for_method(), which widens the
+    per-column pre_agg/all_agg specifically so this method (and
+    _its_ptdf_flow()) can reach them.
+
+    Diagnostic (not required to use the projection, but there to avoid
+    trusting it blindly): the returned Series carries a
+    `ram_identity_check` entry in its `.attrs`, reusing the exact same
+    "does the identity balance within 1 MW" check build_covariates()'s
+    ram_check already runs — computed here on the PRE-PERIOD rows this
+    projection was fit from, so a caller can see whether this particular
+    CNEC/window's data actually supports the identity before trusting a
+    projection built on it.
+    """
+    if col != "ram":
+        return _its_theta(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    components = list(_RAM_IDENTITY_TERMS.keys())
+    missing = [c for c in components
+              if c not in pre_agg.columns or c not in all_agg.columns
+              or pre_agg[c].isna().all()]
+    if missing:
+        return _its_ensemble(pre_agg, all_agg, "ram", mtu_minutes=mtu_minutes)
+
+    projected_ram = np.zeros(len(all_agg))
+    component_series = {}
+    for c in components:
+        method = _RAM_COMPONENT_METHOD[c]
+        fn = _ITS_METHODS[method]["fn"]
+        proj_c = _call_its_method(fn, pre_agg, all_agg, c, method, mtu_minutes)
+        component_series[c] = proj_c
+        projected_ram += _RAM_IDENTITY_TERMS[c] * proj_c.values
+
+    result = pd.Series(projected_ram, index=all_agg.index)
+
+    # Identity-balance diagnostic on the PRE-PERIOD rows only (never
+    # during/post — this is purely informational, not part of the
+    # projection, and must obey the same "pre-period only" discipline as
+    # everything else in this section on principle).
+    if "ram" in pre_agg.columns and pre_agg["ram"].notna().any():
+        formula_pre = sum(_RAM_IDENTITY_TERMS[c] * pre_agg[c].fillna(0.0) for c in components)
+        diff = (pre_agg["ram"] - formula_pre).abs()
+        pct_ok = float((diff < 1.0).mean())
+        result.attrs["ram_identity_check"] = {
+            "pct_within_1mw_pre_period": pct_ok,
+            "mean_abs_diff_mw": float(diff.mean()),
+            "n_pre_period_rows": int(len(pre_agg)),
+        }
+
+    return result
+
+
+def _its_ptdf_flow(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                   mtu_minutes: int = 15,
+                   min_validation_corr: float = 0.5) -> pd.Series:
+    """
+    Physics-informed counterfactual for flow-type columns ("fall"/
+    "flowFB"): reconstruct the counterfactual as
+        flow_t ≈ Σ_zone PTDF_{zone,CNEC,t} × NetPosition_{zone,t}
+    — the DC/PTDF-based flow decomposition FBMC methodology is built on
+    (PTDFs derive from the grid's admittance matrix; a CNEC's loading is
+    the linear combination of every zone's net position, weighted by
+    that zone's sensitivity). See _ITS_METHODS["ptdf_flow"]["description"]
+    for the full rationale, and CLAUDE.md's domain-facts entry for why
+    this method validates itself rather than trusting the physics blindly.
+
+    UNLIKE _its_ram_identity(), this relationship is NOT a proven
+    accounting identity in this codebase — "fall" (F_allReference) is a
+    REFERENCE-case flow from the D-2 common grid model, not necessarily
+    numerically identical to Σ PTDF × REALIZED net position. Treating it
+    as exact would overclaim. So this method VALIDATES itself on the
+    pre-period before trusting the reconstruction: it computes
+    Σ PTDF_actual × NetPosition_actual against the ACTUAL observed `col`
+    on pre-period rows, and if the correlation is below
+    `min_validation_corr`, falls back to _its_ensemble() instead of
+    handing back a physics-flavored number that doesn't actually fit
+    this CNEC's data. The validation result is always attached to the
+    returned Series' `.attrs["ptdf_flow_validation"]`, whichever path is
+    taken, so a caller can see why.
+
+    Each zone's PTDF and net position get their OWN counterfactual
+    projection, but NOT the same sub-method for both — re-picked from a
+    per-column backtest the same way _RAM_COMPONENT_METHOD was (see its
+    comment): PTDF stays seasonal_naive (near-constant per CNEC by
+    construction; every candidate ties within noise, so the cheapest wins,
+    and its projection is deliberately what "removes" an AC-outage's
+    topology shift, per H2's own logic). Net position gets ridge instead —
+    it's a market-driven quantity with real day-to-day persistence (cold
+    snaps, demand swings) a hound/dow-only lookup can't see, and
+    seasonal_naive backtested consistently worse than ridge (never best at
+    either pre-period length tested, ~13% worse at a 30-day pre-period)
+    since it can only see the hour/dow pattern, not the day-specific
+    regime level; ridge, not catboost (which edges it out slightly), to
+    keep the total cost down since this method already fits up to 2
+    sub-projections per zone across every zone with data.
+
+    Requires netpos_<ZONE> columns already merged into pre_agg/all_agg
+    (see merge_nordpool_net_positions()) alongside the matching
+    ptdf_<ZONE> columns JAO already provides — falls back to
+    _its_ensemble() if none of the zones has both, since the whole
+    reconstruction needs at least one PTDF×position pair to mean
+    anything. This is an OPT-IN capability: out of the box, no caller has
+    fetched and merged net-position data, so this method gracefully
+    degrades to ensemble for everyone until that merge step is run —
+    exactly the same "library not installed" style fallback lightgbm/
+    catboost/tbats already use, just for a data dependency instead of a
+    package one.
+    """
+    if col not in ("fall", "flowFB"):
+        return _its_theta(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    zone_cols = []
+    for c in pre_agg.columns:
+        if not c.startswith("ptdf_") or c.endswith("_abs"):
+            continue
+        zone = c[len("ptdf_"):]
+        netpos_col = f"netpos_{zone}"
+        if (netpos_col in pre_agg.columns and netpos_col in all_agg.columns
+                and pre_agg[c].notna().any() and pre_agg[netpos_col].notna().any()):
+            zone_cols.append((zone, c, netpos_col))
+
+    if not zone_cols:
+        result = _its_ensemble(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+        result.attrs["ptdf_flow_validation"] = {
+            "status": "no_netpos_data",
+            "reason": ("no ptdf_<ZONE>/netpos_<ZONE> column pair found in "
+                      "pre_agg -- fetch_nordpool_net_positions() + "
+                      "merge_nordpool_net_positions() haven't been run for "
+                      "this data, or no zone had both columns populated"),
+        }
+        return result
+
+    # ── Validate on the pre-period: does Σ PTDF_actual × NP_actual ─────────
+    # actually track the observed target here, before trusting a projection
+    # built the same way?
+    reconstructed_pre = np.zeros(len(pre_agg))
+    for _zone, ptdf_col, netpos_col in zone_cols:
+        reconstructed_pre += (pre_agg[ptdf_col].fillna(0.0).values
+                              * pre_agg[netpos_col].fillna(0.0).values)
+    actual_pre = pre_agg[col].values.astype(float)
+    valid_mask = np.isfinite(reconstructed_pre) & np.isfinite(actual_pre)
+    if valid_mask.sum() >= 5 and np.std(reconstructed_pre[valid_mask]) > 1e-9:
+        corr = float(np.corrcoef(reconstructed_pre[valid_mask], actual_pre[valid_mask])[0, 1])
+    else:
+        corr = float("nan")
+
+    validation = {
+        "status": "validated",
+        "zones_used": [z for z, _, _ in zone_cols],
+        "n_pre_period_rows": int(valid_mask.sum()),
+        "pre_period_correlation": corr,
+        "min_required_correlation": min_validation_corr,
+    }
+
+    if not np.isfinite(corr) or corr < min_validation_corr:
+        result = _its_ensemble(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+        validation["status"] = "failed_validation_fell_back_to_ensemble"
+        result.attrs["ptdf_flow_validation"] = validation
+        return result
+
+    # ── Passed validation: project each zone's PTDF and net position, ──────
+    # combine via the linear PTDF-flow formula.
+    projected_flow = np.zeros(len(all_agg))
+    for _zone, ptdf_col, netpos_col in zone_cols:
+        ptdf_proj   = _call_its_method(_its_seasonal_naive, pre_agg, all_agg,
+                                       ptdf_col, "seasonal_naive", mtu_minutes)
+        netpos_proj = _call_its_method(_its_ridge, pre_agg, all_agg,
+                                       netpos_col, "ridge", mtu_minutes)
+        projected_flow += ptdf_proj.values * netpos_proj.values
+
+    result = pd.Series(projected_flow, index=all_agg.index)
+    result.attrs["ptdf_flow_validation"] = validation
+    return result
+
+
 def _clamp_recovery_frac(impact: float, recovery_residual: float) -> float:
     """Compute recovery fraction clamped to [-1.0, 1.0].
 
@@ -3189,6 +4133,648 @@ def _recovery_direction(impact: float, recovery_residual: float,
     if abs(ratio) <= tol_frac:
         return "recovered"
     return "persists" if ratio > 0 else "reversed"
+
+
+def _its_lag_model(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                   mtu_minutes: int, fit_predict) -> Optional[pd.Series]:
+    """
+    Shared feature engineering + leak-avoidance recursive projection for
+    every lag/calendar-feature ITS model (_its_gbm's LightGBM/CatBoost
+    backends, _its_ridge). Lag features are lag1d/lag2d/lag7d (same MTU 1,
+    2 and 7 days ago) plus their mean — a simplified Neighborhood Days
+    Approach / NDA — alongside cyclical hour/weekday features. See
+    _ITS_METHODS["lightgbm"/"catboost"/"ridge"]["description"] for the
+    per-method rationale; this function only owns the machinery all three
+    share.
+
+    `fit_predict(X_train, y_train)` receives ONLY pre-period-derived
+    training rows (every X_train row's lags point at-or-before the
+    pre-period end) and must return a `predict(X) -> np.ndarray` callable.
+    Returns None if there isn't enough pre-period history to fit anything
+    — the caller decides its own fallback for that case.
+
+    CRITICAL (data-leakage guard): a lag feature for a during/post
+    timestamp t must NEVER read the actual observed value at t-lag if
+    t-lag itself falls inside the during/post window — that value may
+    already be outage-affected, exactly what the "fit on pre-period only"
+    rule at the top of this section exists to prevent. Projection is
+    therefore RECURSIVE: during/post timestamps are predicted in
+    chronological order and each prediction is immediately fed back in as
+    the lag source for later steps, mirroring how _its_arima/_its_sarima's
+    own .forecast() never touches real future data. Pre-period rows are
+    predicted in one batch using only real pre-period lags — no recursion
+    needed there, since a pre-period lag always points at-or-before the
+    pre-period itself.
+    """
+    T_day = int(24 * 60 / mtu_minutes)
+    LAGS_DAYS = (1, 2, 7)
+
+    if len(pre_agg) < 2 * T_day:
+        return None
+
+    freq = f"{mtu_minutes}min"
+    pre_ts = (pre_agg.set_index("dateTimeUtc")[col]
+              .resample(freq).mean()
+              .interpolate("time"))
+
+    grid_start = pre_ts.index.min()
+    grid_end   = all_agg["dateTimeUtc"].max()
+    grid = pd.date_range(grid_start, grid_end, freq=freq, tz="UTC")
+    pre_end = pre_ts.index.max()
+
+    # value_source is "ground truth as known so far": real pre-period values
+    # now, overwritten with the model's own predictions as the recursive
+    # during/post loop below proceeds. It must never contain a real
+    # during/post observation.
+    value_source = pd.Series(np.nan, index=grid)
+    value_source.loc[pre_ts.index] = pre_ts.values
+
+    feature_cols = ["hour", "dow", "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+                    "lag1d", "lag2d", "lag7d", "lag_nda_mean"]
+
+    def _features_at(ts: pd.Timestamp, source: pd.Series) -> dict:
+        feat = {
+            "hour": ts.hour, "dow": ts.dayofweek,
+            "hour_sin": np.sin(2 * np.pi * ts.hour / 24),
+            "hour_cos": np.cos(2 * np.pi * ts.hour / 24),
+            "dow_sin": np.sin(2 * np.pi * ts.dayofweek / 7),
+            "dow_cos": np.cos(2 * np.pi * ts.dayofweek / 7),
+        }
+        lag_vals = []
+        for d in LAGS_DAYS:
+            v = source.get(ts - pd.Timedelta(days=d), np.nan)
+            feat[f"lag{d}d"] = v
+            if pd.notna(v):
+                lag_vals.append(v)
+        feat["lag_nda_mean"] = float(np.mean(lag_vals)) if lag_vals else np.nan
+        return feat
+
+    def _as_row(feat: dict) -> np.ndarray:
+        return np.array([[feat[c] for c in feature_cols]], dtype=float)
+
+    # ── Training set: pre-period rows with a real lag1d, so leak-free by
+    # construction (every lag used here points at-or-before pre_end too) ──
+    train_rows, train_y = [], []
+    for ts, y in pre_ts.items():
+        feat = _features_at(ts, value_source)
+        if pd.isna(feat["lag1d"]):
+            continue   # not enough history yet (start of pre-period)
+        train_rows.append([feat[c] for c in feature_cols])
+        train_y.append(y)
+
+    if len(train_rows) < 20:
+        return None
+
+    X_train = np.array(train_rows, dtype=float)
+    y_train = np.array(train_y, dtype=float)
+
+    try:
+        predict = fit_predict(X_train, y_train)
+    except Exception:
+        return None
+
+    # ── Batch-predict the pre-period (real lags throughout — no recursion
+    # needed since nothing here can read a during/post value) ──────────────
+    seas_mean = pre_agg.groupby(["hour", "dow"])[col].mean()
+    fallback  = float(pre_agg[col].mean())
+    predictions: dict = {}
+    for ts in pre_ts.index:
+        feat = _features_at(ts, value_source)
+        if pd.isna(feat["lag1d"]):
+            predictions[ts] = float(seas_mean.get((ts.hour, ts.dayofweek), fallback))
+        else:
+            predictions[ts] = float(predict(_as_row(feat))[0])
+
+    # ── Recursive during/post projection: chronological order, each
+    # prediction immediately becomes the lag source for later steps ────────
+    for ts in grid[grid > pre_end]:
+        feat = _features_at(ts, value_source)
+        pred = float(predict(_as_row(feat))[0])
+        predictions[ts] = pred
+        value_source.loc[ts] = pred
+
+    def _lookup(ts: pd.Timestamp) -> float:
+        if ts in predictions:
+            return predictions[ts]
+        pos = grid.get_indexer([ts], method="nearest")[0]
+        return float(predictions.get(grid[pos], fallback)) if pos >= 0 else fallback
+
+    return all_agg["dateTimeUtc"].apply(_lookup)
+
+
+def _carve_pre_period_holdout(pre_agg: pd.DataFrame, min_total_days: int = 14,
+                              holdout_days: Optional[int] = None):
+    """
+    Carve the most recent slice off a pre-period as an internal
+    validation window: hold out `holdout_days` (default: up to 7, capped
+    at 25% of the pre-period, so most of it is still left to train on),
+    fit on the earlier remainder only. Returns (inner_pre_agg,
+    holdout_mask) — holdout_mask indexed against the ORIGINAL pre_agg —
+    or None if the pre-period is under `min_total_days` (too short for a
+    meaningful split).
+
+    Shared by _ensemble_backtest_weights() (grading candidate METHODS)
+    and _tune_lag_hyperparams() (grading candidate HYPERPARAMETER SETS
+    for a single method) — both need the identical "fit on earlier
+    pre-period data, evaluate on a later pre-period slice whose truth is
+    already known" split. That split lives entirely inside the real
+    pre-period, so anything built on it — method choice, hyperparameter
+    choice, ensemble weights — can never be influenced by a real
+    during/post observation.
+    """
+    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
+    if total_days < min_total_days:
+        return None
+    if holdout_days is None:
+        holdout_days = min(7, max(2, total_days // 4))
+    split = pre_agg["dateTimeUtc"].max() - pd.Timedelta(days=holdout_days)
+    inner_pre_agg = pre_agg[pre_agg["dateTimeUtc"] < split].reset_index(drop=True)
+    holdout_mask = (pre_agg["dateTimeUtc"] >= split).values
+    if inner_pre_agg.empty or not holdout_mask.any():
+        return None
+    return inner_pre_agg, holdout_mask
+
+
+def _carve_rolling_origin_splits(pre_agg: pd.DataFrame, min_total_days: int = 14,
+                                 max_splits: int = 2) -> list:
+    """
+    Like _carve_pre_period_holdout(), but returns UP TO `max_splits`
+    non-overlapping holdout windows walking backward from the end of the
+    pre-period, each with its own earlier-only training slice — a
+    lightweight rolling-origin backtest. A single holdout window's MAE
+    estimate for a candidate is noisy (it's one window of at most a
+    handful of days); averaging a candidate's MAE across 2 independent
+    windows is a materially more stable estimate of how well it actually
+    generalizes, at roughly double the backtest cost — used by
+    _ensemble_backtest_weights() specifically because a noisy weight
+    estimate was diluting how decisively the ensemble could favor a
+    genuinely better member.
+
+    A second split only activates once there's enough pre-period to fit
+    both windows without starving the earliest one's own training side —
+    `total_days >= 2 * holdout_days + min_total_days` (typically ~28 days
+    at the default 7-day holdout); shorter pre-periods still get exactly
+    one split, same behavior as before this existed. Returns an empty
+    list (not None) if even one split isn't possible, so callers can
+    `for inner_pre_agg, holdout_mask in splits:` without a None check.
+    """
+    total_days = (pre_agg["dateTimeUtc"].max() - pre_agg["dateTimeUtc"].min()).days
+    if total_days < min_total_days:
+        return []
+    holdout_days = min(7, max(2, total_days // 4))
+    n_splits = 2 if (max_splits >= 2 and total_days >= 2 * holdout_days + min_total_days) else 1
+
+    splits = []
+    end = pre_agg["dateTimeUtc"].max()
+    for _ in range(n_splits):
+        split_ts = end - pd.Timedelta(days=holdout_days)
+        inner = pre_agg[pre_agg["dateTimeUtc"] < split_ts].reset_index(drop=True)
+        mask = ((pre_agg["dateTimeUtc"] >= split_ts) & (pre_agg["dateTimeUtc"] < end)).values
+        if inner.empty or not mask.any():
+            break
+        splits.append((inner, mask))
+        end = split_ts
+    return splits
+
+
+def _tune_lag_hyperparams(pre_agg: pd.DataFrame, col: str, mtu_minutes: int,
+                          candidates: list, make_fit_predict) -> dict:
+    """
+    Pick the best of a small hyperparameter grid for a lag-feature ITS
+    method (LightGBM/CatBoost/Ridge), using the SAME pre-period-only
+    holdout split _ensemble_backtest_weights() uses to grade candidate
+    METHODS — here grading candidate HYPERPARAMETER SETS for a single
+    method instead, requested specifically because none of the
+    lag-feature methods were ever tuned; they all just used one arbitrary
+    fixed configuration.
+
+    `candidates` is a list of kwargs dicts — candidates[0] must be a
+    safe, already-proven default, since it's what gets used if tuning
+    can't run at all. `make_fit_predict(kwargs)` returns a
+    `fit_predict(X_train, y_train) -> predict` closure, exactly the shape
+    _its_gbm()/_its_ridge() already build for _its_lag_model().
+
+    Returns candidates[0] unchanged if the pre-period is under 14 days
+    (too short for a reliable split) or if every candidate errors out —
+    "no tuning happened" is a safe, already-well-tested fallback, never a
+    crash. This split lives entirely inside the pre-period (see
+    _carve_pre_period_holdout()), so tuning can't leak during/post data
+    into the hyperparameter choice any more than fitting itself can.
+    """
+    split = _carve_pre_period_holdout(pre_agg, min_total_days=14)
+    if split is None:
+        return candidates[0]
+    inner_pre_agg, holdout_mask = split
+    true_vals = pre_agg[col].values[holdout_mask]
+
+    best_kwargs, best_mae = candidates[0], float("inf")
+    for kwargs in candidates:
+        try:
+            proj = _its_lag_model(inner_pre_agg, pre_agg, col, mtu_minutes,
+                                  make_fit_predict(kwargs))
+            if proj is None:
+                continue
+            pred = proj.values[holdout_mask]
+            mae = float(np.mean(np.abs(pred - true_vals)))
+            if np.isfinite(mae) and mae < best_mae:
+                best_kwargs, best_mae = kwargs, mae
+        except Exception:
+            continue
+    return best_kwargs
+
+
+def _its_gbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+             mtu_minutes: int = 15, backend: str = "lightgbm") -> pd.Series:
+    """
+    Gradient-boosted trees (LightGBM/CatBoost) on lag + calendar features.
+    See _ITS_METHODS["lightgbm"/"catboost"]["description"] for full docs,
+    and _its_lag_model() for the shared feature engineering and
+    leak-avoidance recursive projection this delegates to.
+
+    Lag features (same MTU 1, 2 and 7 days ago, plus their mean — a
+    simplified Neighborhood Days Approach / NDA) are the dominant predictor
+    for this kind of series: recent history captures autocorrelation and
+    weekly structure that calendar features alone cannot reconstruct. This
+    is not specific to gradient boosting — lag24-style features improve
+    Ridge/XGBoost/CatBoost/LightGBM alike — so the feature set, not the
+    model family, is what's expected to move accuracy here; LightGBM and
+    CatBoost are offered because they handle the resulting NaN-heavy lag
+    columns (early pre-period rows, missing days) natively, with no
+    imputation step needed.
+
+    HYPERPARAMETER TUNING: rather than one fixed, arbitrary configuration,
+    a small grid of candidates (varying depth/learning_rate/n_estimators)
+    is graded via _tune_lag_hyperparams() on a held-out slice of the
+    pre-period itself, and the winner is what actually fits the real
+    projection. candidates[0] is the original fixed configuration this
+    method shipped with — the safe fallback when the pre-period is too
+    short to tune reliably (<14 days) — so tuning can only match or beat
+    that baseline, never do worse by picking something untested.
+    """
+    try:
+        if backend == "lightgbm":
+            from lightgbm import LGBMRegressor as _Regressor
+            _candidates = [
+                dict(n_estimators=200, max_depth=5, num_leaves=31,
+                    learning_rate=0.05, min_child_samples=10, verbosity=-1),
+                dict(n_estimators=100, max_depth=3, num_leaves=15,
+                    learning_rate=0.10, min_child_samples=10, verbosity=-1),
+                dict(n_estimators=300, max_depth=6, num_leaves=63,
+                    learning_rate=0.03, min_child_samples=5, verbosity=-1),
+                dict(n_estimators=150, max_depth=4, num_leaves=20,
+                    learning_rate=0.08, min_child_samples=15, verbosity=-1),
+            ]
+        else:
+            from catboost import CatBoostRegressor as _Regressor
+            _candidates = [
+                dict(iterations=300, depth=5, learning_rate=0.05,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=150, depth=3, learning_rate=0.10,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=500, depth=6, learning_rate=0.03,
+                    verbose=False, allow_writing_files=False),
+                dict(iterations=200, depth=4, learning_rate=0.08,
+                    verbose=False, allow_writing_files=False),
+            ]
+        # Fail fast here, not at .fit() time: lightgbm's sklearn wrapper
+        # imports cleanly even without scikit-learn installed, then raises
+        # a non-ImportError LightGBMError the first time it's constructed
+        # ("scikit-learn is required for lightgbm.sklearn ..."). Catching
+        # only ImportError above let that slip through to a downstream
+        # except-Exception guard, which falls back to seasonal_naive
+        # instead of the documented ARIMA fallback -- same end result
+        # either way in isolation, but it skipped ARIMA's deseasonalized-
+        # residual attempt and silently discarded all the feature
+        # engineering. Constructing (not fitting) the regressor here
+        # surfaces that failure at the right fallback point.
+        _Regressor(**_candidates[0])
+    except Exception:
+        return _its_arima(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+    def _make_fit_predict(kwargs: dict):
+        def fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+            model = _Regressor(**kwargs)
+            model.fit(X_train, y_train)
+            return model.predict
+        return fit_predict
+
+    best_kwargs = (_tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                         _make_fit_predict)
+                   if ITS_TUNE_HYPERPARAMS else _candidates[0])
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
+                            _make_fit_predict(best_kwargs))
+    return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
+
+
+def _its_lightgbm(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                  col: str, mtu_minutes: int = 15) -> pd.Series:
+    """LightGBM on lag + calendar features. See _its_gbm() for the shared
+    implementation and _ITS_METHODS["lightgbm"]["description"] for docs."""
+    return _its_gbm(pre_agg, all_agg, col, mtu_minutes=mtu_minutes, backend="lightgbm")
+
+
+def _its_catboost(pre_agg: pd.DataFrame, all_agg: pd.DataFrame,
+                  col: str, mtu_minutes: int = 15) -> pd.Series:
+    """CatBoost on lag + calendar features. See _its_gbm() for the shared
+    implementation and _ITS_METHODS["catboost"]["description"] for docs."""
+    return _its_gbm(pre_agg, all_agg, col, mtu_minutes=mtu_minutes, backend="catboost")
+
+
+class _ClosedFormRidge:
+    """
+    Ridge regression fit via closed-form linear algebra (numpy only — no
+    scikit-learn/statsmodels dependency): standardize features (mean-
+    impute any NaN lag column first, using TRAINING-set-only column means,
+    since unlike the tree backends a linear model needs finite inputs),
+    center the target, solve beta = (XᵀX + αI)⁻¹Xᵀy on the centered/
+    standardized design, and add the target mean back at predict time.
+    Imputation/standardization statistics are captured once in .fit() from
+    training rows only and reused unchanged in .predict() — this is what
+    keeps _its_ridge() leak-free through _its_lag_model()'s recursive
+    during/post loop, exactly like a fitted LGBMRegressor/CatBoostRegressor
+    never re-fitting itself on a later .predict() call.
+
+    A column that is NaN in EVERY training row (e.g. lag7d whenever the
+    pre-period is under 7 days — it can never have a real value then) has
+    no mean to impute with: naively using np.nanmean's NaN result as the
+    fill value would silently poison every prediction with NaN, with
+    nothing raising to catch it (found via a real backtest run where a
+    6-day pre-period produced an all-NaN "ridge" projection that then
+    NaN-poisoned _its_ensemble()'s per-timestamp median for every method,
+    not just ridge). Such a column is instead treated as entirely
+    uninformative: imputed to 0 and left at 0 after centering, which (via
+    the alpha-regularized normal equations below) always fits that
+    feature's own coefficient to exactly 0 — equivalent to dropping it,
+    with no special-casing needed anywhere else in this class.
+    """
+    def __init__(self, alpha: float = 5.0):
+        self.alpha = alpha
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "_ClosedFormRidge":
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            # An all-NaN column (see class docstring) makes np.nanmean warn
+            # "Mean of empty slice" -- expected here, handled on the next
+            # line, not a sign of a real problem worth surfacing.
+            _warnings.filterwarnings("ignore", message="Mean of empty slice")
+            self._col_mean = np.nanmean(X, axis=0)
+        self._col_mean = np.where(np.isnan(self._col_mean), 0.0, self._col_mean)
+        Xf = np.where(np.isnan(X), self._col_mean, X)
+        self._x_mean = Xf.mean(axis=0)
+        self._x_std  = Xf.std(axis=0)
+        self._x_std[self._x_std < 1e-8] = 1.0
+        Xs = (Xf - self._x_mean) / self._x_std
+        self._y_mean = float(np.mean(y))
+        yc = y - self._y_mean
+        n_features = Xs.shape[1]
+        A = Xs.T @ Xs + self.alpha * np.eye(n_features)
+        b = Xs.T @ yc
+        self._beta = np.linalg.solve(A, b)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        Xf = np.where(np.isnan(X), self._col_mean, X)
+        Xs = (Xf - self._x_mean) / self._x_std
+        return Xs @ self._beta + self._y_mean
+
+
+def _its_ridge(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+               mtu_minutes: int = 15) -> pd.Series:
+    """
+    Ridge regression on the same lag1d/lag2d/lag7d + NDA-mean + calendar
+    feature set as _its_gbm() (see _its_lag_model() for the shared
+    machinery and leak-avoidance discipline), fit with closed-form numpy
+    linear algebra — no extra dependency beyond what this module already
+    requires.
+
+    A linear model with L2 regularization is a much lower-variance fit
+    than gradient-boosted trees, which matters most exactly where the GBM
+    methods are weakest in practice: short pre-periods, where there is too
+    little data for a tree ensemble to reliably separate real lag-day
+    signal from noise (see the "Backtested accuracy" note in CLAUDE.md),
+    but a simple, well-regularized linear combination of the same features
+    can still pick up the dominant lag1d/lag24-style signal. It is also
+    the cheapest of the lag-feature methods to fit (closed-form solve, no
+    iterative boosting), and the article this whole feature set was added
+    for (see CLAUDE.md's ITS domain-facts entry) explicitly reports Ridge
+    benefiting from lag features alongside XGBoost/CatBoost/LightGBM — the
+    improvement isn't specific to tree models.
+
+    Unlike the tree backends, ridge needs finite inputs (no native NaN
+    handling): _ClosedFormRidge mean-imputes missing lag columns (lag7d
+    during the first week of a pre-period, lag2d on day 1) from the
+    training set's own column means, computed once and reused unchanged
+    at prediction time — never recomputed from during/post data.
+
+    HYPERPARAMETER TUNING: the regularization strength `alpha` was
+    previously a fixed 5.0. It's now chosen from a small grid via
+    _tune_lag_hyperparams() on a held-out slice of the pre-period itself
+    — 5.0 stays candidate zero (the safe fallback below 14 days of
+    pre-period), so tuning can only match or beat the original behavior.
+    """
+    _candidates = [dict(alpha=a) for a in (5.0, 0.5, 2.0, 20.0, 80.0)]
+
+    def _make_fit_predict(kwargs: dict):
+        def fit_predict(X_train: np.ndarray, y_train: np.ndarray):
+            model = _ClosedFormRidge(**kwargs).fit(X_train, y_train)
+            return model.predict
+        return fit_predict
+
+    best_kwargs = (_tune_lag_hyperparams(pre_agg, col, mtu_minutes, _candidates,
+                                         _make_fit_predict)
+                   if ITS_TUNE_HYPERPARAMS else _candidates[0])
+    result = _its_lag_model(pre_agg, all_agg, col, mtu_minutes,
+                            _make_fit_predict(best_kwargs))
+    return result if result is not None else _its_seasonal_naive(pre_agg, all_agg, col)
+
+
+def _call_its_method(fn, pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                     method: str, mtu_minutes: int) -> pd.Series:
+    """Call an _ITS_METHODS[...]["fn"] with the right signature — every
+    method except seasonal_naive accepts mtu_minutes (see
+    _build_its_for_col(), the single-pair dispatcher this mirrors)."""
+    return fn(pre_agg, all_agg, col) if method == "seasonal_naive" \
+           else fn(pre_agg, all_agg, col, mtu_minutes=mtu_minutes)
+
+
+def _ensemble_backtest_weights(pre_agg: pd.DataFrame, col: str, mtu_minutes: int,
+                               members: list, quality_ratio: float = 1.5,
+                               min_survivors: int = 2,
+                               dedupe_tol: float = 1e-6) -> Optional[dict]:
+    """
+    Backtest every candidate member ENTIRELY WITHIN the pre-period, using
+    _carve_rolling_origin_splits() — up to 2 non-overlapping holdout
+    windows once there's enough pre-period, 1 otherwise — fit each member
+    on the earlier remainder of each window only, project onto that
+    window's held-out slice, and grade against its already-known true
+    values, averaging across windows when there's more than one for a
+    less noisy estimate. Same "fit on earlier data, project into a later
+    window, compare to known truth" backtest used to produce CLAUDE.md's
+    "Backtested accuracy" numbers, just run automatically per-outage
+    instead of once offline on synthetic data. Every split lives entirely
+    inside the real pre-period, so — like every other method in this
+    section — nothing here can see a real during/post observation.
+
+    Returns None if the pre-period is too short (<14 days) for even one
+    split; the caller falls back to an unweighted median of all members
+    in that case.
+
+    Otherwise returns {member: weight} for the SURVIVING, DE-DUPLICATED
+    members:
+      1. De-duplication FIRST: several members can legitimately converge
+         on numerically identical backtest predictions on a given
+         pre-period (e.g. arima's residual-ARIMA order search selecting
+         (0,0,0) and hurdle's P(binding) saturating near 1 both reduce to
+         plain seasonal_naive) — keeping every one of them as a separate
+         "vote" doesn't add diversity, it just gives that one answer
+         disproportionate weight relative to genuinely different members.
+         Only the lowest-MAE representative of each cluster of
+         near-identical backtest predictions (within `dedupe_tol`) is
+         kept as a candidate for the steps below.
+      2. Exclusion: any surviving-dedup member whose backtest MAE exceeds
+         `quality_ratio`x the best one's is dropped outright ("exclude
+         bad models"), unless doing so would leave fewer than
+         `min_survivors` — in that case the `min_survivors` lowest-MAE
+         members are kept instead, so one unlucky backtest window can't
+         collapse the ensemble down below what's still meant to be a
+         blend.
+      3. Weighting: survivors are weighted ∝ 1/MAE² (inverse-SQUARED
+         error, not plain inverse) — a member that backtested twice as
+         accurately as another now gets roughly 4x the say, not 2x. Plain
+         inverse-error weighting measured too flat in practice (the
+         ensemble's edge over its own best single member was much smaller
+         than expected); squaring makes the "adaptive" part of this
+         method actually decisive about a clearly-better member instead
+         of averaging it down toward the pack.
+    """
+    splits = _carve_rolling_origin_splits(pre_agg, min_total_days=14, max_splits=2)
+    if not splits:
+        return None
+
+    mae_by_member: dict = {}
+    pred_by_member: dict = {}
+    for m in members:
+        fn = _ITS_METHODS[m]["fn"]
+        split_maes, split_preds = [], []
+        for inner_pre_agg, holdout_mask in splits:
+            try:
+                proj = _call_its_method(fn, inner_pre_agg, pre_agg, col, m, mtu_minutes)
+                pred = proj.values[holdout_mask]
+                true_vals = pre_agg[col].values[holdout_mask]
+                mae = float(np.mean(np.abs(pred - true_vals)))
+                if np.isfinite(mae):
+                    split_maes.append(mae)
+                    split_preds.append(pred)
+            except Exception:
+                pass
+        if split_maes:
+            mae_by_member[m] = float(np.mean(split_maes))
+            pred_by_member[m] = np.concatenate(split_preds)
+
+    finite_maes = [v for v in mae_by_member.values() if np.isfinite(v)]
+    if not finite_maes:
+        return None
+    best_mae = min(finite_maes)
+
+    # De-duplicate: keep only the best-MAE representative of each cluster
+    # of members whose backtest predictions are numerically indistinguishable.
+    ranked = sorted(mae_by_member.items(), key=lambda kv: kv[1])
+    deduped, seen_preds = [], []
+    for m, mae in ranked:
+        pred = pred_by_member[m]
+        is_dup = any(pred.shape == seen.shape and
+                    np.allclose(pred, seen, atol=dedupe_tol, rtol=dedupe_tol)
+                    for seen in seen_preds)
+        if not is_dup:
+            deduped.append((m, mae))
+            seen_preds.append(pred)
+    if not deduped:
+        return None
+
+    survivors = [m for m, mae in deduped if mae <= quality_ratio * best_mae]
+    if len(survivors) < min(min_survivors, len(deduped)):
+        survivors = [m for m, _ in deduped[:min_survivors]]
+
+    eps = 1e-6
+    raw_weights = {m: (1.0 / (mae_by_member[m] + eps)) ** 2 for m in survivors}
+    total_weight = sum(raw_weights.values())
+    return {m: w / total_weight for m, w in raw_weights.items()}
+
+
+def _its_ensemble(pre_agg: pd.DataFrame, all_agg: pd.DataFrame, col: str,
+                  mtu_minutes: int = 15) -> pd.Series:
+    """
+    Adaptive ensemble across every OTHER registered ITS method
+    (seasonal_naive, fourier_trend, stl, arima, sarima, lightgbm,
+    catboost, ridge — "ensemble" itself and the UI-only "all"
+    pseudo-method are excluded to avoid recursion).
+
+    "Adaptive" + "exclude bad models": _ensemble_backtest_weights() grades
+    every member on up to 2 rolling-origin held-out windows of the
+    pre-period ITSELF (never during/post data — see its own docstring),
+    de-duplicates members whose backtest predictions are numerically
+    identical (several legitimately converge on the same seasonal-mean
+    answer on some pre-periods — counting that answer 2-3x over would
+    just dilute genuinely different members, not add diversity), drops
+    members that backtested far worse than the best one, and weights the
+    survivors ∝ 1/backtest-MAE² (inverse-SQUARED, so a clearly better
+    member dominates rather than being averaged down toward the pack —
+    plain inverse-error weighting was tried first and measured too flat).
+    The final projection is those survivors' REAL full-pre-period
+    projections into the real during/post window, combined with those
+    weights. This adapts per-outage: which methods get excluded, which
+    get treated as duplicates, and how the rest are weighted all depend
+    on that outage's own pre-period, not a fixed roster decided in
+    advance.
+
+    Falls back to an unweighted per-timestamp MEDIAN of every member's
+    full-pre-period projection when the pre-period is too short (<14
+    days) for a meaningful backtest split. Median, not mean, for the same
+    reason the backtest step excludes bad members: an equal-weight MEAN
+    was tried first and measured substantially worse in development (MAE
+    ~14.8 vs the best individual member's ~1.7) because a single
+    badly-wrong member (fourier_trend/STL both derail on a pre-period
+    level shift — see their own "Weaknesses" docs) drags a mean toward
+    it; the median can't be moved past the next-most-central projection
+    by one outlier and needs no backtest to be robust, which is why it's
+    the fallback for pre-periods too short to backtest reliably.
+
+    Leak-safety: every member already independently guarantees it never
+    reads a during/post observation (this section's top-level "fit on
+    pre-period only" rule; _its_lag_model()'s recursive projection for the
+    lag-feature methods). A weighted combination of several leak-free
+    projections is leak-free too, and the backtest weights themselves are
+    computed entirely from pre-period data (see
+    _ensemble_backtest_weights()), so nothing added here can introduce a
+    leak. By far the slowest method to run — rolling-origin backtesting
+    fits most members up to 2 extra times each on top of their final
+    projection fit (SARIMA's ~10-25s AIC grid search alone, up to 3x),
+    and lightgbm/catboost/ridge now ALSO tune their own hyperparameters
+    internally on every one of those fits (see _its_gbm()/_its_ridge()),
+    so budget noticeably more than a plain "all" mode run, not just
+    double.
+    """
+    # ram_identity/ptdf_flow are excluded, not just "ensemble" itself: both
+    # fall back to _its_ensemble() when their physics doesn't apply to this
+    # column/data (see their own docstrings) -- including them as members
+    # here would let that fallback call straight back into this function,
+    # an infinite recursion for any column/CNEC where either one degrades.
+    members = [m for m in _ITS_METHODS
+              if m not in ("ensemble", "ram_identity", "ptdf_flow")]
+
+    weights = _ensemble_backtest_weights(pre_agg, col, mtu_minutes, members)
+    if weights is None:
+        projections = [_call_its_method(_ITS_METHODS[m]["fn"], pre_agg, all_agg, col,
+                                        m, mtu_minutes).values
+                       for m in members]
+        return pd.Series(np.median(np.vstack(projections), axis=0), index=all_agg.index)
+
+    blended = np.zeros(len(all_agg))
+    for m, w in weights.items():
+        proj = _call_its_method(_ITS_METHODS[m]["fn"], pre_agg, all_agg, col,
+                                m, mtu_minutes)
+        blended += w * proj.values
+    return pd.Series(blended, index=all_agg.index)
 
 
 _ITS_METHODS = {
@@ -3248,6 +4834,287 @@ _ITS_METHODS = {
             "Minimum baseline: 14 days. Recommended: 30–90 days."),
         "fn": _its_sarima,
     },
+    "lightgbm": {
+        "label":       "LightGBM (lag + calendar features)",
+        "min_days":    14,
+        "description": (
+            "Gradient-boosted trees (LightGBM) trained on lag1d/lag2d/lag7d "
+            "(same MTU 1, 2 and 7 days ago — a simplified Neighborhood Days "
+            "Approach / NDA) plus their mean and cyclical hour/weekday "
+            "features. Lag features are consistently the dominant predictor "
+            "for this kind of series across model families (Ridge, XGBoost, "
+            "CatBoost, LightGBM), not just for gradient boosting specifically "
+            "— it's the richer input representation, not model sophistication, "
+            "that does most of the work. LightGBM handles the NaN-heavy lag "
+            "columns natively (no imputation). Projection into during/post is "
+            "RECURSIVE — each prediction feeds back in as the lag source for "
+            "later steps — so a lag can never read a real during/post "
+            "observation. lag7d is only populated once ≥7 days of pre-period "
+            "history exist; shorter pre-periods still train on lag1d/lag2d. "
+            "HYPERPARAMETER TUNING: depth/learning_rate/n_estimators are "
+            "chosen from a small grid via a held-out slice of the "
+            "pre-period itself (see _tune_lag_hyperparams()), not fixed in "
+            "advance -- below 14 days of pre-period this has no effect "
+            "(too short to tune reliably) and the original fixed "
+            "configuration is used unchanged. Set module-level "
+            "propagation.ITS_TUNE_HYPERPARAMS = False to skip tuning "
+            "entirely and always use that fixed configuration -- "
+            "meaningfully faster, especially inside 'ensemble'/'all' mode. "
+            "Falls back to ARIMA if lightgbm isn't installed, seasonal naive "
+            "if the pre-period is too short to fit. "
+            "Minimum baseline: 14 days. Recommended: ≥30 days (so lag7d has "
+            "several weeks of examples, not just one)."),
+        "fn": _its_lightgbm,
+    },
+    "catboost": {
+        "label":       "CatBoost (lag + calendar features)",
+        "min_days":    14,
+        "description": (
+            "Same lag1d/lag2d/lag7d + NDA-mean + calendar feature set as the "
+            "LightGBM method above (see its description for the rationale, "
+            "the recursive leak-avoidance projection scheme, and the "
+            "hyperparameter tuning both share), fit with CatBoost instead. "
+            "CatBoost also handles missing lag values natively. Falls back "
+            "to ARIMA if catboost isn't installed, "
+            "seasonal naive if the pre-period is too short to fit. "
+            "Minimum baseline: 14 days. Recommended: ≥30 days."),
+        "fn": _its_catboost,
+    },
+    "ridge": {
+        "label":       "Ridge (lag + calendar features)",
+        "min_days":    7,
+        "description": (
+            "Same lag1d/lag2d/lag7d + NDA-mean + calendar feature set as "
+            "LightGBM/CatBoost above, fit with closed-form ridge regression "
+            "(numpy only -- no extra library, unlike the two GBM methods). "
+            "A regularized linear model is much lower-variance than a tree "
+            "ensemble, which is exactly where the GBM methods are weakest in "
+            "practice here: short pre-periods, where there's too little data "
+            "for trees to reliably separate real lag-day signal from noise. "
+            "The lag-feature article this whole family was added for "
+            "explicitly reports Ridge improving alongside XGBoost/CatBoost/ "
+            "LightGBM -- the benefit isn't tree-specific. Missing lag values "
+            "(no native NaN handling in a linear model) are mean-imputed "
+            "from pre-period-only training statistics. HYPERPARAMETER "
+            "TUNING: the L2 regularization strength (alpha) is chosen from "
+            "a small grid via a held-out slice of the pre-period itself, "
+            "same mechanism and same <14-day no-op threshold as "
+            "LightGBM/CatBoost above. Falls back to "
+            "seasonal naive if the pre-period is too short to fit. "
+            "Minimum baseline: 7 days (lag7d needs at least one full week "
+            "to ever be non-imputed). Cheapest lag-feature method to fit."),
+        "fn": _its_ridge,
+    },
+    "structural": {
+        "label":       "Structural TS / Kalman filter (daily+weekly)",
+        "min_days":    14,
+        "description": (
+            "State-space structural time series (statsmodels "
+            "UnobservedComponents): local linear trend plus DAILY AND "
+            "WEEKLY seasonality estimated jointly via the Kalman filter, on "
+            "hourly-aggregated data, expanded back to MTU resolution using "
+            "the within-hour deviation pattern (same technique as SARIMA's "
+            "own Step 5/6). Exists because SARIMA above only models ONE "
+            "seasonal period (m=24) and bolts the weekly pattern on "
+            "afterward as a separate lookup -- this instead lets daily and "
+            "weekly structure inform the trend/level estimate together, in "
+            "one coherent model. The weekly component only activates with "
+            "≥336h (2 full weekly cycles) of pre-period; shorter pre-periods "
+            "get daily seasonality only rather than an unidentified weekly "
+            "one. Falls back to SARIMA if UnobservedComponents can't be "
+            "imported (not expected -- statsmodels is already required), if "
+            "there's under 48h of pre-period, or if fitting fails. "
+            "Minimum baseline: 14 days. Recommended: 30-90 days, and ≥14 "
+            "days (336h) specifically to get the weekly component."),
+        "fn": _its_structural,
+    },
+    "tbats": {
+        "label":       "TBATS (daily+weekly, Box-Cox+trend+ARMA)",
+        "min_days":    14,
+        "description": (
+            "TBATS (Box-Cox transform, ARMA errors, Trend, multiple "
+            "Seasonal components) with daily AND weekly seasonal periods, "
+            "on hourly-aggregated data, expanded back to MTU resolution -- "
+            "purpose-built for exactly this 'more than one seasonal period "
+            "on one series' shape, the same gap 'structural' above targets "
+            "but with a model designed around it rather than approximating "
+            "it with harmonics inside a general state-space model. Box-Cox/ "
+            "damped-trend/ARMA-error model selection are all fixed "
+            "explicitly rather than left to TBATS' own automatic search "
+            "over those combinations, since that search is expensive and "
+            "SARIMA's own AIC grid search here is already the slowest "
+            "single method -- letting TBATS run its full default search on "
+            "top would make it slower still for a GUI a person is waiting "
+            "on. Optional dependency (`tbats`, pure numpy/scipy, no "
+            "compiled toolchain -- unlike Prophet, which was considered and "
+            "rejected for exactly that reason). Falls back to 'structural' "
+            "(the other dual-seasonality method) if tbats isn't installed, "
+            "if there's under 48h of pre-period, or if fitting fails. The "
+            "weekly period is only included with ≥336h of pre-period, same "
+            "threshold as 'structural'. "
+            "Minimum baseline: 14 days. Recommended: 30-90 days."),
+        "fn": _its_tbats,
+    },
+    "theta": {
+        "label":       "Theta method (deseasonalized residuals)",
+        "min_days":    7,
+        "description": (
+            "Theta method (Assimakopoulos & Nikolopoulos -- a top performer "
+            "in the M3/M4 forecasting competitions) on deseasonalized "
+            "residuals, mirroring ARIMA's own 'deseasonalize via "
+            "seasonal_naive, then model the residual' structure exactly, "
+            "with Theta swapped in for ARIMA. No AIC-style order search, so "
+            "it's also one of the cheapest methods here to fit. Known "
+            "specifically for punching above its weight on SHORT series -- "
+            "the regime where ARIMA/SARIMA's own order search and the "
+            "lag-feature methods' need for several weeks of lag7d examples "
+            "both struggle (see CLAUDE.md's 'Backtested accuracy' note). "
+            "Falls back to seasonal naive if statsmodels (already required) "
+            "is unavailable, or below the same length/deseasonalization "
+            "guards ARIMA uses -- Theta's short-series strength still needs "
+            "a floor of usable data. "
+            "Minimum baseline: 7 days -- the lowest of any non-seasonal_naive "
+            "method here, matching its short-series reputation."),
+        "fn": _its_theta,
+    },
+    "hurdle": {
+        "label":       "Hurdle (zero-inflated — for shadow price)",
+        "min_days":    2,
+        "description": (
+            "Two-part 'hurdle' model for zero-inflated series -- built for "
+            "shadow price specifically (exactly 0 on a non-binding CNEC, "
+            "positive only when binding), a poor match for every other "
+            "method here, which implicitly fits a continuous, "
+            "roughly-Gaussian-shaped model to whatever column it's given. "
+            "Estimates P(binding) and E[value | binding] as separate "
+            "(hour, weekday) tables from the pre-period -- same "
+            "zero-estimation-variance philosophy as seasonal_naive -- and "
+            "projects their product. No lag features, no recursion: every "
+            "projected value is a deterministic pre-period-only lookup, "
+            "same leak-safety story as seasonal_naive. Works on any column "
+            "with a real point mass at zero, not only shadow price, but "
+            "adds nothing over seasonal_naive on a genuinely continuous "
+            "column (P(binding) saturates near 1 and the product collapses "
+            "back to a plain seasonal mean). "
+            "Minimum baseline: 2 days, same as seasonal_naive."),
+        "fn": _its_hurdle,
+    },
+    "ram_identity": {
+        "label":       "RAM Identity (physics-informed)",
+        "min_days":    7,
+        "description": (
+            "Physics-informed: instead of forecasting RAM as an "
+            "independent black-box target, forecasts each of the seven "
+            "terms in the Nordic RAM identity (RAM = Fmax - FRM - fall + "
+            "fnrao + AMR - FAAC - IVA -- the same formula build_covariates()' "
+            "ram_check already verifies balances within 1 MW on ~100% of "
+            "real rows) with its own suited method -- seasonal_naive for "
+            "fmax/frm (structural; frm is literally the H6 placebo's null "
+            "hypothesis), theta for fnrao/amr/faac, catboost for fall (the "
+            "term outages actually move -- H1's own dependent variable), "
+            "hurdle for iva (zero-inflated, TSO-discretionary, documented "
+            "as nonzero mainly during forced outages) -- and COMPUTES the "
+            "counterfactual RAM from them. This makes an internally "
+            "inconsistent projection impossible by construction, not just "
+            "unlikely: the result IS the sum of its (signed) parts, never "
+            "an independently-fit number that happens to differ from what "
+            "its own components would imply. Only decomposes 'ram' "
+            "specifically -- falls back to theta for any other column, and "
+            "to ensemble for 'ram' itself if any of the seven raw component "
+            "columns is missing from pre_agg/all_agg (computing RAM from an "
+            "incomplete subset would silently produce a different, WRONG "
+            "quantity -- the exact AMR/IVA-dropping mistake this formula's "
+            "own history warns about, see CLAUDE.md). Requires pre_agg/ "
+            "all_agg to carry the raw fmax/frm/fnrao/amr/faac/fall/iva "
+            "columns -- single_event_analysis() widens them for this "
+            "purpose; a caller building pre_agg/all_agg itself must do the "
+            "same. Attaches a `ram_identity_check` diagnostic to the "
+            "returned Series' .attrs (pre-period formula-balance %) so the "
+            "projection's own footing can be checked, not just trusted. "
+            "Minimum baseline: 7 days (governed by its weakest component "
+            "sub-method's own floor)."),
+        "fn": _its_ram_identity,
+    },
+    "ptdf_flow": {
+        "label":       "PTDF x Net Position (physics-informed)",
+        "min_days":    7,
+        "description": (
+            "Physics-informed: reconstructs the counterfactual flow as "
+            "Σ_zone PTDF_zone,CNEC,t x NetPosition_zone,t -- the DC/PTDF-"
+            "based flow decomposition Nordic FBMC is built on (a CNEC's "
+            "loading is the linear combination of every zone's net "
+            "position, weighted by that zone's grid-topology sensitivity). "
+            "Unlike ram_identity, this is NOT a proven accounting identity "
+            "in this codebase -- 'fall' (F_allReference) is a REFERENCE-"
+            "case flow from the D-2 common grid model, not necessarily "
+            "identical to Σ PTDF x REALIZED net position -- so this method "
+            "VALIDATES the reconstruction against the actually observed "
+            "column on pre-period data before trusting it (correlation "
+            "must clear min_validation_corr, default 0.5), falling back to "
+            "ensemble when it doesn't. The validation outcome is always "
+            "attached to the returned Series' .attrs['ptdf_flow_validation'] "
+            "regardless of which path was taken, so a caller can see why. "
+            "Each zone's PTDF and net position get their OWN seasonal_naive "
+            "counterfactual (deliberately simple -- PTDF's own projection is "
+            "what 'removes' an AC-outage's topology shift per H2's logic, "
+            "and net position is market-driven, not directly caused by a "
+            "single CNEC-level outage) before combining via the linear "
+            "formula. Only applies to 'fall'/'flowFB' -- falls back to theta "
+            "for any other column. OPT-IN: requires netpos_<ZONE> columns "
+            "already merged into pre_agg/all_agg (see "
+            "fetch_nordpool_net_positions()/merge_nordpool_net_positions()) "
+            "alongside the matching ptdf_<ZONE> columns JAO already "
+            "provides -- out of the box, no caller has done that merge, so "
+            "this gracefully degrades to ensemble for everyone until it is, "
+            "the same 'library not installed' style fallback lightgbm/"
+            "catboost/tbats use, just for a data dependency instead of a "
+            "package one. "
+            "Minimum baseline: 7 days."),
+        "fn": _its_ptdf_flow,
+    },
+    "ensemble": {
+        "label":       "Ensemble (adaptive, backtest-weighted)",
+        "min_days":    2,
+        "description": (
+            "Adaptive blend of every other registered method: backtests "
+            "each candidate on up to 2 rolling-origin held-out windows of "
+            "the pre-period ITSELF (never during/post data), DE-DUPLICATES "
+            "members whose backtest predictions come out numerically "
+            "identical (several legitimately converge on the same "
+            "seasonal-mean answer on some pre-periods -- keeping every one "
+            "would dilute genuinely different members, not add diversity), "
+            "drops any survivor that backtested far worse than the best "
+            "one, and weights the rest proportional to "
+            "1/backtest-MAE-SQUARED -- a clearly-better member dominates "
+            "rather than getting averaged down toward the pack (plain "
+            "1/MAE weighting was tried first and measured too flat). "
+            "Which methods get excluded, which get treated as duplicates, "
+            "and how the rest are weighted is all recomputed per-outage "
+            "from that outage's own pre-period -- not a fixed roster "
+            "decided in advance. Falls back to an unweighted per-timestamp "
+            "MEDIAN of all members when the pre-period is under 14 days "
+            "(too short for a reliable backtest split); median rather than "
+            "mean there too, since a mean lets a single badly-wrong member "
+            "(fourier_trend/STL both derail on a pre-period level shift -- "
+            "see their own descriptions) drag the whole blend toward it, "
+            "while the median can't be moved past the next-most-central "
+            "projection by one outlier. No single method dominated across "
+            "the pre-period/holdout-length combinations tested during "
+            "development (see CLAUDE.md's 'Backtested accuracy' note); "
+            "this is meant to track whichever method actually suits a "
+            "given outage's own history, without the user having to guess "
+            "in advance. Not guaranteed best on every outage. By far the "
+            "slowest method to run -- rolling-origin backtesting fits most "
+            "members up to 2 extra times each (SARIMA's ~10-25s AIC grid "
+            "search alone, up to 3x total), and lightgbm/catboost/ridge "
+            "each tune their own hyperparameters internally on every one "
+            "of those fits too -- budget noticeably more than a plain "
+            "'all' mode run, not just double. "
+            "Minimum baseline: 2 days (members below that threshold "
+            "individually fall back further, same as running them alone; "
+            "backtest weighting itself only activates at 14+ days)."),
+        "fn": _its_ensemble,
+    },
 }
 
 ITS_METHOD_NAMES = list(_ITS_METHODS.keys())
@@ -3281,6 +5148,165 @@ def pre_period_abs_ptdf(pre_df: pd.DataFrame, ptdf_col: str) -> pd.Series:
     return pre_df[ptdf_col].abs().groupby(pre_df["cneName"]).mean()
 
 
+def estimate_cnec_price_impact(df: pd.DataFrame, cnec: str, tgt_zone: str,
+                               pre_end, timestamp,
+                               its_method: str = ITS_DEFAULT_METHOD,
+                               mtu_minutes: int = 15,
+                               timestamp_tol_minutes: Optional[float] = None) -> dict:
+    """
+    Estimate how much ONE CNEC's contribution to ONE target zone's
+    day-ahead price has moved, at ONE specific timestamp, relative to what
+    it would have been without whatever changed the CNEC's behaviour (an
+    outage, typically) — the FBMC price-decomposition term
+    `shadowPrice_CNEC × PTDF_{tgt_zone},CNEC`, evaluated ACTUAL vs its ITS
+    COUNTERFACTUAL (Y(0), fit on data strictly before `pre_end` — same
+    "pre-period only" discipline as every other ITS method in this file,
+    see the section header comment above `_ITS_METHODS`):
+
+        impact = (shadowPrice_actual × PTDF_target_actual)
+                 − (shadowPrice_counterfactual × PTDF_target_counterfactual)
+
+    An earlier version of this function instead compared the CNEC's
+    contribution to TWO DIFFERENT zones' prices at the same moment
+    (`shadowPrice × (PTDF_target − PTDF_reference)`, needing a
+    user-supplied reference-zone price as an anchor). That answers a
+    different question ("how does this CNEC split the price between two
+    zones right now") than what this function answers ("how has this
+    CNEC's effect on ONE zone's price changed because of the outage") —
+    the latter needs an actual-vs-counterfactual comparison, not a
+    second zone, which is why there is no `ref_zone` here at all.
+
+    BOTH `shadowPrice` and `PTDF_target` get their OWN counterfactual
+    projection via `its_method` (not just shadow price): PTDF itself can
+    move during an AC-line outage on the target zone (H2's own logic,
+    `ptdf_FI` shifting under `is_ac` in synthetic.py is the same
+    mechanism) — treating PTDF as fixed while only shadow price moves
+    would silently misattribute a topology-driven PTDF shift to shadow
+    price alone. Reuses `_build_its_for_col()`, the same dispatcher
+    `single_event_analysis()`'s own ITS run uses, so this respects
+    whichever of the 15 registered methods the caller picks, with that
+    method's own fallback chain if the pre-period is too short.
+
+    Refuses (returns `ok=False`, `error` set) rather than computing from
+    partial data: `cnec` has no rows; `ptdf_<tgt_zone>` doesn't exist in
+    the data; the pre-period (rows strictly before `pre_end`) has fewer
+    than 4 distinct timestamps to fit a counterfactual from; or no row
+    exists within `timestamp_tol_minutes` of `timestamp`. Same
+    "validate before trusting the physics" posture `_its_ptdf_flow()`'s
+    own correlation gate uses elsewhere in this file.
+
+    `timestamp_tol_minutes` defaults to `mtu_minutes` (the data's own MTU
+    grid spacing, 15 minutes for Nordic FBMC) rather than a fixed small
+    number: a caller's `timestamp` is a human-entered wall-clock value
+    (e.g. the app's Price Spread pane), so it needs to reach the row for
+    ITS OWN MTU, not just an exact-second match -- a 1-minute default
+    tolerance rejected almost every real timestamp a person could type,
+    since actual rows only exist every 15 minutes. Pass an explicit value
+    to tighten (or further loosen) this for a specific caller.
+
+    Returns a dict, always carrying `ok`/`error`/`cnec`/`tgt_zone`/
+    `its_method`; on success (`ok=True`) also carries
+    `matched_timestamp`, `shadow_price_actual`, `shadow_price_cf`,
+    `ptdf_target_actual`, `ptdf_target_cf`, `actual_contribution`,
+    `counterfactual_contribution`, `impact`.
+    """
+    if timestamp_tol_minutes is None:
+        timestamp_tol_minutes = mtu_minutes
+    result = {"ok": False, "error": None, "cnec": cnec,
+              "tgt_zone": tgt_zone, "its_method": its_method}
+
+    sub = df[df["cneName"] == cnec] if "cneName" in df.columns else df.iloc[0:0]
+    if sub.empty:
+        result["error"] = f"No rows found for CNEC {cnec!r}."
+        return result
+
+    ptdf_col = f"ptdf_{tgt_zone}"
+    if ptdf_col not in sub.columns or sub[ptdf_col].isna().all():
+        result["error"] = (
+            f"No PTDF data for zone {tgt_zone!r} on this CNEC "
+            f"(column {ptdf_col!r} missing or entirely empty). Refusing "
+            f"to estimate an impact from partial physics data.")
+        return result
+
+    sp_col = "shadowPrice_clean" if "shadowPrice_clean" in sub.columns else "shadowPrice"
+    if sp_col not in sub.columns or sub[sp_col].isna().all():
+        result["error"] = f"No {sp_col!r} data for this CNEC."
+        return result
+
+    ts = pd.Timestamp(timestamp)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    pre_end_ts = pd.Timestamp(pre_end)
+    if pre_end_ts.tzinfo is None:
+        pre_end_ts = pre_end_ts.tz_localize("UTC")
+
+    sub = sub.sort_values("dateTimeUtc")
+    dt_diff = (sub["dateTimeUtc"] - ts).abs()
+    idx_nearest = dt_diff.idxmin()
+    if dt_diff.loc[idx_nearest] > pd.Timedelta(minutes=timestamp_tol_minutes):
+        result["error"] = (
+            f"No row for CNEC {cnec!r} within {timestamp_tol_minutes} "
+            f"minute(s) of {ts} (nearest available: "
+            f"{sub['dateTimeUtc'].loc[idx_nearest]}).")
+        return result
+    matched_row = sub.loc[idx_nearest]
+    matched_ts = matched_row["dateTimeUtc"]
+
+    pre = sub[sub["dateTimeUtc"] < pre_end_ts]
+
+    def _project(col: str) -> Optional[float]:
+        """Fit `its_method`'s counterfactual on the pre-period, project
+        it onto `matched_ts`. Returns None if the pre-period is too thin
+        to fit anything (mirrors _run_its_for_method()'s own `< 4` guard)."""
+        pre_agg = pre.groupby("dateTimeUtc")[[col]].mean().reset_index()
+        if len(pre_agg) < 4:
+            return None
+        pre_agg["hour"] = pre_agg["dateTimeUtc"].dt.hour
+        pre_agg["dow"]  = pre_agg["dateTimeUtc"].dt.dayofweek
+        all_agg = sub.groupby("dateTimeUtc")[[col]].mean().reset_index()
+        all_agg["hour"] = all_agg["dateTimeUtc"].dt.hour
+        all_agg["dow"]  = all_agg["dateTimeUtc"].dt.dayofweek
+        projected = _build_its_for_col(pre_agg, all_agg, col, its_method, mtu_minutes)
+        match_mask = all_agg["dateTimeUtc"] == matched_ts
+        if not match_mask.any():
+            return None
+        return float(projected.values[match_mask.values][0])
+
+    if len(pre.groupby("dateTimeUtc")) < 4:
+        result["error"] = (
+            f"Fewer than 4 distinct pre-period timestamps before "
+            f"{pre_end_ts} for CNEC {cnec!r} — too little data to fit a "
+            f"{its_method!r} counterfactual.")
+        return result
+
+    shadow_price_cf = _project(sp_col)
+    ptdf_target_cf  = _project(ptdf_col)
+    if shadow_price_cf is None or ptdf_target_cf is None:
+        result["error"] = (
+            "Could not fit a counterfactual projection onto the "
+            "requested timestamp (pre-period too short, or the "
+            "timestamp fell outside the aggregated window).")
+        return result
+
+    shadow_price_actual = float(matched_row[sp_col])
+    ptdf_target_actual  = float(matched_row[ptdf_col])
+    actual_contribution = shadow_price_actual * ptdf_target_actual
+    cf_contribution      = shadow_price_cf * ptdf_target_cf
+
+    result.update(
+        ok=True,
+        matched_timestamp=matched_ts,
+        shadow_price_actual=shadow_price_actual,
+        shadow_price_cf=shadow_price_cf,
+        ptdf_target_actual=ptdf_target_actual,
+        ptdf_target_cf=ptdf_target_cf,
+        actual_contribution=actual_contribution,
+        counterfactual_contribution=cf_contribution,
+        impact=actual_contribution - cf_contribution,
+    )
+    return result
+
+
 def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
                            baseline_days: int = 7,
                            post_days: int = 3,
@@ -3295,7 +5321,19 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         "seasonal_naive" — mean by (hour, weekday) from pre-period [default]
         "fourier_trend"  — OLS with Fourier harmonics + linear trend
         "stl"            — STL decomposition (Loess), robust to outliers
-        "all"            — run all three; dashboard can compare them
+        "arima"          — ARIMA on deseasonalized residuals
+        "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
+        "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
+        "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+        "ridge"          — Ridge (closed-form) on the same lag + calendar features
+        "structural"     — state-space structural TS with daily+weekly seasonality
+        "tbats"          — TBATS with daily+weekly seasonality
+        "theta"          — Theta method on deseasonalized residuals
+        "hurdle"         — two-part zero-inflated model (for shadow price)
+        "ram_identity"   — physics-informed: forecasts RAM's 7 components, computes RAM
+        "ptdf_flow"      — physics-informed: reconstructs flow as Σ PTDF x net position
+        "ensemble"       — adaptive, backtest-weighted blend of every method above
+        "all"            — run every registered method; dashboard can compare them
 
     Returns:
       summary      : dict of scalar statistics
@@ -3482,11 +5520,23 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
     #   The maintenance interval itself is NEVER used to build Y(0).
     #   Y(0) is then projected into both DURING and POST windows.
     #
-    # Three models available (see _ITS_METHODS and _build_its_for_col):
+    # Models available (see _ITS_METHODS and _build_its_for_col):
     #   "seasonal_naive" — mean by (hour, weekday) from pre-period [default]
     #   "fourier_trend"  — OLS with Fourier harmonics + linear trend
     #   "stl"            — STL decomposition (Loess), robust to outliers
-    #   "all"            — run all three, return its_all dict for comparison
+    #   "arima"          — ARIMA on deseasonalized residuals
+    #   "sarima"         — SARIMA(p,d,q)(P,D,Q)[24] on hourly-resampled data
+    #   "lightgbm"       — LightGBM on lag1d/lag2d/lag7d + calendar features
+    #   "catboost"       — CatBoost on lag1d/lag2d/lag7d + calendar features
+    #   "ridge"          — Ridge (closed-form) on the same lag + calendar features
+    #   "structural"     — state-space structural TS with daily+weekly seasonality
+    #   "tbats"          — TBATS with daily+weekly seasonality
+    #   "theta"          — Theta method on deseasonalized residuals
+    #   "hurdle"         — two-part zero-inflated model (for shadow price)
+    #   "ram_identity"   — physics-informed: forecasts RAM's 7 components, computes RAM
+    #   "ptdf_flow"      — physics-informed: reconstructs flow as Σ PTDF x net position
+    #   "ensemble"       — adaptive, backtest-weighted blend of every method above
+    #   "all"            — run every registered method, return its_all dict
     #
     # Use fall_signed (verified RAM formula input) as primary dep var.
     _its_cols = []
@@ -3519,7 +5569,20 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
         s_lookups = {}
         s_means   = {}
         for col in _its_cols:
-            pre_agg = pre.groupby("dateTimeUtc")[col].mean().reset_index()
+            # Extra columns carried alongside `col`, purely for the two
+            # physics-informed methods (_its_ram_identity()/_its_ptdf_flow())
+            # -- every other method only ever reads `col`/hour/dow from
+            # pre_agg/all_agg and ignores anything else, so widening this is
+            # backward-compatible with all of them. RAM-identity terms come
+            # from _RAM_IDENTITY_TERMS; ptdf_*/netpos_* are prefix-matched
+            # since the exact zone set varies per JAO export and whether
+            # merge_nordpool_net_positions() has been run for this data.
+            _extra = [c for c in _RAM_IDENTITY_TERMS if c in pre.columns and c != col]
+            _extra += [c for c in pre.columns
+                      if (c.startswith("ptdf_") or c.startswith("netpos_")) and c != col]
+            _extra = list(dict.fromkeys(_extra))   # de-dup, keep first-seen order
+
+            pre_agg = pre.groupby("dateTimeUtc")[[col] + _extra].mean().reset_index()
             if len(pre_agg) < 4:
                 continue
             pre_agg["hour"] = pre_agg["dateTimeUtc"].dt.hour
@@ -3530,7 +5593,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             s_lookups[col] = _sn
             s_means[col]   = float(pre_agg[col].mean())
 
-            all_agg = window.groupby("dateTimeUtc")[col].mean().reset_index()
+            all_agg = window.groupby("dateTimeUtc")[[col] + _extra].mean().reset_index()
             all_agg = all_agg.sort_values("dateTimeUtc").reset_index(drop=True)
             all_agg["hour"] = all_agg["dateTimeUtc"].dt.hour
             all_agg["dow"]  = all_agg["dateTimeUtc"].dt.dayofweek
@@ -3543,7 +5606,7 @@ def single_event_analysis(no3_df: pd.DataFrame, outage_row: pd.Series,
             all_agg.loc[all_agg.dateTimeUtc >= e, "period"] = "post"
             all_agg["param"]  = col
             all_agg["method"] = method_key
-            rows.append(all_agg.drop(columns=["hour","dow"]))
+            rows.append(all_agg.drop(columns=["hour","dow"] + _extra))
 
             dur_rows  = all_agg[all_agg.period == "during"]
             post_rows = all_agg[all_agg.period == "post"]

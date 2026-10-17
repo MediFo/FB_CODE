@@ -206,11 +206,46 @@ def generate_jao_csv(start: datetime, end: datetime,
         mask = (ts_np >= r["start_utc"].to_datetime64()) & (ts_np < r["end_utc"].to_datetime64())
         mw_hvdc[mask] += float(r["capacity_mw"])
 
-    # Diurnal & weekly patterns
+    # Diurnal & weekly patterns. Small here deliberately -- this is 'fall's
+    # OWN direct residual pattern (genuine local structure not mediated by
+    # net position, e.g. thermal/reactive effects), NOT the CNEC's whole
+    # diurnal/weekly signal: most of that now flows through the larger
+    # netpos-mediated diurnal/weekly term below (per-CNEC, inside the main
+    # generation loop) instead, so _its_ptdf_flow()'s Σ PTDF×NetPosition
+    # reconstruction has a real chance of seeing it. This split changes
+    # nothing about 'fall' as a direct-forecast target -- its total
+    # diurnal/weekly magnitude is unchanged, just differently composed.
     hr = timestamps.hour
-    diurnal = 50 * np.sin(2 * np.pi * hr / 24)
+    diurnal = 12 * np.sin(2 * np.pi * hr / 24)
     dow = timestamps.dayofweek
-    weekly = -30 * (dow >= 5)  # weekends slightly lower
+    weekly = -8 * (dow >= 5)  # weekends slightly lower
+
+    # Day-level index per timestamp, used below to give fnrao/amr/faac/iva
+    # genuine day-to-day persistence -- distinct from the diurnal/weekly
+    # hour-of-day/day-of-week pattern already on 'fall' (which
+    # seasonal_naive/theta already see via hour+dow grouping), a specific
+    # calendar day's regime level is invisible to any method that only
+    # conditions on (hour, weekday). Without this, fnrao/amr/faac/iva were
+    # each close to i.i.d. noise or near-constant, giving lag-feature/
+    # decomposition-based ITS methods (see _its_ram_identity() in
+    # propagation.py) nothing to exploit that a direct forecast of 'ram'
+    # couldn't already get from the aggregate's own hour/dow pattern --
+    # making any accuracy comparison between them unfair to the
+    # decomposition approach. See CLAUDE.md's "ACCURACY REALITY CHECK".
+    day_index = (timestamps.normalize() - timestamps.normalize().min()).days.values
+    n_days = int(day_index.max()) + 1
+
+    def _ar1_day_regime(phi: float = 0.65) -> np.ndarray:
+        """Mean-reverting AR(1) walk, one value per calendar day, unit std,
+        broadcast to MTU resolution. A fresh call consumes n_days rng draws."""
+        days = np.zeros(n_days)
+        innovations = rng.normal(0, 1, n_days)
+        for d in range(1, n_days):
+            days[d] = phi * days[d - 1] + innovations[d]
+        std = days.std()
+        if std > 1e-9:
+            days = days / std
+        return days[day_index]
 
     rows = []
     for cnec, zfrom, zto in NO3_CNECS:
@@ -221,6 +256,67 @@ def generate_jao_csv(start: datetime, end: datetime,
         ptdf_NO3_base = rng.uniform(0.20, 0.40)
         ptdf_FI_FS_base = rng.uniform(-0.04, -0.01)
         ptdf_FI_EL_base = rng.uniform(-0.03, -0.01)
+        # NO4/SE1/SE2/SE3 PTDFs used to be redrawn fresh, INDEPENDENTLY, on
+        # every single row -- no persistent per-CNEC value at all, unlike a
+        # real PTDF (stable for a CNEC, shifting only slowly with grid
+        # topology) or ptdf_FI/ptdf_NO3 above (both base + small per-MTU
+        # noise). Fixed to the same base + small-noise shape so they're
+        # usable as genuine physics inputs below and in _its_ptdf_flow()
+        # (propagation.py).
+        ptdf_NO4_base = rng.uniform(0.10, 0.20)
+        ptdf_SE1_base = rng.uniform(0.05, 0.15)
+        ptdf_SE2_base = rng.uniform(0.02, 0.08)
+        ptdf_SE3_base = rng.uniform(0.01, 0.05)
+
+        # Zone net positions (day-ahead market schedules): real economic
+        # quantities, so -- unlike fnrao/amr/faac/iva above, which are
+        # grid-operational -- they get the diurnal/weekly demand pattern
+        # too, on top of their own day-level AR(1) regime (cold snaps /
+        # demand swings a single global diurnal/weekly curve can't
+        # capture). Written out as netpos_<ZONE> columns for
+        # _its_ptdf_flow() to reconstruct 'fall' from, and also feeds an
+        # UNSCALED (not effect_scale-multiplied -- a base-case market
+        # quantity, not an outage effect) Σ PTDF_base × NetPosition term
+        # into 'fall' itself below: the real F_allReference genuinely
+        # depends on the D-2 base-case net positions, which 'fall'
+        # previously had no dependency on at all. Diurnal/weekly amplitude
+        # here is deliberately LARGER than 'fall' keeps directly below (see
+        # that comment) -- a backtest showed most of fall's diurnal/weekly
+        # pattern needs to flow through this netpos-mediated channel for
+        # _its_ptdf_flow() to have any real chance of reconstructing it;
+        # this changes nothing about 'fall' itself as a direct-forecast
+        # target (seasonal_naive/catboost only ever see fall's final
+        # values, not how it's internally composed), only whether the
+        # PHYSICS-BASED reconstruction can also see that same structure.
+        _ptdf_base_by_zone = {
+            "FI": ptdf_FI_base, "NO3": ptdf_NO3_base, "NO4": ptdf_NO4_base,
+            "SE1": ptdf_SE1_base, "SE2": ptdf_SE2_base, "SE3": ptdf_SE3_base,
+        }
+        netpos_by_zone = {}
+        fall_netpos_term = np.zeros(n)
+        for _zone, _ptdf_base in _ptdf_base_by_zone.items():
+            _regime_np = _ar1_day_regime()
+            _npzone = (70 * np.sin(2 * np.pi * hr / 24) - 35 * (dow >= 5)
+                      + 30 * _regime_np + rng.normal(0, 15, n))
+            netpos_by_zone[_zone] = _npzone
+            fall_netpos_term += _ptdf_base * _npzone
+
+        # CNEC-specific base-case level: previously an arbitrary constant
+        # added directly to 'fall' with no physical explanation, and
+        # invisible to _its_ptdf_flow() (propagation.py), which only ever
+        # looks at netpos_<ZONE>, never 'fall' itself -- an unexplained
+        # bias it structurally could never correct for, unlike a direct
+        # forecast fit on 'fall' (seasonal_naive/catboost), which trivially
+        # absorbs any constant level via its own hour/dow mean. Folded into
+        # netpos_NO3's own per-CNEC mean level instead -- NO3 has the
+        # largest PTDF magnitude of the six zones (always in [0.20, 0.40],
+        # comfortably away from zero), so dividing by it here is safe. Same
+        # rng draw and same net effect on 'fall' as before, but now
+        # genuinely reconstructible from net position like the rest of the
+        # netpos-driven term.
+        _fall_bias = rng.uniform(-30, 30)
+        netpos_by_zone["NO3"] = netpos_by_zone["NO3"] + _fall_bias / ptdf_NO3_base
+        fall_netpos_term += _fall_bias
 
         # fall (F_allReference): the reference flow that actually enters the RAM
         # formula (see CLAUDE.md / METHODOLOGY.md) — this is where outage effects
@@ -232,10 +328,10 @@ def generate_jao_csv(start: datetime, end: datetime,
         # that check a real test again.
         fall = (rng.normal(0, 30, n)                   # noise
               + diurnal + weekly                       # patterns
+              + fall_netpos_term                       # D-2 base-case net-position term
               + effect_scale * 80 * is_hvdc * np.sign(ptdf_FI_FS_base)  # HVDC -> reference-flow jump
               + effect_scale * 0.04 * mw_gen * np.sign(ptdf_FI_base) * is_forced  # gen forced
               + effect_scale * 25 * is_ac * np.sign(ptdf_FI_base))    # AC topology
-        fall += rng.uniform(-30, 30)  # CNEC-specific bias
 
         # PTDF_FI shifts only during AC line outages (small magnitude)
         ptdf_FI = ptdf_FI_base + effect_scale * 0.025 * is_ac * np.sign(ptdf_FI_base) * (-1) \
@@ -249,24 +345,52 @@ def generate_jao_csv(start: datetime, end: datetime,
                               rng.normal(0, 0.001, n),
                               ptdf_FI_EL_base + rng.normal(0, 0.001, n))
 
+        # NO3/NO4/SE1/SE2/SE3 PTDFs: base + small per-MTU noise, vectorized
+        # (this used to be drawn one rng call at a time inside the per-row
+        # loop below -- moved up here alongside the other ptdf_* arrays,
+        # same base+noise shape, just precomputed instead of drawn 96*days
+        # times in a Python loop).
+        ptdf_NO3 = ptdf_NO3_base + rng.normal(0, 0.005, n)
+        ptdf_NO4 = ptdf_NO4_base + rng.normal(0, 0.005, n)
+        ptdf_SE1 = ptdf_SE1_base + rng.normal(0, 0.005, n)
+        ptdf_SE2 = ptdf_SE2_base + rng.normal(0, 0.005, n)
+        ptdf_SE3 = ptdf_SE3_base + rng.normal(0, 0.005, n)
+
         # FRM: structural, with December 2024 step change
         frm = np.full(n, frm_base * 0.5)  # pre-Dec-2024 lower
         post_dec24 = timestamps >= pd.Timestamp("2024-12-10", tz="UTC")
         frm[post_dec24] = frm_base
         frm += rng.normal(0, 1, n)
 
-        # FRA: small, sometimes positive during HVDC outages (cross-zonal RA)
+        # FRA: small, sometimes positive during HVDC outages (cross-zonal RA),
+        # plus a day-level regime (TSO cross-zonal RA allocation tends to
+        # persist across a day, not reset every 15 min).
+        regime_fra = _ar1_day_regime()
         fra = np.where(is_hvdc, rng.uniform(0, 30, n), rng.uniform(0, 5, n))
+        fra = np.maximum(fra + 5.0 * regime_fra, 0.0)
 
-        # AMR: zero most of the time
-        amr = np.where(rng.uniform(0, 1, n) > 0.97, rng.uniform(20, 80, n), 0.0)
+        # AMR: zero most of the time, but the daily spike PROBABILITY (not
+        # just each spike's magnitude) is day-regime-modulated -- redispatch
+        # actions cluster on high-stress grid days rather than firing
+        # independently every 15 min. Bounded so it stays "zero most of the
+        # time" (~90-99% zero rows) like before.
+        regime_amr = _ar1_day_regime()
+        amr_prob = np.clip(0.03 + 0.02 * regime_amr, 0.005, 0.10)
+        amr = np.where(rng.uniform(0, 1, n) < amr_prob, rng.uniform(20, 80, n), 0.0)
 
-        # FAAC: tiny constant
-        faac = rng.uniform(0, 5, n)
+        # FAAC: tiny, but with a slow day-level level shift under the
+        # per-MTU noise rather than pure i.i.d. noise around one constant.
+        regime_faac = _ar1_day_regime()
+        faac = np.clip(1.5 + 1.2 * regime_faac + rng.normal(0, 0.7, n), 0.0, None)
 
-        # IVA: more frequent during forced outages, especially HVDC forced
-        # (0.01 baseline rate is not outage-induced and is left unscaled)
-        iva_prob = 0.01 + effect_scale * (0.10 * is_forced + 0.15 * (is_hvdc * is_forced))
+        # IVA: more frequent during forced outages, especially HVDC forced.
+        # The non-outage-induced baseline rate now drifts by day (a mild
+        # "congestion regime" independent of any specific outage) instead of
+        # sitting fixed at 0.01 -- still deliberately left unscaled by
+        # effect_scale, same as before, since it isn't outage-induced.
+        regime_iva = _ar1_day_regime()
+        iva_baseline = np.clip(0.01 + 0.02 * np.clip(regime_iva, -1.5, 1.5), 0.002, 0.05)
+        iva_prob = iva_baseline + effect_scale * (0.10 * is_forced + 0.15 * (is_hvdc * is_forced))
         iva_active = rng.uniform(0, 1, n) < iva_prob
         iva = np.where(iva_active, rng.uniform(20, 150, n), 0.0)
 
@@ -316,11 +440,17 @@ def generate_jao_csv(start: datetime, end: datetime,
                 "ptdf_FI": round(float(ptdf_FI[i]), 5),
                 "ptdf_FI_FS": round(float(ptdf_FI_FS[i]), 5),
                 "ptdf_FI_EL": round(float(ptdf_FI_EL[i]), 5),
-                "ptdf_NO3": round(float(ptdf_NO3_base + rng.normal(0, 0.005)), 5),
-                "ptdf_NO4": round(float(rng.uniform(0.10, 0.20)), 5),
-                "ptdf_SE1": round(float(rng.uniform(0.05, 0.15)), 5),
-                "ptdf_SE2": round(float(rng.uniform(0.02, 0.08)), 5),
-                "ptdf_SE3": round(float(rng.uniform(0.01, 0.05)), 5),
+                "ptdf_NO3": round(float(ptdf_NO3[i]), 5),
+                "ptdf_NO4": round(float(ptdf_NO4[i]), 5),
+                "ptdf_SE1": round(float(ptdf_SE1[i]), 5),
+                "ptdf_SE2": round(float(ptdf_SE2[i]), 5),
+                "ptdf_SE3": round(float(ptdf_SE3[i]), 5),
+                "netpos_FI":  round(float(netpos_by_zone["FI"][i]), 2),
+                "netpos_NO3": round(float(netpos_by_zone["NO3"][i]), 2),
+                "netpos_NO4": round(float(netpos_by_zone["NO4"][i]), 2),
+                "netpos_SE1": round(float(netpos_by_zone["SE1"][i]), 2),
+                "netpos_SE2": round(float(netpos_by_zone["SE2"][i]), 2),
+                "netpos_SE3": round(float(netpos_by_zone["SE3"][i]), 2),
             })
 
     df = pd.DataFrame(rows)

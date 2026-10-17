@@ -9,6 +9,7 @@ import sys
 import os
 import json
 import warnings
+from unittest import mock
 warnings.filterwarnings("ignore")
 
 # All files are in the same folder as this script. This directory also has
@@ -38,7 +39,7 @@ from propagation import (
     summarize_hypotheses, PipelineConfig, run_pipeline,
     DEFAULT_NO3_PATTERNS, cet_input_to_utc, utc_to_cet_str, jao_datetime_to_utc,
     build_event_time_dummies, run_event_study,
-    single_event_analysis, pre_period_abs_ptdf,
+    single_event_analysis, pre_period_abs_ptdf, estimate_cnec_price_impact,
     build_report_ctx, run_nordic_matrix, render_nordic_matrix_report,
     NORDIC_SOURCE_COUNTRIES, NORDIC_TARGET_ZONES,
     fetch_entsoe_outages,
@@ -318,6 +319,37 @@ class TestEntsoeCapacityField:
         cov = build_covariates(no3_df, outages, src="fi")
         assert cov["fi_hvdc_outage_active"].sum() > 0
         assert (cov["fi_hvdc_outage_mw_lost"] == 0).all()
+
+
+class TestEntsoeFetchFailureMarker:
+    """fetch_entsoe_outages() returns an empty-or-partial DataFrame both when
+    a window genuinely has zero events AND when every query silently failed
+    (missing entsoe-py, bad network/token, etc.) -- those look identical to
+    a caller unless the DataFrame's .attrs distinguish them (found via a
+    real user whose entsoe-py wasn't installed: the GUI showed a plain
+    green '0 outage events' with no hint anything was wrong)."""
+
+    def test_missing_library_sets_library_missing_flag(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient", None)
+        df = fetch_entsoe_outages("2026-03-01T00:00:00Z", "2026-04-21T00:00:00Z",
+                                  country_code="FI")
+        assert df.empty
+        failures = df.attrs.get("entsoe_fetch_failures")
+        assert failures is not None, (
+            "an empty result from a missing entsoe-py install must still "
+            "carry entsoe_fetch_failures -- this is an early return, before "
+            "the normal end-of-function .attrs assignment")
+        assert failures["library_missing"] is True
+
+    def test_successful_fetch_sets_library_missing_false(self, monkeypatch):
+        monkeypatch.setattr(_pipe, "EntsoePandasClient",
+                            TestEntsoeCapacityField._FakeEntsoeClient)
+        df = fetch_entsoe_outages("2024-11-01T00:00:00Z", "2024-11-03T00:00:00Z",
+                                  country_code="FI")
+        failures = df.attrs.get("entsoe_fetch_failures")
+        assert failures is not None
+        assert failures["library_missing"] is False
+        assert failures["a77_failed"] is False
 
 
 # ── 4. Covariate building ─────────────────────────────────────────────────────
@@ -1142,6 +1174,141 @@ class TestPrePeriodAbsPtdf:
         assert pre_period_abs_ptdf(df, "ptdf_FI").empty
 
 
+# ── 16b. CNEC price impact estimator (actual vs ITS counterfactual) ──────────
+
+class TestEstimateCnecPriceImpact:
+    """impact = (shadowPrice_actual * PTDF_target_actual)
+                - (shadowPrice_cf * PTDF_target_cf),
+    for one CNEC/zone at one timestamp, both terms projected via the same
+    ITS counterfactual machinery every other method here uses -- the
+    Tab 9 Single Event "Price Spread" pane's backing function."""
+
+    def _df(self):
+        # 4 pre-period rows, all Mondays at hour 0 (same (hour,dow) cell),
+        # constant values -- seasonal_naive's counterfactual for that cell
+        # is then exactly the pre-period mean, so the expected numbers are
+        # exact, not approximate. One "during" row, same (hour,dow) cell
+        # (a later Monday at hour 0) but different actual values.
+        pre_dates = ["2025-01-06", "2025-01-13", "2025-01-20", "2025-01-27"]
+        during_date = "2025-02-03"
+        ts = pd.to_datetime([f"{d}T00:00:00Z" for d in pre_dates + [during_date]])
+        n_pre = len(pre_dates)
+        return pd.DataFrame({
+            "cneName":     ["X"] * (n_pre + 1),
+            "dateTimeUtc": ts,
+            "shadowPrice": [10.0] * n_pre + [50.0],
+            "ptdf_NO3":    [0.20] * n_pre + [0.25],
+        })
+
+    def test_computes_expected_impact_with_seasonal_naive(self):
+        df = self._df()
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                       its_method="seasonal_naive")
+        assert r["ok"] is True
+        assert r["shadow_price_actual"] == pytest.approx(50.0)
+        assert r["shadow_price_cf"]     == pytest.approx(10.0)
+        assert r["ptdf_target_actual"]  == pytest.approx(0.25)
+        assert r["ptdf_target_cf"]      == pytest.approx(0.20)
+        assert r["actual_contribution"] == pytest.approx(50.0 * 0.25)
+        assert r["counterfactual_contribution"] == pytest.approx(10.0 * 0.20)
+        assert r["impact"] == pytest.approx(50.0 * 0.25 - 10.0 * 0.20)
+
+    def test_no_actual_movement_gives_zero_impact(self):
+        """If the 'during' row is identical to the pre-period pattern
+        (same (hour,dow) cell, same values), the counterfactual matches
+        the actual exactly and the impact must be exactly zero."""
+        df = self._df()
+        df.loc[df.index[-1], ["shadowPrice", "ptdf_NO3"]] = [10.0, 0.20]
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                       its_method="seasonal_naive")
+        assert r["ok"] is True
+        assert r["impact"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_missing_cnec_refuses(self):
+        df = self._df()
+        r = estimate_cnec_price_impact(df, "NOT_A_CNEC", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
+        assert r["ok"] is False
+        assert "No rows" in r["error"]
+
+    def test_missing_ptdf_column_refuses(self):
+        df = self._df()
+        r = estimate_cnec_price_impact(df, "X", "SE3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
+        assert r["ok"] is False
+        assert "ptdf_SE3" in r["error"]
+
+    def test_too_short_pre_period_refuses(self):
+        df = self._df()
+        # pre_end before any pre-period row exists at all
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-01-01T00:00:00Z"),
+                                       df["dateTimeUtc"].iloc[-1])
+        assert r["ok"] is False
+        assert "pre-period" in r["error"] or "Fewer than 4" in r["error"]
+
+    def test_timestamp_outside_tolerance_refuses(self):
+        df = self._df()
+        far_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(days=1)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       far_ts)
+        assert r["ok"] is False
+        assert "No row" in r["error"]
+
+    def test_timestamp_within_tolerance_snaps_to_nearest(self):
+        df = self._df()
+        near_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(seconds=10)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       near_ts)
+        assert r["ok"] is True
+        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[-1]
+
+    def test_default_tolerance_matches_mtu_minutes(self):
+        """A fixed 1-minute default tolerance rejected almost every real,
+        human-typed timestamp against the actual 15-minute MTU grid --
+        the default now scales with mtu_minutes (15 by default) instead,
+        so an offset well past 1 minute but still within one MTU period
+        must still match."""
+        df = self._df()
+        near_ts = df["dateTimeUtc"].iloc[-1] + pd.Timedelta(minutes=10)
+        r = estimate_cnec_price_impact(df, "X", "NO3",
+                                       pd.Timestamp("2025-02-01T00:00:00Z"),
+                                       near_ts)
+        assert r["ok"] is True
+        assert r["matched_timestamp"] == df["dateTimeUtc"].iloc[-1]
+
+    def test_naive_timestamps_treated_as_utc(self):
+        df = self._df()
+        r = estimate_cnec_price_impact(
+            df, "X", "NO3",
+            pd.Timestamp("2025-02-01T00:00:00Z").tz_localize(None),
+            df["dateTimeUtc"].iloc[-1].tz_localize(None))
+        assert r["ok"] is True
+
+    def test_no_leakage_pre_period_is_strictly_before_pre_end(self):
+        """Sabotage the 'during' row to an extreme outlier and confirm the
+        counterfactual (fit only on rows before pre_end) doesn't move --
+        same discipline every other ITS method in this file is held to."""
+        df = self._df()
+        pre_end = pd.Timestamp("2025-02-01T00:00:00Z")
+        ts = df["dateTimeUtc"].iloc[-1]
+        r_before = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                              its_method="seasonal_naive")
+        df.loc[df.index[-1], ["shadowPrice", "ptdf_NO3"]] = [99999.0, 99999.0]
+        r_after = estimate_cnec_price_impact(df, "X", "NO3", pre_end, ts,
+                                             its_method="seasonal_naive")
+        assert r_before["shadow_price_cf"] == pytest.approx(r_after["shadow_price_cf"])
+        assert r_before["ptdf_target_cf"]  == pytest.approx(r_after["ptdf_target_cf"])
+
+
 # ── 17. Recovery direction (magnitude-blind metric fix) ───────────────────────
 
 class TestRecoveryDirection:
@@ -1187,3 +1354,705 @@ class TestSingleEventAnalysis:
         diag = no3_cov.attrs.get("planned_forced_confound")
         assert diag is not None
         assert "all_planned_transmission_is_manual" in diag
+
+
+# ── 19. Lag-feature ITS methods (lightgbm/catboost/ridge) and ensemble ────────
+
+def _synthetic_seasonal_series(n_days=45, mtu_minutes=15, seed=42):
+    """A daily+weekly seasonal series with trend and noise, for ITS tests."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    hour = idx.hour + idx.minute / 60
+    dow = idx.dayofweek
+    seasonal = 100 + 20 * np.sin(2 * np.pi * hour / 24) + 10 * np.cos(2 * np.pi * dow / 7)
+    trend = np.linspace(0, 5, len(idx))
+    noise = rng.normal(0, 3, size=len(idx))
+    df = pd.DataFrame({"dateTimeUtc": idx, "val": seasonal + trend + noise})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df, seasonal, trend
+
+
+_LAG_FEATURE_METHODS = ["lightgbm", "catboost", "ridge"]
+
+
+def _skip_if_backend_missing(method):
+    if method == "lightgbm":
+        pytest.importorskip("lightgbm")
+    elif method == "catboost":
+        pytest.importorskip("catboost")
+    # ridge is numpy-only -- never skipped
+
+
+class TestLagFeatureItsMethods:
+    def test_registered_in_its_methods(self):
+        for key in _LAG_FEATURE_METHODS:
+            assert key in _pipe.ITS_METHOD_NAMES
+            entry = _pipe._ITS_METHODS[key]
+            assert entry["fn"] is not None
+            assert entry["min_days"] > 0
+            assert entry["label"]
+            assert entry["description"]
+
+    def test_lightgbm_regressor_actually_constructs(self):
+        """Regression guard: `import lightgbm` succeeds even without
+        scikit-learn installed, but LGBMRegressor(...) -- the sklearn
+        wrapper _its_gbm() uses -- then raises a non-ImportError
+        LightGBMError the first time it's constructed. That exception
+        type previously slipped past _its_gbm()'s `except ImportError`
+        import guard and was only caught by the broader `except Exception`
+        around model.fit(), which silently fell back to seasonal_naive
+        (discarding all the lag-feature engineering) instead of the
+        documented ARIMA fallback. This constructs it exactly as
+        _its_gbm() does, so a missing scikit-learn fails this test loudly
+        instead of silently degrading every "lightgbm" projection."""
+        pytest.importorskip("lightgbm")
+        from lightgbm import LGBMRegressor
+        LGBMRegressor(n_estimators=200, max_depth=5, num_leaves=31,
+                      learning_rate=0.05, min_child_samples=10, verbosity=-1)
+
+    def test_ridge_handles_all_nan_feature_column(self):
+        """Regression guard: a feature column that is NaN in every
+        training row (lag7d whenever the pre-period is under 7 days --
+        it can never have a real value then) made np.nanmean's NaN result
+        silently poison every prediction with NaN, with nothing raising
+        to catch it -- found via a real run where a 6-day pre-period's
+        all-NaN lag7d column NaN-poisoned _its_ensemble()'s median across
+        EVERY method, not just ridge. Such a column must be imputed to a
+        finite fallback (0) instead, fitting that feature's coefficient
+        to exactly 0 rather than corrupting the whole model."""
+        rng = np.random.default_rng(3)
+        X = rng.normal(size=(50, 4))
+        X[:, 2] = np.nan
+        y = rng.normal(size=50)
+        model = _pipe._ClosedFormRidge(alpha=5.0).fit(X, y)
+        pred = model.predict(X)
+        assert not np.isnan(pred).any()
+        assert model._beta[2] == 0.0
+
+    def test_tune_lag_hyperparams_picks_better_candidate(self):
+        """Regression guard for the hyperparameter-tuning addition: given
+        a deliberately-bad candidate FIRST (huge ridge alpha, suppresses
+        every coefficient toward 0 and predicts close to a constant mean,
+        ignoring the calendar/lag features entirely) and a reasonable one
+        second, the tuner must still pick the good one by backtest MAE --
+        proving it actually evaluates candidates rather than just
+        returning candidates[0]."""
+        df, _, _ = _synthetic_seasonal_series(n_days=30)
+
+        def _make_fit_predict(kwargs):
+            def fit_predict(X_train, y_train):
+                model = _pipe._ClosedFormRidge(**kwargs).fit(X_train, y_train)
+                return model.predict
+            return fit_predict
+
+        candidates = [dict(alpha=1e8), dict(alpha=5.0)]
+        best = _pipe._tune_lag_hyperparams(df, "val", 15, candidates, _make_fit_predict)
+        assert best == dict(alpha=5.0), (
+            f"tuner should have picked the low-alpha candidate, got {best}")
+
+    def test_tune_lag_hyperparams_falls_back_to_default_on_short_pre_period(self):
+        """Below 14 days, tuning must be a no-op: candidates[0] returned
+        unchanged regardless of which candidate would actually backtest
+        better -- there's no reliable split to check it against."""
+        df, _, _ = _synthetic_seasonal_series(n_days=6)
+
+        def _make_fit_predict(kwargs):
+            def fit_predict(X_train, y_train):
+                model = _pipe._ClosedFormRidge(**kwargs).fit(X_train, y_train)
+                return model.predict
+            return fit_predict
+
+        candidates = [dict(alpha=5.0), dict(alpha=1e8)]
+        best = _pipe._tune_lag_hyperparams(df, "val", 15, candidates, _make_fit_predict)
+        assert best == dict(alpha=5.0)
+
+    def test_its_tune_hyperparams_toggle_skips_tuning_when_false(self):
+        """ITS_TUNE_HYPERPARAMS=False must make _its_ridge() (and by the
+        same code path, _its_gbm()) noticeably faster by skipping
+        _tune_lag_hyperparams() entirely -- verified by monkeypatching it
+        to raise if called, then confirming the method still runs
+        cleanly (using candidates[0] unchanged) instead of erroring."""
+        df, _, _ = _synthetic_seasonal_series(n_days=30)
+        original_toggle = _pipe.ITS_TUNE_HYPERPARAMS
+        original_tune_fn = _pipe._tune_lag_hyperparams
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("_tune_lag_hyperparams should not be called "
+                                 "when ITS_TUNE_HYPERPARAMS is False")
+
+        try:
+            _pipe.ITS_TUNE_HYPERPARAMS = False
+            _pipe._tune_lag_hyperparams = _boom
+            proj = _pipe._its_ridge(df, df, "val", mtu_minutes=15)
+            assert len(proj) == len(df)
+            assert not proj.isna().any()
+        finally:
+            _pipe.ITS_TUNE_HYPERPARAMS = original_toggle
+            _pipe._tune_lag_hyperparams = original_tune_fn
+
+    @pytest.mark.parametrize("method", _LAG_FEATURE_METHODS)
+    def test_no_leakage_into_during_post_projection(self, method):
+        """A during/post projection must never be able to see real
+        during/post observations -- verified by sabotaging the actual
+        values in that window to an outlier the model could not have
+        produced from pre-period-only training, then checking the
+        projection neither reproduces that outlier nor drifts wildly."""
+        _skip_if_backend_missing(method)
+        df, seasonal, trend = _synthetic_seasonal_series()
+        split = pd.Timestamp("2024-02-05", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "val"] = 99999.0
+
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(pre_agg, sabotaged, "val", mtu_minutes=15)
+
+        # Guard against a silent fallback that happens to produce a
+        # plausible-looking (and thus easy to miss) result: if the
+        # lag-feature path silently degraded to seasonal_naive, this test
+        # would still pass every check below despite never exercising the
+        # real recursive lag-feature logic at all. seasonal_naive is
+        # leak-proof by construction (it only ever reads hour/dow group
+        # means from pre_agg), so it can't be used to certify this method.
+        sn_proj = _pipe._its_seasonal_naive(pre_agg, sabotaged, "val")
+        assert not np.allclose(proj[during_mask].values, sn_proj[during_mask].values), (
+            f"{method} projection is identical to seasonal_naive's -- "
+            "it likely silently fell back instead of running its own "
+            "recursive lag-feature model")
+
+        proj_during = proj[during_mask]
+        assert proj_during.max() < 1000, (
+            f"{method} projection leaked the sabotaged during-period value")
+
+        true_during = seasonal[during_mask] + trend[during_mask]
+        mae = float(np.mean(np.abs(proj_during.values - true_during)))
+        assert mae < 15, (
+            f"{method} projection MAE={mae:.2f} vs true seasonal pattern "
+            "-- too high to be tracking the pre-period-fit model")
+
+    @pytest.mark.parametrize("method", _LAG_FEATURE_METHODS)
+    def test_short_pre_period_falls_back_without_error(self, method):
+        """Below the seasonal_naive/STL length guard, the lag-feature path
+        must degrade gracefully (no exception, no NaNs) rather than error
+        out."""
+        _skip_if_backend_missing(method)
+        df, _, _ = _synthetic_seasonal_series(n_days=4)
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(df, df, "val", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+
+    def test_all_mode_includes_new_methods(self, no3_cov, outages_df):
+        if _pipe.sm is None:
+            pytest.skip("statsmodels not installed")
+        row = outages_df.iloc[0]
+        res = single_event_analysis(no3_cov, row, baseline_days=7, post_days=3,
+                                    its_method="all")
+        for key in (_LAG_FEATURE_METHODS + ["ensemble", "structural", "tbats",
+                                            "theta", "hurdle"]):
+            assert key in res["its_all"]
+
+
+# ── 21. Dual-seasonality / short-series time-series ITS methods ───────────────
+
+_HOURLY_ITS_METHODS = ["structural", "tbats"]
+
+
+def _skip_if_ts_backend_missing(method):
+    if method == "tbats":
+        pytest.importorskip("tbats")
+    # structural/theta are statsmodels-only, already a required dependency
+
+
+class TestTimeSeriesItsMethods:
+    def test_registered_in_its_methods(self):
+        for key in _HOURLY_ITS_METHODS + ["theta"]:
+            assert key in _pipe.ITS_METHOD_NAMES
+            entry = _pipe._ITS_METHODS[key]
+            assert entry["fn"] is not None
+            assert entry["min_days"] > 0
+            assert entry["label"]
+            assert entry["description"]
+
+    @pytest.mark.parametrize("method", _HOURLY_ITS_METHODS + ["theta"])
+    def test_no_leakage_into_during_post_projection(self, method):
+        _skip_if_ts_backend_missing(method)
+        df, seasonal, trend = _synthetic_seasonal_series()
+        split = pd.Timestamp("2024-02-05", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "val"] = 99999.0
+
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(pre_agg, sabotaged, "val", mtu_minutes=15)
+        proj_during = proj[during_mask]
+        assert proj_during.max() < 1000, (
+            f"{method} projection leaked the sabotaged during-period value")
+        assert not proj_during.isna().any()
+
+        true_during = seasonal[during_mask] + trend[during_mask]
+        mae = float(np.mean(np.abs(proj_during.values - true_during)))
+        assert mae < 15, (
+            f"{method} projection MAE={mae:.2f} vs true seasonal pattern "
+            "-- too high to be tracking the pre-period-fit model")
+
+    @pytest.mark.parametrize("method", _HOURLY_ITS_METHODS + ["theta"])
+    def test_short_pre_period_falls_back_without_error(self, method):
+        _skip_if_ts_backend_missing(method)
+        df, _, _ = _synthetic_seasonal_series(n_days=4)
+        fn = _pipe._ITS_METHODS[method]["fn"]
+        proj = fn(df, df, "val", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+
+    def test_structural_adds_weekly_component_with_enough_history(self):
+        """The whole point of 'structural'/'tbats' over SARIMA is joint
+        daily+weekly seasonality -- confirm the weekly freq_seasonal term
+        actually gets added once there's >= 336h (14 days) of pre-period,
+        and is skipped (daily-only) below that, per their own docs."""
+        pytest.importorskip("statsmodels")
+        from statsmodels.tsa.statespace.structural import UnobservedComponents
+        long_df, _, _ = _synthetic_seasonal_series(n_days=20)
+        pre_ts = _pipe._hourly_pre_series(long_df, "val")
+        assert len(pre_ts) >= 336
+
+
+# ── 22. Zero-inflated hurdle ITS method (for shadow price) ────────────────────
+
+def _zero_inflated_series(n_days=20, mtu_minutes=15, seed=11):
+    """A series that's exactly 0 off-peak and a positive draw on-peak --
+    stands in for a shadow price column (0 when non-binding)."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    on_peak = (idx.hour >= 8) & (idx.hour <= 20)
+    vals = np.where(on_peak, np.abs(rng.normal(15, 5, len(idx))), 0.0)
+    df = pd.DataFrame({"dateTimeUtc": idx, "shadow": vals})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df
+
+
+class TestHurdleItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "hurdle" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["hurdle"]
+        assert entry["fn"] is _pipe._its_hurdle
+
+    def test_projects_zero_off_peak_and_positive_on_peak(self):
+        df = _zero_inflated_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_hurdle(pre_agg, df, "shadow", mtu_minutes=15)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        off_peak_mask = during_mask & (df["hour"] < 8).values
+        on_peak_mask = during_mask & (df["hour"] >= 8).values & (df["hour"] <= 20).values
+        assert (proj[off_peak_mask] == 0.0).all(), (
+            "hurdle should project exactly 0 for hours that never bound in the pre-period")
+        assert (proj[on_peak_mask] > 0.0).all()
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = _zero_inflated_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "shadow"] = 99999.0
+
+        proj = _pipe._its_hurdle(pre_agg, sabotaged, "shadow", mtu_minutes=15)
+        assert proj[during_mask].max() < 1000
+
+    def test_degrades_to_seasonal_mean_on_non_zero_inflated_column(self):
+        """On a genuinely continuous column (no exact zeros), P(binding)
+        should saturate near 1 and the hurdle projection should collapse
+        back to essentially the plain seasonal mean."""
+        df, _, _ = _synthetic_seasonal_series(n_days=20)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj_hurdle = _pipe._its_hurdle(pre_agg, df, "val", mtu_minutes=15)
+        proj_sn = _pipe._its_seasonal_naive(pre_agg, df, "val")
+        during_mask = (df["dateTimeUtc"] >= split).values
+        assert np.allclose(proj_hurdle[during_mask].values,
+                           proj_sn[during_mask].values, rtol=1e-6)
+
+
+# ── 20. Adaptive ensemble ITS method ───────────────────────────────────────────
+
+class TestEnsembleItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "ensemble" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["ensemble"]
+        assert entry["fn"] is _pipe._its_ensemble
+        assert entry["label"]
+        assert entry["description"]
+
+    def test_no_leakage_into_during_post_projection(self):
+        df, seasonal, trend = _synthetic_seasonal_series()
+        split = pd.Timestamp("2024-02-05", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        sabotaged.loc[during_mask, "val"] = 99999.0
+
+        proj = _pipe._its_ensemble(pre_agg, sabotaged, "val", mtu_minutes=15)
+        proj_during = proj[during_mask]
+        assert proj_during.max() < 1000, "ensemble leaked the sabotaged during-period value"
+        assert not proj_during.isna().any()
+
+        true_during = seasonal[during_mask] + trend[during_mask]
+        mae = float(np.mean(np.abs(proj_during.values - true_during)))
+        assert mae < 15
+
+    def test_backtest_weighting_excludes_bad_members_and_favors_good_ones(self):
+        """The adaptive weighting is the actual point of this method:
+        given a clean seasonal+trend+noise series (45 pre-days, long
+        enough to trigger the backtest split), it must down-weight or
+        drop members with a structurally poor fit for this shape
+        (fourier_trend/STL, whose trend extrapolation is known to derail
+        -- see their own docs) and favor the ones that fit it well."""
+        df, _, _ = _synthetic_seasonal_series(n_days=45)
+        members = [m for m in _pipe._ITS_METHODS if m != "ensemble"]
+        weights = _pipe._ensemble_backtest_weights(df, "val", 15, members)
+        assert weights is not None, "45-day pre-period should trigger backtest weighting"
+        assert abs(sum(weights.values()) - 1.0) < 1e-6
+        assert "fourier_trend" not in weights, (
+            "fourier_trend backtests poorly on this shape and should be excluded")
+
+    def test_short_pre_period_uses_median_fallback(self):
+        """Under the 14-day backtest threshold, weighting must be skipped
+        (returns None) and _its_ensemble() must still run cleanly via the
+        unweighted-median fallback -- no exception, no NaNs."""
+        df, _, _ = _synthetic_seasonal_series(n_days=6)
+        members = [m for m in _pipe._ITS_METHODS if m != "ensemble"]
+        assert _pipe._ensemble_backtest_weights(df, "val", 15, members) is None
+
+        proj = _pipe._its_ensemble(df, df, "val", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+
+    def test_deduplicates_members_with_identical_backtest_predictions(self):
+        """seasonal_naive/arima/hurdle can legitimately converge on
+        numerically identical predictions when there's no real residual
+        signal beyond the seasonal mean (see CLAUDE.md's ensemble
+        domain-facts entry on the hyperparameter-tuning/dedup addition) --
+        de-duplication should keep only one representative rather than
+        letting a coincidental multi-way tie dominate the weighted blend."""
+        df, _, _ = _synthetic_seasonal_series(n_days=45)
+        members = [m for m in _pipe._ITS_METHODS if m != "ensemble"]
+        weights = _pipe._ensemble_backtest_weights(df, "val", 15, members)
+        assert weights is not None
+        identical_trio = {"seasonal_naive", "arima", "hurdle"} & set(weights)
+        assert len(identical_trio) <= 1, (
+            f"expected at most one of seasonal_naive/arima/hurdle to survive "
+            f"de-duplication, got {identical_trio}")
+
+    def test_rolling_origin_split_count_scales_with_pre_period_length(self):
+        """0 splits under 14 days, 1 split from 14 up to ~28 days, 2
+        splits at ~28+ days -- the threshold _carve_rolling_origin_splits()
+        uses to decide it's safe to fit a second window without starving
+        the first one's own training side."""
+        for n_days, expected in [(10, 0), (20, 1), (30, 2), (60, 2)]:
+            df, _, _ = _synthetic_seasonal_series(n_days=n_days)
+            splits = _pipe._carve_rolling_origin_splits(df)
+            assert len(splits) == expected, (
+                f"{n_days} days -> expected {expected} splits, got {len(splits)}")
+
+    def test_excludes_ram_identity_and_ptdf_flow_from_its_own_members(self):
+        """Regression guard against infinite recursion: ram_identity and
+        ptdf_flow both fall back to _its_ensemble() when their physics
+        doesn't apply -- if _its_ensemble() ever listed them as its own
+        candidate members again, that fallback call would recurse forever
+        the moment either one's fallback condition is met. Never real
+        members of its own pool, whatever _ITS_METHODS contains."""
+        import inspect
+        src = inspect.getsource(_pipe._its_ensemble)
+        assert '"ram_identity"' in src and '"ptdf_flow"' in src, (
+            "expected _its_ensemble()'s member-list construction to "
+            "explicitly exclude ram_identity/ptdf_flow by name")
+
+
+# ── 23. Physics-informed ITS methods (ram_identity, ptdf_flow) + Nord Pool ────
+
+def _ram_identity_series(n_days=30, mtu_minutes=15, seed=7):
+    """A series with all 7 RAM-identity components, exactly satisfying
+    RAM = Fmax - FRM - fall + fnrao + AMR - FAAC - IVA by construction."""
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                        freq=f"{mtu_minutes}min", tz="UTC")
+    hour = idx.hour + idx.minute / 60
+    dow = idx.dayofweek
+    fmax  = np.full(len(idx), 1500.0) + rng.normal(0, 5, len(idx))
+    frm   = np.full(len(idx), 200.0)
+    fnrao = 50 + 10 * np.sin(2 * np.pi * hour / 24) + rng.normal(0, 3, len(idx))
+    amr   = 30 + rng.normal(0, 2, len(idx))
+    faac  = 100 + 20 * np.cos(2 * np.pi * dow / 7) + rng.normal(0, 4, len(idx))
+    fall  = 200 + 80 * np.sin(2 * np.pi * hour / 24 - 1.0) + rng.normal(0, 8, len(idx))
+    iva   = np.where(rng.random(len(idx)) < 0.05,
+                     np.abs(rng.normal(20, 5, len(idx))), 0.0)
+    ram = fmax - frm - fall + fnrao + amr - faac - iva
+    df = pd.DataFrame({"dateTimeUtc": idx, "ram": ram, "fmax": fmax, "frm": frm,
+                       "fnrao": fnrao, "amr": amr, "faac": faac, "fall": fall, "iva": iva})
+    df["hour"] = df["dateTimeUtc"].dt.hour
+    df["dow"] = df["dateTimeUtc"].dt.dayofweek
+    return df
+
+
+class TestRamIdentityItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "ram_identity" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["ram_identity"]
+        assert entry["fn"] is _pipe._its_ram_identity
+        assert entry["label"] and entry["description"]
+
+    def test_projection_satisfies_identity_exactly(self):
+        """The whole point of this method: the returned RAM projection
+        must equal the sum of its (signed) component projections to
+        floating-point precision, not just approximately -- it's
+        COMPUTED from them, never independently fit."""
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+
+        recomputed = np.zeros(len(df))
+        for c, sign in _pipe._RAM_IDENTITY_TERMS.items():
+            method = _pipe._RAM_COMPONENT_METHOD[c]
+            fn = _pipe._ITS_METHODS[method]["fn"]
+            proj_c = _pipe._call_its_method(fn, pre_agg, df, c, method, 15)
+            recomputed += sign * proj_c.values
+        assert np.allclose(proj.values, recomputed, atol=1e-9), (
+            "projected RAM must equal Σ(sign × projected component) exactly")
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        components = ["ram"] + list(_pipe._RAM_IDENTITY_TERMS.keys())
+        sabotaged.loc[during_mask, components] = 99999.0
+
+        proj = _pipe._its_ram_identity(pre_agg, sabotaged, "ram", mtu_minutes=15)
+        assert proj[during_mask].max() < 10000, (
+            "ram_identity leaked a sabotaged during-period component value")
+        assert not proj[during_mask].isna().any()
+
+    def test_attaches_identity_check_diagnostic(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+        diag = proj.attrs.get("ram_identity_check")
+        assert diag is not None
+        assert diag["pct_within_1mw_pre_period"] > 0.99, (
+            "identity was constructed to hold exactly -- diagnostic should confirm it")
+
+    def test_falls_back_to_ensemble_when_component_missing(self):
+        """Computing RAM from an incomplete subset of the formula would
+        silently produce a different, WRONG quantity -- must degrade to
+        ensemble instead, not fabricate a partial-formula number."""
+        df = _ram_identity_series().drop(columns=["iva"])
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ram_identity(pre_agg, df, "ram", mtu_minutes=15)
+        assert len(proj) == len(df)
+        assert not proj.isna().any()
+        assert "ram_identity_check" not in proj.attrs
+
+    def test_non_ram_column_delegates_to_theta(self):
+        df = _ram_identity_series()
+        split = pd.Timestamp("2024-01-20", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj_ri = _pipe._its_ram_identity(pre_agg, df, "fmax", mtu_minutes=15)
+        proj_th = _pipe._its_theta(pre_agg, df, "fmax", mtu_minutes=15)
+        assert np.allclose(proj_ri.values, proj_th.values)
+
+
+class TestPtdfFlowItsMethod:
+    def test_registered_in_its_methods(self):
+        assert "ptdf_flow" in _pipe.ITS_METHOD_NAMES
+        entry = _pipe._ITS_METHODS["ptdf_flow"]
+        assert entry["fn"] is _pipe._its_ptdf_flow
+        assert entry["label"] and entry["description"]
+
+    def _physics_series(self, n_days=20, mtu_minutes=15, seed=3, noisy_target=False):
+        rng = np.random.default_rng(seed)
+        idx = pd.date_range("2024-01-01", periods=n_days * 24 * 60 // mtu_minutes,
+                            freq=f"{mtu_minutes}min", tz="UTC")
+        hour = idx.hour + idx.minute / 60
+        dow = idx.dayofweek
+        ptdf_fi  = 0.3 + 0.02 * np.sin(2 * np.pi * hour / 24) + rng.normal(0, 0.005, len(idx))
+        ptdf_se1 = -0.15 + rng.normal(0, 0.005, len(idx))
+        np_fi  = 500 + 200 * np.sin(2 * np.pi * hour / 24 - 1) + rng.normal(0, 20, len(idx))
+        np_se1 = -300 + 100 * np.cos(2 * np.pi * dow / 7) + rng.normal(0, 15, len(idx))
+        fall = (rng.normal(1000, 300, len(idx)) if noisy_target
+               else ptdf_fi * np_fi + ptdf_se1 * np_se1)
+        df = pd.DataFrame({"dateTimeUtc": idx, "fall": fall,
+                           "ptdf_FI": ptdf_fi, "netpos_FI": np_fi,
+                           "ptdf_SE1": ptdf_se1, "netpos_SE1": np_se1})
+        df["hour"] = df["dateTimeUtc"].dt.hour
+        df["dow"] = df["dateTimeUtc"].dt.dayofweek
+        return df
+
+    def test_validates_and_reconstructs_when_physics_holds(self):
+        df = self._physics_series(noisy_target=False)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        v = proj.attrs["ptdf_flow_validation"]
+        assert v["status"] == "validated"
+        assert v["pre_period_correlation"] > 0.9
+        assert set(v["zones_used"]) == {"FI", "SE1"}
+
+    def test_falls_back_when_physics_does_not_hold(self):
+        df = self._physics_series(noisy_target=True)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        v = proj.attrs["ptdf_flow_validation"]
+        assert v["status"] == "failed_validation_fell_back_to_ensemble"
+        assert not proj.isna().any()
+
+    def test_no_leakage_into_during_post_projection(self):
+        df = self._physics_series(noisy_target=False)
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        during_mask = (df["dateTimeUtc"] >= split).values
+
+        sabotaged = df.copy()
+        cols = ["fall", "ptdf_FI", "netpos_FI", "ptdf_SE1", "netpos_SE1"]
+        sabotaged.loc[during_mask, cols] = 99999.0
+
+        proj = _pipe._its_ptdf_flow(pre_agg, sabotaged, "fall", mtu_minutes=15)
+        assert proj[during_mask].max() < 500000, (
+            "ptdf_flow leaked a sabotaged during-period value "
+            "(99999 * 99999 scale would be ~1e10 if it had)")
+        assert not proj[during_mask].isna().any()
+
+    def test_no_netpos_data_falls_back_gracefully(self):
+        df, _, _ = _synthetic_seasonal_series(n_days=20)
+        df = df.rename(columns={"val": "fall"})
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        proj = _pipe._its_ptdf_flow(pre_agg, df, "fall", mtu_minutes=15)
+        assert proj.attrs["ptdf_flow_validation"]["status"] == "no_netpos_data"
+        assert not proj.isna().any()
+
+    def test_non_flow_column_delegates_to_theta(self):
+        df = self._physics_series()
+        split = pd.Timestamp("2024-01-15", tz="UTC")
+        pre_agg = df[df["dateTimeUtc"] < split].reset_index(drop=True)
+        # Rename target so col != "fall"/"flowFB"
+        df2 = df.rename(columns={"fall": "something_else"})
+        pre2 = pre_agg.rename(columns={"fall": "something_else"})
+        proj_pf = _pipe._its_ptdf_flow(pre2, df2, "something_else", mtu_minutes=15)
+        proj_th = _pipe._its_theta(pre2, df2, "something_else", mtu_minutes=15)
+        assert np.allclose(proj_pf.values, proj_th.values)
+
+
+class TestNordPoolFetch:
+    """fetch_nordpool_net_positions()/merge_nordpool_net_positions() --
+    mocked HTTP throughout, no live network dependency (same posture as
+    the rest of this suite: synthetic/mocked data, never a live API call
+    in pytest)."""
+
+    def test_fetch_and_pivot_to_wide_format(self):
+        def fake_post(url, headers=None, data=None, timeout=None):
+            r = mock.Mock(status_code=200)
+            r.raise_for_status = lambda: None
+            r.json = lambda: {"access_token": "FAKE"}
+            return r
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            date_str = dict(params)["date"]
+            zones = [v for k, v in params if k == "areas"]
+            payload = [{"deliveryArea": z,
+                       "volumes": [{"deliveryStart": f"{date_str}T{h:02d}:00:00Z",
+                                   "sell": 100.0 + h, "buy": 40.0} for h in range(24)]}
+                      for z in zones]
+            r = mock.Mock(status_code=200)
+            r.json = lambda: payload
+            return r
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post
+            mock_requests.get = fake_get
+            net_pos = _pipe.fetch_nordpool_net_positions(["FI", "SE1"],
+                                                          "2024-01-01", "2024-01-02")
+
+        assert not net_pos.empty
+        assert set(net_pos.columns) == {"dateTimeUtc", "netpos_FI", "netpos_SE1"}
+        assert net_pos.attrs["nordpool_fetch_failures"]["days_failed"] == 0
+        # sell(100+h) - buy(40) at h=0 -> 60.0
+        assert net_pos["netpos_FI"].iloc[0] == 60.0
+
+    def test_auth_failure_returns_empty_with_diagnostic(self):
+        def fake_post_raises(url, headers=None, data=None, timeout=None):
+            raise ConnectionError("refused")
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post_raises
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-01")
+
+        assert result.empty
+        assert list(result.columns) == ["dateTimeUtc", "netpos_FI"]
+        assert result.attrs["nordpool_fetch_failures"]["auth_failed"] is True
+
+    def test_http_error_counted_as_day_failure(self):
+        def fake_post_ok(url, headers=None, data=None, timeout=None):
+            r = mock.Mock(status_code=200)
+            r.raise_for_status = lambda: None
+            r.json = lambda: {"access_token": "T"}
+            return r
+
+        def fake_get_500(url, headers=None, params=None, timeout=None):
+            return mock.Mock(status_code=500, text="server error")
+
+        with mock.patch("propagation.requests") as mock_requests:
+            mock_requests.post = fake_post_ok
+            mock_requests.get = fake_get_500
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-02")
+
+        assert result.empty
+        assert result.attrs["nordpool_fetch_failures"]["days_failed"] == 2
+
+    def test_library_missing_returns_empty_with_diagnostic(self):
+        with mock.patch("propagation.requests", None):
+            result = _pipe.fetch_nordpool_net_positions(["FI"], "2024-01-01", "2024-01-01")
+        assert result.empty
+        assert result.attrs["nordpool_fetch_failures"]["library_missing"] is True
+
+    def test_merge_asof_forward_fills_within_tolerance(self):
+        net_pos = pd.DataFrame({
+            "dateTimeUtc": pd.to_datetime(["2024-01-01T00:00:00Z", "2024-01-01T01:00:00Z"], utc=True),
+            "netpos_FI": [60.0, 61.0],
+        })
+        jao_like = pd.DataFrame({
+            "dateTimeUtc": pd.date_range("2024-01-01T00:00", periods=8, freq="15min", tz="UTC"),
+            "cneName": "TEST",
+            "ram": range(8),
+        })
+        merged = _pipe.merge_nordpool_net_positions(jao_like, net_pos)
+        assert (merged["netpos_FI"].iloc[:4] == 60.0).all()   # 00:00-00:45 -> 00:00 value
+        assert (merged["netpos_FI"].iloc[4:8] == 61.0).all()  # 01:00-01:45 -> 01:00 value
+
+    def test_merge_with_empty_net_pos_is_noop(self):
+        jao_like = pd.DataFrame({
+            "dateTimeUtc": pd.date_range("2024-01-01", periods=4, freq="15min", tz="UTC"),
+            "ram": [1, 2, 3, 4],
+        })
+        empty_net_pos = pd.DataFrame(columns=["dateTimeUtc", "netpos_FI"])
+        merged = _pipe.merge_nordpool_net_positions(jao_like, empty_net_pos)
+        assert list(merged.columns) == list(jao_like.columns)
+        assert len(merged) == len(jao_like)

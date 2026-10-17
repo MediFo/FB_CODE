@@ -1253,7 +1253,17 @@ class App:
             "stl":            "STL Decomposition        [min 7 days]",
             "arima":          "ARIMA on residuals       [min 14 days, rec. 30]",
             "sarima":         "SARIMA hourly [m=24]     [min 14 days, rec. 30–90]",
-            "all":            "All five  [run & compare side-by-side]",
+            "lightgbm":       "LightGBM (lag + calendar) [min 14 days, rec. 30+]",
+            "catboost":       "CatBoost (lag + calendar) [min 14 days, rec. 30+]",
+            "ridge":          "Ridge (lag + calendar)   [min 7 days]",
+            "structural":     "Structural TS / Kalman (daily+weekly) [min 14 days]",
+            "tbats":          "TBATS (daily+weekly)     [min 14 days]",
+            "theta":          "Theta method              [min 7 days]",
+            "hurdle":         "Hurdle (zero-inflated, shadow price) [min 2 days]",
+            "ram_identity":   "RAM Identity (physics-informed)   [min 7 days]",
+            "ptdf_flow":      "PTDF x Net Position (physics-informed) [min 7 days]",
+            "ensemble":       "Ensemble (adaptive, backtest-weighted) [min 2 days]",
+            "all":            "All fifteen  [run & compare side-by-side]",
         }
         _method_cb = ttk.Combobox(
             ctrl,
@@ -1278,7 +1288,7 @@ class App:
             cur_bl = int(self.baseline_days.get())
             if key == "all":
                 hint = (
-                    "Runs all five models and overlays their projected counterfactuals "
+                    "Runs every registered model and overlays their projected counterfactuals "
                     "on the ITS plot so you can compare them directly. "
                     "Summary metrics use Seasonal Naive as primary. "
                     "Tip: set baseline ≥30 days to get the best out of ARIMA and SARIMA.")
@@ -1580,6 +1590,18 @@ class App:
             "seasonal_naive": ("#e74c3c", "--"),
             "fourier_trend":  ("#2980b9", "-."),
             "stl":            ("#27ae60", ":"),
+            "arima":          ("#8e44ad", "-."),
+            "sarima":         ("#16a085", ":"),
+            "lightgbm":       ("#d35400", "--"),
+            "catboost":       ("#34495e", "-."),
+            "ridge":          ("#7f8c8d", ":"),
+            "structural":     ("#5b7fa6", "-."),
+            "tbats":          ("#a65b8e", ":"),
+            "theta":          ("#7fa65b", "--"),
+            "hurdle":         ("#c97b3c", "-."),
+            "ram_identity":   ("#3d7a6b", "-"),
+            "ptdf_flow":      ("#6b4c8c", "-"),
+            "ensemble":       ("#1a1a1a", "-"),
         }
 
         if not its.empty:
@@ -1600,7 +1622,7 @@ class App:
 
                 # Projected counterfactual(s)
                 if its_all and len(its_all) > 1:
-                    # "all" mode: overlay all three
+                    # "all" mode: overlay every registered ITS method
                     for mkey, mdf in its_all.items():
                         if mdf.empty: continue
                         msub = mdf[mdf.param == param].sort_values("dateTimeUtc")

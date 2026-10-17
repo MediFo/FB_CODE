@@ -31,10 +31,9 @@ branch (`fi-no3-app`) carries only this package, flattened to the repo
 root; it was split off from `claude/energy-model-audit-fafl07`, which still
 keeps this same code nested under a `file/` directory alongside an older,
 independent flat-file copy of the same project (the one this branch's own
-root-level files replaced). `Old/` in this listing predates both of those —
-it's an even earlier generation of the flat-file app, inherited as-is from
-before the fi_no3 package existed; it isn't part of this package and isn't
-touched by anything in this file.
+root-level files replaced). An even earlier generation of the flat-file
+app, inherited as-is from before the fi_no3 package existed under `Old/`,
+was removed in a repo cleanup — it wasn't part of this package.
 
 ## File layout (flat — all in the repo root, doubles as the `fi_no3` package)
 ```
@@ -46,10 +45,15 @@ app_jao_NP_API_fix_d14.py      — tkinter 9-tab GUI, adds JAO/Nord Pool fetch
                                   d07–d13, its superseded prior iterations,
                                   were removed (repo cleanup) — d14 was
                                   always the only one referenced by anything
-                                  else; `Old/` (see above) still keeps the
-                                  independent pre-fi_no3 generation of this
-                                  same GUI as historical reference.
+                                  else.
 propagation.py                 — analytical pipeline (no UI code)
+check_entsoe.py                — standalone ENTSO-E connectivity diagnostic
+                                  (DNS/TCP → TLS → raw HTTPS → entsoe-py, in
+                                  that order); run this first whenever an
+                                  ENTSO-E fetch returns 0 events and you
+                                  can't tell if that's genuine or a network/
+                                  firewall/proxy problem — it has no GUI/
+                                  pandas-stack dependency of its own
 synthetic.py                   — synthetic JAO + outage data generator for testing
 test_pipeline.py                — full test suite (pytest)
 run_analysis.py                — CLI entry point (also installed as the
@@ -57,6 +61,10 @@ run_analysis.py                — CLI entry point (also installed as the
 pyproject.toml                 — packaging: `pip install -e .` gives you
                                   `fi-no3-analyse` / `fi-no3-dash` console
                                   scripts
+requirements.txt                — plain dependency list (core + regression +
+                                  entsoe-py + pytest, mirrors pyproject.toml)
+                                  for `pip install -r requirements.txt`
+                                  without installing this package itself
 manual_outages.csv             — hand-curated outage events for any Nordic
                                   source country (edit this; bidding_zone
                                   column selects which country/zone a row
@@ -72,8 +80,13 @@ map.png, map2.png, Slide1w.PNG — reference images used by the GUIs
 # Editable install (one time) — also creates the fi-no3-analyse /
 # fi-no3-dash console scripts
 pip install -e .
-# or, without installing: pip install pandas numpy matplotlib requests jinja2 \
-#   statsmodels linearmodels entsoe-py
+# or, without installing: pip install -r requirements.txt
+# Either way, install into the SAME Python/venv you'll actually run the
+# scripts with -- a missing statsmodels/linearmodels/entsoe-py doesn't
+# crash the app, it silently degrades (empty regressions/DiD, "0 events"
+# fetches) with the real cause easy to miss; app_jao_NP_API_fix_d14.py
+# now surfaces these explicitly where they matter (see below) but
+# installing everything up front avoids hitting them one at a time.
 
 # Launch the main dashboard
 python dashboard.py
@@ -218,12 +231,527 @@ pytest test_pipeline.py -v
   UI shell only — its generate/export handlers show an honest "not
   implemented" message rather than silently doing nothing or fabricating
   output. Use the Analysis sub-tab or Tab 9 (Maintenance Analysis) instead.
+- ITS counterfactual models: `_ITS_METHODS` in propagation.py now has 13
+  entries — the original seasonal_naive/fourier_trend/stl/arima/sarima plus
+  "lightgbm"/"catboost" (gradient-boosted trees), "ridge" (closed-form
+  linear), "structural" (state-space Kalman filter), "tbats", "theta",
+  "hurdle" (zero-inflated, for shadow price), and "ensemble" (adaptive
+  blend of all the others) — see the three entries below this one for the
+  latter five. The three
+  lag-feature methods (lightgbm, catboost, ridge) share one
+  `_its_lag_model()` implementation for feature engineering + the
+  leak-avoidance recursive during/post projection — `_its_gbm(...,
+  backend=...)` and `_its_ridge()` each just supply a
+  `fit_predict(X_train, y_train) -> predict` closure to it. Features:
+  lag1d/lag2d/lag7d + their mean (a simplified Neighborhood Days Approach /
+  NDA) plus cyclical hour/weekday features. Rationale: lag features are
+  reported to consistently improve forecast accuracy across model families
+  (Ridge, XGBoost, CatBoost, LightGBM alike) more than model choice does —
+  it's the input representation, not model sophistication, doing most of
+  the work; NDA extends the classic lag24 feature to a small neighborhood
+  of nearby days, distinct from DSTA (day-of-same-type, e.g. previous
+  Mondays), which seasonal_naive/Fourier/STL already capture via
+  (hour, weekday) grouping. LightGBM/CatBoost handle the resulting
+  NaN-heavy lag columns (start of pre-period, gaps) natively; ridge instead
+  mean-imputes from TRAINING-set-only column statistics inside
+  `_ClosedFormRidge` (see the next entry for a bug this needed fixing).
+  Leak-avoidance: a naive lag feature (e.g. "value 24h ago") would read
+  real, potentially outage-contaminated data for any during/post timestamp
+  whose lag source falls inside the during/post window itself — exactly
+  what the "fit on pre-period only" rule at the top of propagation.py's ITS
+  section exists to prevent. `_its_lag_model()` avoids this by projecting
+  the during/post window RECURSIVELY: predictions are made in chronological
+  order and each one is immediately fed back in as the lag source for later
+  steps, the same discipline `_its_arima`/`_its_sarima` already follow via
+  `.forecast()` never touching real future data. Pre-period rows are still
+  batch-predicted from real pre-period lags (no recursion needed there).
+  Verified with a synthetic-data test that sabotages the actual during/post
+  values to an outlier and confirms the projection neither reproduces it
+  nor tracks it — see `TestLagFeatureItsMethods`/`TestEnsembleItsMethod` in
+  test_pipeline.py. LightGBM/CatBoost fall back to ARIMA if their library
+  isn't installed (`lightgbm`/`catboost`/`scikit-learn`, all optional — see
+  requirements.txt/pyproject.toml's `gbm` extra); all three lag-feature
+  methods fall back to seasonal_naive if the pre-period is too short to fit
+  (same `< 2*T_day` guard as STL). `ITS_METHOD_NAMES`/`_ITS_METHODS` being a
+  plain dict/list is why both dashboard.py's and
+  app_jao_NP_API_fix_d14.py's Single Event ITS-method dropdowns picked
+  these up with zero other GUI code changes — only their
+  `_method_labels`/`_method_colors` dicts (cosmetic: friendly display name,
+  distinct plot color for "all" mode's overlay) needed new entries.
+  "ensemble" (`_its_ensemble()`) backtests every OTHER method on a held-out
+  slice of the pre-period ITSELF (`_ensemble_backtest_weights()` — never
+  during/post data, so this can't introduce a leak either), drops any that
+  backtest more than 2x worse than the best one, and blends the survivors'
+  real full-pre-period projections weighted ∝ 1/backtest-MAE — "adaptive"
+  and "exclude bad models" per the user request this was built for. Below
+  14 days of pre-period (too short for a reliable backtest split) it falls
+  back to an unweighted per-timestamp MEDIAN of every member instead of a
+  MEAN: a mean was tried first and measured far worse in development (MAE
+  ~14.8 vs the best individual member's ~1.7) because a single badly-wrong
+  member (fourier_trend/STL both derail on a pre-period level shift) drags
+  a mean toward it; the median can't be moved past the next-most-central
+  projection by one outlier. By far the slowest method (most members,
+  SARIMA included, get fit roughly twice — once for backtest weighting,
+  once for the real projection).
+- `scikit-learn` is a REQUIRED companion package for the "lightgbm" ITS
+  method, not merely a nice-to-have: `import lightgbm` succeeds without it,
+  but `LGBMRegressor(...)` (the sklearn wrapper `_its_gbm()` uses) raises a
+  non-`ImportError` `LightGBMError` — "scikit-learn is required for
+  lightgbm.sklearn..." — the first time it's constructed. That exception
+  type slipped past `_its_gbm()`'s original `except ImportError` guard
+  and was only caught by a broader `except Exception` guard downstream,
+  which silently fell back all the way to seasonal_naive (discarding the
+  lag-feature engineering entirely) instead of the documented ARIMA
+  fallback — the same failure mode this file's SE-fallback entry above
+  warns about in the regression code, just for a dependency instead of a
+  clustering mode. Fixed by constructing (not fitting) the regressor
+  immediately after import, inside the same `except Exception` (not
+  `except ImportError`) block, so a missing scikit-learn now fails fast
+  into the intended ARIMA fallback. `TestLagFeatureItsMethods
+  ::test_lightgbm_regressor_actually_constructs` in test_pipeline.py
+  guards against this regressing again, and the leak test now also asserts
+  each lag-feature method's projection isn't bit-identical to
+  seasonal_naive's (a silent fallback would otherwise still pass every
+  other check in that test, since seasonal_naive is trivially leak-proof
+  and could look like a "working, non-leaking" result). `catboost` never
+  needed sklearn, so it was unaffected — this only ever silently degraded
+  "lightgbm".
+- `_ClosedFormRidge` (propagation.py, backs the "ridge" ITS method) must
+  guard against a feature column that is NaN in EVERY training row — lag7d
+  whenever the pre-period is under 7 days, since it can then never have a
+  single real value. `np.nanmean` on an all-NaN column returns NaN (plus a
+  "Mean of empty slice" RuntimeWarning), and using that NaN as the
+  imputation fill value silently NaN-poisons every prediction from that
+  point on, with nothing raising to catch it — found live while backtesting
+  the "ensemble" method on a 6-day pre-period: ridge's all-NaN lag7d column
+  poisoned its own projection with NaN, which then NaN-poisoned
+  `_its_ensemble()`'s per-timestamp median for EVERY method, not just
+  ridge, since `np.median` propagates a single NaN through the whole
+  timestamp. Fixed by replacing any NaN entries in the computed column-mean
+  vector with 0.0 before imputing — an all-NaN column becomes a constant-0
+  column, which the ridge normal equations then always fit a coefficient of
+  exactly 0 for (equivalent to dropping the feature), rather than a special
+  case anywhere else in the class. `TestLagFeatureItsMethods
+  ::test_ridge_handles_all_nan_feature_column` guards against this
+  regressing again.
+- Three more ITS methods target a gap none of the first nine cover:
+  SARIMA above only models ONE seasonal period (m=24, hourly) and bolts
+  the weekly pattern on afterward via a separate within-hour-deviation
+  lookup — it never lets the weekly cycle inform the trend/level estimate
+  itself. "structural" (statsmodels `UnobservedComponents`, state-space/
+  Kalman filter) and "tbats" (the `tbats` package) both instead model
+  daily AND weekly seasonality JOINTLY in one coherent model — structural
+  via harmonics inside a general state-space model (no new dependency,
+  statsmodels already required), tbats via a model purpose-built for
+  exactly this multi-seasonal-period shape (Box-Cox + trend + ARMA errors
+  + multiple seasonal components; optional dependency, falls back to
+  "structural" if not installed — pure numpy/scipy, no compiled toolchain,
+  unlike Prophet, which was considered and rejected earlier in this same
+  session for exactly that reason). Both fit on hourly-aggregated data and
+  expand back to MTU resolution via a shared `_expand_hourly_forecast_to_mtu()`
+  helper — the same within-hour-deviation technique `_its_sarima()` already
+  used, factored out so "structural"/"tbats" don't duplicate it, though
+  `_its_sarima()` itself was left with its own original inline copy
+  untouched to avoid any regression risk to that already-shipped, tested
+  method. The weekly seasonal component/period is only added once there's
+  ≥336h (2 full weekly cycles) of pre-period; shorter pre-periods get
+  daily seasonality only. TBATS' own automatic Box-Cox/damped-trend/ARMA
+  model-selection search is deliberately disabled (all fixed explicitly)
+  since that search is expensive and SARIMA's AIC grid search here is
+  already the slowest single method — letting TBATS run its full default
+  search on top would make it slower still for a GUI a person is waiting
+  on. Fallback chain: tbats → structural → sarima → arima → fourier_trend
+  → seasonal_naive. "theta" (statsmodels `ThetaModel`, a top performer in
+  the M3/M4 forecasting competitions) instead targets the opposite
+  problem — mirrors `_its_arima()`'s own "deseasonalize via seasonal_naive,
+  then model the residual" structure exactly, swapping in the Theta method
+  for ARIMA, specifically because Theta is known for punching above its
+  weight on SHORT series, the regime where ARIMA/SARIMA's order search and
+  the lag-feature methods' need for weeks of lag7d examples both struggle
+  (see "Backtested accuracy" below) — `min_days` is 7, the lowest of any
+  non-seasonal_naive method. All three were requested together in response
+  to "what more time series models [could we add]" after the lag-feature
+  methods above, and their leak-safety is verified the same way as every
+  other method here — see `TestTimeSeriesItsMethods` in test_pipeline.py.
+- "hurdle" is a two-part zero-inflated model, added specifically because
+  shadow price is NOT a continuous quantity the way fall/PTDF/RAM are: it
+  is exactly 0 on a non-binding CNEC and only positive when binding, so
+  every other ITS method here — all of which implicitly fit something
+  continuous and roughly Gaussian-shaped — risks projecting a smooth
+  trend/seasonal value onto a small positive baseline the real quantity
+  structurally cannot take except when actually binding. `_its_hurdle()`
+  instead estimates two (hour, weekday) tables from the pre-period —
+  P(binding) and E[value | binding] — and projects their product; same
+  zero-estimation-variance philosophy and leak-safety story as
+  seasonal_naive (a deterministic pre-period-only lookup, no lag features,
+  no recursion). Works on any column with a real point mass at zero, and
+  degrades harmlessly to plain seasonal_naive on a genuinely continuous
+  column (P(binding) saturates near 1) — verified by
+  `TestHurdleItsMethod::test_degrades_to_seasonal_mean_on_non_zero_inflated_column`.
+  This is a per-outage counterfactual choice a user makes by picking
+  "hurdle" in the ITS-method dropdown for a shadow-price single-event
+  analysis — nothing auto-detects zero-inflation and switches methods for
+  you.
+- Hyperparameter tuning + a smarter adaptive ensemble (added after a user
+  reported the ensemble's edge over its own best single member was
+  smaller than expected): investigating WHY surfaced that `arima`,
+  `hurdle`, and `seasonal_naive` were producing bit-for-bit IDENTICAL
+  predictions on several backtest runs — all three legitimately collapse
+  to the same seasonal-mean answer when there's no extra signal to model
+  (ARIMA's residual order search picking (0,0,0); hurdle's P(binding)
+  saturating near 1). That meant the ensemble's "12 members" had real
+  diversity closer to 9-10 — a coincidental multi-way tie was getting
+  counted 3x, diluting genuinely different members rather than adding
+  robustness. Combined with lightgbm/catboost/ridge each using ONE fixed,
+  never-tuned hyperparameter configuration, there wasn't much room for
+  the "adaptive" part to do more than it was.
+  Fixed both:
+    1. LightGBM/CatBoost/ridge now each tune a small hyperparameter grid
+       (depth/learning_rate/n_estimators for the GBMs, L2 alpha for
+       ridge) via `_tune_lag_hyperparams()`, graded on a held-out slice of
+       the pre-period itself (`_carve_pre_period_holdout()`) — same
+       leak-safety story as fitting itself, since the split never touches
+       during/post data. Below 14 days of pre-period this is a no-op:
+       candidates[0] (the original fixed config) is used unchanged, so
+       tuning can only match or beat the pre-tuning baseline, never do
+       worse by picking something untested on too little data.
+    2. `_ensemble_backtest_weights()` now: (a) grades members on up to 2
+       ROLLING-ORIGIN backtest windows (`_carve_rolling_origin_splits()`,
+       activates once there's ~28+ days of pre-period) instead of one,
+       averaging each member's MAE across windows for a less noisy
+       estimate; (b) DE-DUPLICATES members whose backtest predictions
+       come out numerically identical (`np.allclose` on the holdout-slice
+       predictions, not just equal MAE — genuinely different methods can
+       tie on MAE by coincidence without producing the same predictions),
+       keeping only the lowest-MAE representative of each cluster before
+       the exclude/weight steps run; (c) weights survivors ∝
+       1/backtest-MAE² instead of 1/backtest-MAE — plain inverse-error
+       weighting measured too flat (a member that backtested twice as
+       accurately as another got only ~2x the say, not enough to move the
+       blend much away from a near-uniform average); squaring makes that
+       ratio ~4x, letting a clearly-better member actually dominate.
+       `quality_ratio` (the exclusion cutoff) was also tightened from 2.0x
+       to 1.5x the best member's MAE, and `min_survivors` lowered from 3
+       to 2, since de-duplication already shrinks the candidate pool to
+       genuinely distinct members.
+  Runtime cost compounds: rolling-origin backtesting fits most members up
+  to 2 extra times each, and lightgbm/catboost/ridge now tune internally
+  on every one of those fits too — the ensemble method went from "budget
+  double an 'all' mode run" to "budget noticeably more than that." See
+  `TestEnsembleItsMethod`/`TestLagFeatureItsMethods` in test_pipeline.py
+  for the regression tests (dedup keeps at most one of
+  seasonal_naive/arima/hurdle, rolling-origin split counts at various
+  pre-period lengths, tuning picks a deliberately-better candidate over a
+  deliberately-bad one, all still leak-safe with no NaN).
+  Because of that runtime cost, tuning is a module-level on/off switch —
+  `propagation.ITS_TUNE_HYPERPARAMS` (default `True`). Set it to `False`
+  before calling into `single_event_analysis()`/`run_pipeline()` (from a
+  future GUI checkbox, a CLI flag, or a test) to skip
+  `_tune_lag_hyperparams()` entirely and use each of the three methods'
+  original fixed configuration instead — confirmed ~6x faster for ridge
+  alone (2.27s → 0.38s on a 30-day pre-period) and cuts "ensemble" from
+  ~113-133s down to ~70s on the same data (the remainder is SARIMA/TBATS'
+  own model-selection cost, unaffected by this toggle). It's a plain
+  module attribute rather than a parameter threaded through
+  `_build_its_for_col()`/`single_event_analysis()`/
+  `_ensemble_backtest_weights()` deliberately: those all dispatch to any
+  of the 13 methods through one shared, fixed call signature
+  `(pre_agg, all_agg, col, mtu_minutes=...)`, and only 3 of the 13
+  methods have anything to tune — a toggle only the tuning-aware methods
+  read keeps that dispatch contract untouched, and means ensemble calls
+  respect it automatically with zero extra plumbing (`_its_ensemble()`
+  calls `_its_gbm()`/`_its_ridge()` the same way regardless). Read fresh
+  on every call, not cached, so flipping it takes effect immediately.
+  Not yet wired to a GUI checkbox or CLI flag in dashboard.py/
+  app_jao_NP_API_fix_d14.py/run_analysis.py — currently code-only.
+- Two PHYSICS-INFORMED ITS methods (`_ITS_METHODS` now has 15 entries):
+  requested explicitly as "physics-informed AI" — the idea being that some
+  of this pipeline's target columns aren't independent physical quantities
+  at all, they're derived from other columns already in the data by a
+  known formula, so a model that respects that formula by CONSTRUCTION
+  should beat one that has to rediscover it statistically.
+    - `"ram_identity"` — RAM is not independently observed here, it's the
+      accounting identity RAM = Fmax − FRM − fall + fnrao + AMR − FAAC − IVA
+      (the exact formula build_covariates()'s `ram_check` already verifies
+      balances within 1 MW on ~100% of real rows, and decompose_delta_ram()
+      already uses for its own before/after attribution — this method is
+      the missing COUNTERFACTUAL-FORECASTING use of that same identity, not
+      a new formula). `_its_ram_identity()` forecasts each of the 7 terms
+      with the sub-method suited to ITS OWN dynamics
+      (`_RAM_COMPONENT_METHOD`: seasonal_naive for fmax/frm — both
+      structural, and frm is literally the H6 placebo's null hypothesis;
+      theta for fnrao/amr/faac; catboost for fall, the term outages
+      actually move (H1's own dependent variable); hurdle for iva, which
+      is zero-inflated/TSO-discretionary and documented as nonzero mainly
+      during forced outages) and COMPUTES RAM from them — the projected
+      Series literally equals Σ(sign × projected component), verified to
+      floating-point precision by
+      `TestRamIdentityItsMethod::test_projection_satisfies_identity_exactly`,
+      not just "close." Falls back to `_its_theta()` for any column other
+      than "ram" (nothing to decompose for a different target), and to
+      `_its_ensemble()` for "ram" itself if any of the 7 raw component
+      columns is missing — computing RAM from an incomplete subset would
+      silently produce a different, WRONG quantity, the exact AMR/IVA-
+      dropping mistake this formula's own history above already warns
+      about, not a merely-degraded RAM. Attaches a `ram_identity_check`
+      diagnostic to the returned Series' `.attrs` (pre-period formula-
+      balance %) so the projection's own footing can be checked, not
+      just trusted on faith.
+    - `"ptdf_flow"` — reconstructs flow-type columns ("fall"/"flowFB") as
+      Σ_zone PTDF_zone,CNEC,t × NetPosition_zone,t, the DC/PTDF-based flow
+      decomposition Nordic FBMC is actually built on. UNLIKE ram_identity,
+      this is explicitly NOT presented as a proven identity in this repo:
+      "fall" (F_allReference) is a REFERENCE-case flow from the D-2 common
+      grid model, not necessarily numerically identical to
+      Σ PTDF × REALIZED net position, so overclaiming it as exact would be
+      dishonest modeling. `_its_ptdf_flow()` instead VALIDATES itself —
+      computes the same Σ PTDF_actual × NetPosition_actual against the
+      ACTUAL observed target on pre-period rows, and only trusts the
+      reconstruction if the correlation clears `min_validation_corr`
+      (default 0.5), falling back to `_its_ensemble()` otherwise. The
+      validation outcome (status/correlation/zones used) is ALWAYS
+      attached to `.attrs["ptdf_flow_validation"]`, whichever path was
+      taken — verified both ways by
+      `TestPtdfFlowItsMethod::test_validates_and_reconstructs_when_physics_holds`
+      / `::test_falls_back_when_physics_does_not_hold`. Each zone's PTDF
+      and net position get their OWN counterfactual, but not the same
+      method for both — PTDF uses seasonal_naive (near-constant per CNEC
+      by construction; also deliberately what "removes" an AC-outage's
+      topology shift, per H2's own logic), net position uses ridge (a
+      later backtest showed seasonal_naive is never the best choice for
+      it once it carries real day-level structure — see "ptdf_flow's own
+      fix, ROUND 3" further down) — before combining. OPT-IN: requires
+      `netpos_<ZONE>` columns already merged into the data (see below)
+      alongside the `ptdf_<ZONE>` columns JAO already provides.
+      synthetic.py's generator now writes these out itself (also added in
+      ROUND 3, further down) so this no longer always degrades to
+      ensemble on synthetic/test data — but on REAL JAO data, out of the
+      box nothing has run that merge yet, so this still gracefully
+      degrades to ensemble there until `fetch_nordpool_net_positions()` +
+      `merge_nordpool_net_positions()` (below) are actually wired into a
+      real-data caller, the same posture lightgbm/catboost/tbats already
+      use for a missing library, just for a missing data source instead.
+    - Both are explicitly EXCLUDED from `_its_ensemble()`'s own member
+      pool (`members = [m for m in _ITS_METHODS if m not in ("ensemble",
+      "ram_identity", "ptdf_flow")]`) — not merely from habit. Both
+      methods fall back to `_its_ensemble()` when their physics doesn't
+      apply; if either were also listed as one of ensemble's own
+      candidates, that fallback call would recurse straight back into
+      ensemble's member-evaluation loop, which would try to evaluate them
+      again, triggering the same fallback again — unbounded recursion the
+      moment either one's fallback condition is met, not a hypothetical
+      edge case (missing component columns / no netpos data are both the
+      DEFAULT state for any caller that hasn't specifically set them up).
+      Guarded by `TestEnsembleItsMethod
+      ::test_excludes_ram_identity_and_ptdf_flow_from_its_own_members`.
+    - New propagation.py capability this needed:
+      `fetch_nordpool_net_positions(zones, start_date, end_date)` (Nord
+      Pool day-ahead Auction Volumes endpoint, sell − buy per zone/MTU —
+      one request per day covering every zone via repeated `areas` params,
+      not one request per zone) and `merge_nordpool_net_positions(no3_df,
+      net_pos_df)` (a vectorized `pd.merge_asof` "nearest earlier, bounded
+      by `max_gap_minutes`" join onto JAO's 15-min grid). This is genuinely
+      NEW plumbing, not a refactor: before this, Nord Pool net-position
+      data only ever reached a single GUI tab's live chart
+      (app_jao_NP_API_fix_d14.py's Tab 7, `_tab7_done`) — fetched fresh
+      per click, held in local Python variables, never persisted or joined
+      into anything propagation.py's analytical functions could see.
+      `NORDPOOL_USER`/`NORDPOOL_PASSWORD`/`NP_TOKEN_URL`/`NP_VOL_URL` are
+      DELIBERATELY DUPLICATED from the GUI file's own copies (same
+      "independent copy, not shared" reasoning as the JAO timestamp-zone
+      toggle above) rather than importing them, to avoid any risk of
+      touching the GUI's own already-working Tab 5-8 fetch code for this.
+      Same known, out-of-scope credential-hardcoding limitation already
+      documented below for ENTSOE_TOKEN. Tested entirely with mocked HTTP
+      (`unittest.mock.patch("propagation.requests")`, matching this
+      suite's existing "no live network calls in pytest" posture) — see
+      `TestNordPoolFetch`, covering the happy path, auth failure, HTTP
+      errors, a missing `requests` library, and the merge_asof gap-
+      tolerance behavior.
+    - Both new methods need pre_agg/all_agg to carry columns beyond just
+      the one being forecast (ram_identity needs all 7 RAM terms;
+      ptdf_flow needs ptdf_*/netpos_* pairs) — a real change from every
+      other ITS method's "only ever reads `col`/hour/dow" contract.
+      `single_event_analysis()`'s `_run_its_for_method()` closure now
+      widens `pre_agg`/`all_agg` to carry `_RAM_IDENTITY_TERMS` columns
+      and any `ptdf_*`/`netpos_*` columns present in the source data
+      alongside `col`, for EVERY method's call, not just these two — safe
+      for the other 13 methods since they've always ignored any column
+      beyond `col`/hour/dow, so this is purely additive from their point
+      of view. A caller building pre_agg/all_agg outside
+      single_event_analysis() must do the same widening itself for these
+      two methods to have anything to work with.
+    - ACCURACY REALITY CHECK, ROUND 1 (superseded by ROUND 2 below — kept
+      for the record since it's what drove the fix): the first backtest of
+      these methods found neither physics-informed method clearly beat a
+      plain black-box forecast of the same target. ram_identity vs
+      seasonal_naive-on-"ram": 21.8 vs 19.6 MAE at 30 days, 14.9 vs 14.3 at
+      60 days, 20.5 vs 20.9 at 90 days — a wash. Root cause, diagnosed by
+      reading synthetic.py's `generate_jao_csv()`: of the 7 RAM-identity
+      terms, only `fall` carried real predictable structure (diurnal +
+      weekly); `fmax`/`frm` were near-constant and `fnrao`/`amr`/`faac`/
+      `iva` were close to i.i.d. noise or rare unclustered spikes — nothing
+      for a decomposition to exploit that a direct forecast of "ram"
+      couldn't already get from the aggregate's own hour/dow pattern, so
+      splitting into 7 independently-fit sub-series just accumulated 7
+      sub-fits' worth of estimation error for no offsetting benefit. This
+      was a property of the TEST DATA, not a flaw in the decomposition
+      itself — see ROUND 2.
+    - ACCURACY REALITY CHECK, ROUND 2 (current): fixed by (1) giving
+      fnrao/amr/faac/iva genuine day-level persistence in synthetic.py (an
+      AR(1) "regime" component, mean-reverting, one value per calendar
+      day, broadcast to MTU resolution via `_ar1_day_regime()` — distinct
+      from the hour/dow pattern seasonal_naive/theta already see, since a
+      specific day's regime level is invisible to any method that only
+      conditions on (hour, weekday)), so there's now real signal for a
+      decomposition to actually exploit; and (2) re-picking
+      `_RAM_COMPONENT_METHOD` from an actual per-component backtest rather
+      than domain-story reasoning alone — this caught two real mistakes:
+      theta was ~2x worse than seasonal_naive on fnrao and consistently
+      worse than hurdle on the zero-inflated amr, and seasonal_naive
+      catastrophically mis-forecast frm (MAE 42.8 vs ridge's 2.2 at a
+      60-day pre-period) whenever the pre-period straddles the Dec-2024
+      structural step, because its (hour, dow) lookup table averages pre-
+      and post-step values into one contaminated mean while ridge's
+      lag1d/lag7d features track the current level instead (see
+      `_RAM_COMPONENT_METHOD`'s own comment in propagation.py for the full
+      per-component numbers). With both fixes, ram_identity vs
+      seasonal_naive/catboost-on-"ram" directly (single NO3 CNEC, 3
+      staggered pre-period start offsets averaged per length): at 30 days,
+      roughly tied (28.1 vs 28.4 seasonal_naive vs 28.0 catboost); at 60
+      days, ram_identity clearly wins (42.5 vs catboost 48.4 vs
+      seasonal_naive 53.6); at 90 days, ram_identity wins by a wide margin
+      (26.9 vs catboost 36.1 vs seasonal_naive 50.8) — the longer
+      pre-period lets both the day-regime signal accumulate and lets
+      ridge's frm fix matter more (more chances for the fit window to
+      straddle the Dec-2024 step). CONCLUSION (revised): on data where the
+      RAM identity's components actually carry genuine, exploitable
+      structure — which any real grid plausibly does, given real
+      operational/regulatory quantities aren't i.i.d. noise — the
+      decomposition is a genuine accuracy win at pre-periods of ~60+ days,
+      not merely an interpretability/consistency tool as ROUND 1
+      concluded. Still worth re-verifying against real JAO data once
+      available rather than assuming the synthetic result transfers
+      exactly, but this is no longer a "wash, so treat it as
+      interpretability-only" finding.
+    - ptdf_flow's own fix, ROUND 3 (came after the two rounds above, once
+      asked to keep improving): closed its own separate gap the same way,
+      in four steps, each verified against the full pytest suite before
+      moving to the next:
+        1. Gave it real physics to reconstruct at all: synthetic.py never
+           wrote `netpos_<ZONE>` columns (only an internal, never-exported
+           `net_position_cgma`), 'fall' had zero dependency on net
+           position, and `ptdf_NO4`/`SE1`/`SE2`/`SE3` were redrawn from
+           scratch on every single row (no persistent per-CNEC value,
+           unlike a real PTDF or `ptdf_FI`/`ptdf_NO3`, which already had a
+           base + small-noise shape). Added `netpos_<ZONE>` columns (FI,
+           NO3, NO4, SE1, SE2, SE3) with a diurnal + weekly + day-regime
+           pattern (same `_ar1_day_regime()` used for the RAM terms),
+           fixed the other four PTDFs to the same base + noise shape, and
+           added an unscaled Σ PTDF_base × NetPosition term into 'fall'.
+           Reconstruction correlation on real pre-period data: ~0.76 —
+           comfortably clears `_its_ptdf_flow()`'s own
+           `min_validation_corr=0.5` gate, so it stopped always falling
+           back to ensemble.
+        2. Re-picked its own per-column sub-methods from a backtest the
+           same way `_RAM_COMPONENT_METHOD` was: net position gets ridge
+           now, not seasonal_naive (seasonal_naive was never the best
+           candidate once netpos carried real day-regime structure, ~13%
+           worse than ridge at a 30-day pre-period); PTDF stays
+           seasonal_naive (near-constant per CNEC by construction, every
+           candidate ties within noise).
+        3. First full accuracy check after (1)+(2) was a regression, not a
+           win: MAE ~44 vs catboost's ~26 on "fall" directly — WORSE than
+           before either fix. Diagnosed why: 'fall' carried a per-CNEC
+           constant bias (`rng.uniform(-30, 30)`, no physical
+           explanation) that `_its_ptdf_flow()`'s reconstruction can
+           never correct for by design (it only ever looks at
+           `netpos_<ZONE>`, never 'fall' itself), while a direct forecast
+           trivially absorbs any constant level through its own hour/dow
+           mean. Folded that same draw into `netpos_NO3`'s own per-CNEC
+           mean level instead (NO3 has the largest, safely-away-from-zero
+           PTDF magnitude of the six zones) — only closed part of the gap
+           (MAE ~44 → ~41), confirming a bias wasn't the main story.
+        4. The real dominant blind spot: 'fall' also carried its own
+           independent diurnal/weekly term (amplitude 50 / −30), generated
+           SEPARATELY from net position — structurally invisible to the
+           reconstruction (which never sees 'fall'), but trivially visible
+           to a direct forecast (seasonal_naive/catboost don't care how
+           'fall' was internally composed, they just fit its observed
+           values). Fixed by moving most of that pattern into the
+           netpos-mediated channel: shrunk the shared diurnal/weekly
+           arrays 'fall' adds directly (50→12, −30→−8, now representing
+           genuine LOCAL structure not mediated by net position) and
+           boosted each `netpos_<ZONE>`'s own diurnal/weekly amplitude
+           proportionally (40→70, −15→−35) so the combined pattern
+           reaching 'fall' is roughly unchanged in total magnitude — this
+           changes NOTHING about 'fall' as a direct-forecast target
+           (seasonal_naive/catboost see the identical final fall values
+           either way), only whether the physics-based reconstruction can
+           also see that structure. Netpos-mediated reconstruction now
+           explains ~55-67% of fall's std (up from ~28-31%).
+      RESULT: ptdf_flow vs catboost/seasonal_naive-on-"fall" directly (same
+      single-CNEC, 3-staggered-offset methodology as ram_identity's
+      re-check): 28.4 vs 26.6 vs 27.9 MAE at 20 days, 26.0 vs 26.0 vs 25.7
+      at 40 days (ptdf_flow and catboost essentially identical), 26.1 vs
+      25.3 vs 25.7 at 60 days — roughly TIED with the best generic method
+      at every pre-period tested, a dramatic improvement from the pre-fix
+      44 vs 26 gap (and from ROUND 1/2's more modest 7.5-vs-7.5 tie, which
+      was on a synthetic 'fall' with much less overall variance to begin
+      with). CONCLUSION: unlike ram_identity, this didn't produce an
+      outright accuracy WIN at longer pre-periods — it produced genuine
+      parity, which is the honest, non-cherry-picked result of these
+      fixes, not a target that was tuned toward. Chasing a further edge
+      here (e.g. reducing 'fall's remaining direct noise/effect terms
+      further) risks overfitting the synthetic generator to a specific
+      benchmark outcome rather than reflecting real Nordic FBMC dynamics,
+      so this was intentionally left here. ptdf_flow's real edge stays
+      what ROUND 1/2 already said: self-validation (it reports its own
+      pre-period correlation and never silently trusts an unproven
+      relationship) rather than a demonstrated MAE advantage — though it
+      no longer trails a direct forecast by a wide margin either, which
+      matters for any use where its interpretability (explaining fall via
+      actual zone net positions) is valuable in its own right.
+- Backtested accuracy (synthetic data, no real JAO/ENTSO-E history
+  available in this repo): with a two-timescale synthetic series — MTU-to-
+  MTU AR(1) noise plus a slower per-DAY AR(1) "regime" component shared by
+  every MTU within a day (the kind of day-to-day persistence lag1d/lag7d
+  are meant to exploit, and that seasonal_naive/Fourier/STL structurally
+  cannot see since they only know hour-of-day/day-of-week, not which
+  specific day it is) — a pre-period-only backtest (fit on N pre-days,
+  project into a held-out continuation, compare against its known true
+  values) across pre-period lengths {14, 30} × holdout lengths {3, 7} days
+  ranked (after fixing the two bugs above — an earlier run of this same
+  backtest, before those fixes, had silently graded "lightgbm" as
+  identical to seasonal_naive/ARIMA the whole time): SARIMA best (lowest
+  MAE) but ~10-20x slower than the others (~10-25s per fit vs <2s);
+  CatBoost, LightGBM and ridge next, beating plain ARIMA/seasonal_naive by
+  roughly a third at 30 days pre-period but giving little-to-no
+  improvement at only 14 days (lag7d only sees ~1-2 weeks of examples then
+  — too little to separate real day-to-day persistence from noise, tree
+  ensembles or ridge alike); the "ensemble" method's adaptive backtest
+  weighting reliably excluded fourier_trend/STL and matched or slightly
+  beat the single best member across every configuration tested, at
+  roughly double the runtime cost. Fourier+trend and STL were clearly
+  worst on this generative process (STL's linear trend extrapolation and
+  Fourier's global trend term both got misled by the day-level regime
+  shocks) — exactly the failure mode "ensemble" was built to route around.
+  Rank is data-generating-process-dependent, not a universal verdict — the
+  qualitative takeaway that matters here is "GBM/ridge need ≥~30 days of
+  pre-period to earn their keep over seasonal_naive, ensemble adapts to
+  whichever wins without needing that judgment call made in advance" is a
+  good sanity check to apply to new results, but don't treat the specific
+  MAE numbers as calibrated against real Nordic flow data.
 
 ## Known limitations
 - ENTSO-E API returning 403 from cloud/server IPs is environment-dependent,
   not universal — a live call succeeded from this Claude Code sandbox's
   outbound proxy. Don't assume either outcome; test from wherever you're
-  actually deploying.
+  actually deploying — run `python check_entsoe.py` there to check layer
+  by layer (DNS/TCP, TLS, raw HTTP, entsoe-py) rather than guessing from
+  the app's "0 events" alone, which looks identical whether every query
+  failed or the window genuinely had none (see fetch_entsoe_outages()'s
+  entsoe_fetch_failures DataFrame.attrs, added to disambiguate the two).
 - ENTSO-E A77 returns "File is not a zip file" when no FI production outages exist in window
 - IVA is zero on NO3 CNECs in short windows; H5 logit needs longer history
 - FRM in synthetic data moves with outages (December 2024 regime change is encoded)
