@@ -2066,6 +2066,56 @@ class App:
         self._brfg_text.pack(fill=tk.BOTH, expand=True)
         self._update_briefing_placeholder()
 
+    @staticmethod
+    def _briefing_methodology_text():
+        """Plain-language explanation of the theory/formula behind every
+        figure this sub-tab shows -- grounded exactly in what Tab 2a's
+        own _run_analysis computes (impact = sp * (pf - pt)), not a
+        separate or idealized model. Shown both before any analysis has
+        run (so the theory doesn't depend on having data loaded) and
+        appended after the generated narrative (as a standing reference
+        for what the numbers above mean and why)."""
+        return (
+            "How this is calculated\n"
+            "-----------------------\n"
+            "Each row is one CNEC (Critical Network Element with "
+            "Contingency) from the JAO flow-based market-coupling "
+            "publication, evaluated for one corridor (Zone From → Zone "
+            "To) at one market time unit (MTU).\n\n"
+            "• Shadow price (€/MWh) -- what JAO's capacity calculation "
+            "says this CNEC is worth, per MW of extra capacity. It is "
+            "exactly 0 when the CNEC is NOT the binding constraint this "
+            "MTU, and only becomes positive once it starts limiting how "
+            "much can be traded across the flow-based domain. That's why "
+            "\"shadow price > 0\" is this briefing's own definition of a "
+            "CNEC being \"active\"/binding, and why a shadow price of 0 "
+            "always contributes 0 price impact below, regardless of its "
+            "PTDF.\n\n"
+            "• PTDF (Power Transfer Distribution Factor) -- how much this "
+            "CNEC's own flow changes for every 1 MW shifted between two "
+            "zones' net positions. ptdf_From and ptdf_To are this CNEC's "
+            "sensitivity to the two zones in the chosen corridor; "
+            "ΔPTDF = ptdf_From − ptdf_To is its net sensitivity to moving "
+            "power along that exact corridor (From → To).\n\n"
+            "• Price impact formula:\n"
+            "      price_impact = shadowPrice × (ptdf_From − ptdf_To)\n"
+            "  This is the CNEC's own contribution to the price "
+            "difference between Zone From and Zone To. A CNEC only moves "
+            "the corridor's price spread if it's BOTH binding (shadow "
+            "price > 0) AND sensitive to this specific corridor (|ΔPTDF| "
+            "large) -- a non-binding CNEC contributes nothing no matter "
+            "how sensitive it is, and a binding CNEC that barely touches "
+            "this corridor (ΔPTDF ≈ 0) contributes little even though "
+            "it's expensive to violate.\n\n"
+            "• Total price impact = the sum of price_impact over every "
+            "CNEC evaluated -- the corridor's total JAO-implied "
+            "price-spread contribution from binding constraints this "
+            "MTU.\n\n"
+            "• Congestion regime: \"Congested\" if at least one CNEC has "
+            "a positive shadow price this MTU (something is actually "
+            "binding), otherwise \"Uncongested\"."
+        )
+
     def _update_briefing_placeholder(self):
         for var in self._brfg_kpis.values():
             var.set("—")
@@ -2076,7 +2126,8 @@ class App:
             "Run an analysis in the Analysis sub-tab (date/time/corridor, "
             "\"Run Analysis\") first -- this briefing summarizes that same "
             "JAO-derived result set. Then come back here and click "
-            "\"Refresh\".")
+            "\"Refresh\".\n\n\n")
+        self._brfg_text.insert('end', self._briefing_methodology_text())
         self._brfg_text.config(state='disabled')
 
     def _refresh_briefing(self):
@@ -2157,6 +2208,9 @@ class App:
         if shown == 0:
             lines.append("  (none -- the top CNEC above is the only row with a "
                          "complete figure this MTU)")
+        lines.append("")
+        lines.append("")
+        lines.append(self._briefing_methodology_text())
 
         self._brfg_text.config(state='normal')
         self._brfg_text.delete('1.0', 'end')
@@ -2192,13 +2246,18 @@ class App:
                 # Paragraph parses its text as a small XML-like markup, so
                 # escape &/</> first (a CNEC name/zone code is never
                 # expected to contain these, but nothing stops one from
-                # someday including one). Separately, swap "⚠" for plain
-                # "[!]" -- confirmed via a rendered test PDF that reportlab's
-                # base Helvetica font has no glyph for U+26A0 and silently
-                # draws a black tofu box instead of erroring, so this isn't
-                # optional cosmetic polish, it's a genuinely unreadable
-                # warning marker otherwise.
-                safe = _saxutils.escape(line).replace("⚠", "[!]")
+                # someday including one). Separately, swap out the two
+                # characters this briefing uses that reportlab's base
+                # Helvetica has no glyph for -- confirmed with a small
+                # per-character test PDF: "⚠" (U+26A0) draws a black tofu
+                # box, and "Δ" (U+0394) draws nothing at all (zero-width
+                # gap, easy to miss and read as a typo rather than a
+                # missing glyph). Everything else this file uses in the
+                # briefing (€, −, →, •, ≈) rendered correctly in that same
+                # test and is left as-is.
+                safe = (_saxutils.escape(line)
+                        .replace("⚠", "[!]")
+                        .replace("Δ", "Delta "))
                 story.append(Paragraph(safe if safe.strip() else "&nbsp;", styles['Normal']))
                 story.append(Spacer(1, 4))
             doc.build(story)
