@@ -22,7 +22,8 @@ try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Circle, FancyBboxPatch
+    from matplotlib.patches import Circle, FancyBboxPatch, PathPatch
+    from matplotlib.path import Path as MplPath
     MATPLOTLIB_OK = True
     MATPLOTLIB_IMPORT_ERROR = None
 except ImportError as _mpl_exc:
@@ -198,6 +199,28 @@ FONT_MONO     = ('Consolas', 10)
 FONT_MONO_SM  = ('Consolas', 9)
 
 CHART_PALETTE = [C_PRIMARY, C_RED, C_GREEN, C_PURPLE, C_AMBER, '#8B8B93', '#52525B']
+
+# Dark theme for the Whole tab's real-geography choropleth ONLY (styled
+# after VoltPath's own dashboard -- see _draw_tab8_whole_map's own
+# comment) -- every other tab/chart in this app stays on the light theme
+# above; this is a deliberately separate palette, not a reskin of C_BG
+# etc., so it can't accidentally bleed into any other chart.
+C_GEO_BG       = '#0B0C10'   # page/figure background
+C_GEO_UNCOVERED = '#1C1F26'  # a zone this app doesn't track -- background
+                              # context only, never priced ("Regions not
+                              # covered" in VoltPath's own legend)
+C_GEO_NODATA   = '#30343D'   # a TRACKED zone with no price THIS slot --
+                              # lighter than C_GEO_UNCOVERED so it reads as
+                              # "normally covered, just missing right now"
+                              # rather than "not covered at all"
+C_GEO_BORDER   = '#3A3E48'   # zone outline stroke
+C_GEO_TEXT     = '#F2F2F2'
+C_GEO_MUTED    = '#9AA0AC'
+C_GEO_PANEL    = '#15171C'   # legend panel fill
+C_GEO_FLOW     = '#D8DADF'   # "normal" flow arrow (VoltPath's own map
+                              # uses a near-white/gray for this, not this
+                              # app's usual green/primary accent)
+C_GEO_COUNTER  = '#E2432F'   # counter-intuitive flow arrow
 
 # ----------------------------------------------------------------------
 #  MODULE-LEVEL HELPERS
@@ -403,6 +426,84 @@ def _draw_group_label(ax, text, x, y):
     ax.text(x, y, text, fontsize=7, fontweight='bold', color=C_MUTED,
             alpha=0.55, ha='left', va='top', zorder=1,
             family='sans-serif')
+
+# ----------------------------------------------------------------------
+#  REAL-GEOGRAPHY ZONE SHAPES — Whole tab's "flows & prices" choropleth
+# ----------------------------------------------------------------------
+# bidding_zones_europe.geojson carries real bidding-zone boundary shapes
+# for every Nordic/Baltic/Core zone this app tracks, plus a ring of
+# neighbouring countries drawn only as background context (never priced,
+# never labelled). Extracted from electricitymaps-contrib's own
+# world.geojson (https://github.com/electricitymaps/electricitymaps-contrib,
+# geo/world.geojson) -- the only source found with real NO1-5/SE1-4/DK1-2
+# SUB-national splits rather than just country outlines (CORE_ZONES/
+# BALTIC_ZONES above use a schematic, non-geographic layout precisely
+# because no such position data existed in this repo before now).
+# electricitymaps-contrib is AGPLv3-licensed; this extract (geometry +
+# zone codes only, simplified and re-keyed to this app's own zone
+# naming) is used here under those terms -- if this tool is ever
+# distributed or run as a public-facing network service, AGPLv3's
+# source-disclosure obligation applies to it.
+BIDDING_ZONE_GEOJSON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "bidding_zones_europe.geojson")
+
+_bidding_zone_geo_cache = None
+
+
+def _load_bidding_zone_geo():
+    """Lazily loads + caches bidding_zones_europe.geojson. Returns None
+    (never raises) if the file is missing next to this script, so the
+    caller can show an on-chart message instead of crashing the GUI --
+    the same "a missing optional asset degrades visibly, not silently"
+    posture this file already uses for a missing map.png."""
+    global _bidding_zone_geo_cache
+    if _bidding_zone_geo_cache is not None:
+        return _bidding_zone_geo_cache
+    if not os.path.exists(BIDDING_ZONE_GEOJSON_PATH):
+        return None
+    with open(BIDDING_ZONE_GEOJSON_PATH, encoding='utf-8') as f:
+        _bidding_zone_geo_cache = json.load(f)
+    return _bidding_zone_geo_cache
+
+
+def _geojson_geom_to_path(geom):
+    """Converts one GeoJSON Polygon/MultiPolygon geometry into a SINGLE
+    compound matplotlib Path -- every ring (exterior and any holes, across
+    every part of a MultiPolygon) as its own MOVETO..LINETO..CLOSEPOLY
+    subpath within one Path/PathPatch, so a zone with an interior hole or
+    several disjoint land masses (offshore islands) still renders as one
+    patch with correctly-punched holes under matplotlib's default
+    nonzero-winding fill rule. That relies on this source data already
+    following GeoJSON's own right-hand-rule ring winding (exterior
+    counter-clockwise, holes clockwise) -- true of electricitymaps-
+    contrib's own export, not re-verified here per zone."""
+    polys = geom['coordinates'] if geom['type'] == 'MultiPolygon' else [geom['coordinates']]
+    verts, codes = [], []
+    for poly in polys:
+        for ring in poly:
+            for i, (x, y) in enumerate(ring):
+                verts.append((x, y))
+                codes.append(MplPath.MOVETO if i == 0 else MplPath.LINETO)
+            codes[-1] = MplPath.CLOSEPOLY
+    return MplPath(verts, codes)
+
+
+def _price_geo_cmap():
+    """Blue (low) -> cyan -> yellow -> orange -> red (high) sequential
+    colormap for the Whole tab's real-geography price choropleth --
+    approximates VoltPath's own dashboard colour scale (dark blue/violet
+    at the low end through red at the high end). A visual reference match
+    from a screenshot, not a claim of pixel-identical hex values. The
+    "#f5d76e" yellow stop is a deliberate bridge, not decoration: cyan and
+    orange are near-complementary, so a straight cyan->orange
+    interpolation (an earlier version of this colormap) desaturates
+    toward a muddy gray-olive in the middle of the scale -- visibly wrong
+    on, e.g., DK1/DK2 at a mid-range price sitting right in that band.
+    Routing through yellow keeps every step of the gradient looking like
+    a step along blue->warm rather than through gray."""
+    return mpl.colors.LinearSegmentedColormap.from_list(
+        "voltpath_price",
+        ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -3673,13 +3774,18 @@ class App:
         self._t8w_status.pack(side=tk.LEFT, padx=(10, 0))
 
         ttk.Label(main, style='Muted.TLabel', wraplength=900, justify=tk.LEFT,
-                  text=("Nordic-internal and Nordic↔Core/Baltic flows are real (the "
-                        "latter sourced from the Nordic zones' OWN flow reports -- the "
-                        "only place this API reports them). Core-internal and "
-                        "Baltic-internal borders are reference lines only, no flow "
-                        "data published for those. Schematic layout -- Nordic keeps "
-                        "its real map positions, Core/Baltic are arranged around it, "
-                        "not geographically placed.")
+                  text=("Real-geography choropleth (zone shapes from a local "
+                        "electricitymaps-contrib extract, AGPLv3 -- see "
+                        "BIDDING_ZONE_GEOJSON_PATH's own comment), styled after "
+                        "VoltPath's own flows-and-prices dashboard view. Nordic-internal "
+                        "and Nordic↔Core/Baltic flow arrows are real (the latter sourced "
+                        "from the Nordic zones' OWN flow reports -- the only place this "
+                        "API publishes them); Core-internal and Baltic-internal borders "
+                        "show no arrow, just the real shared border, since neither side's "
+                        "own report publishes that flow. \"Data not available\" (lighter "
+                        "gray) is a zone this app tracks but with no price this slot; "
+                        "\"Regions not covered\" (darker gray) is background context only, "
+                        "never priced.")
                   ).pack(fill=tk.X, pady=(0, 6))
 
         self.toolbar_f8w = ttk.Frame(main, style='Card.TFrame')
@@ -3795,11 +3901,15 @@ class App:
                 continue
             cross_flows[(area, other)] = cross_flows.get((area, other), 0.0) + mw
 
-        missing_core = [z for z in missing if z in CORE_ZONES]
+        # `missing` here already covers both Core AND Baltic (the single
+        # combined request above queried core_baltic_zones together) --
+        # kept as one combined list now (was narrowed to Core-only before)
+        # so the real-geography map can distinguish "not on this account's
+        # subscription" for a Baltic zone too, not just a Core one.
         self.root.after(0, self._tab8_whole_fetch_done, all_prices, net_flows, cross_flows,
-                        missing_core, date_str, mtu_label, None)
+                        missing, date_str, mtu_label, None)
 
-    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, missing_core,
+    def _tab8_whole_fetch_done(self, prices, net_flows, cross_flows, missing_cb,
                                date_str, mtu_label, error):
         self._t8w_btn.config(state=tk.NORMAL, text="Fetch & Plot")
         if error:
@@ -3807,164 +3917,178 @@ class App:
             messagebox.showerror("Whole Map", error)
             return
         self._draw_tab8_whole_map(prices or {}, net_flows or {}, cross_flows or {},
-                                  missing_core or [], f"{date_str} {mtu_label}")
+                                  missing_cb or [], f"{date_str} {mtu_label}")
         self.canvas8w.draw()
         self._add_toolbar(self.canvas8w, self.toolbar_f8w)
-        n_na = len(missing_core or [])
+        n_na = len(missing_cb or [])
         self._t8w_status.config(
-            text=f"Done. {n_na} Core zone(s) unavailable (no API access)." if n_na else "Done.",
+            text=f"Done. {n_na} Core/Baltic zone(s) unavailable (no API access)." if n_na else "Done.",
             foreground=C_MUTED)
 
-    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, missing_core, slot_label):
+    def _draw_tab8_whole_map(self, prices, net_flows, cross_flows, missing_cb, slot_label):
+        """Real-geography choropleth, styled after VoltPath's own Nordic+
+        Core+Baltic "Flows & prices" dashboard view (dark theme, zones
+        filled by their own real shape and shaded by price, thin flow
+        arrows along real borders) -- replaces this tab's earlier
+        schematic circle layout. Zone shapes come from a local extract of
+        electricitymaps-contrib's own bidding-zone GeoJSON -- see
+        BIDDING_ZONE_GEOJSON_PATH's own comment for the source/license
+        note, and CORE_ZONES'/BALTIC_ZONES' own comment for why a
+        schematic layout existed here in the first place (no such
+        position data used to be available in this repo)."""
+        import matplotlib.patheffects as patheffects
+
         self.fig8w.clear()
         ax = self.fig8w.add_subplot(111)
-        ax.set_xlim(0, 1); ax.set_ylim(1, 0)
-        ax.set_facecolor('#F3F2EE')
+        self.fig8w.patch.set_facecolor(C_GEO_BG)
+        ax.set_facecolor(C_GEO_BG)
 
-        # Nordic keeps its real (hand-placed) relative layout, rescaled
-        # into the upper band of this shared canvas; Baltic gets a small
-        # cluster to the upper-right (geographically roughly correct
-        # relative to Nordic); Core is a circle in the lower band. None
-        # of this is pixel-accurate geography (see CORE_ZONES' own
-        # comment on why), just a readable, consistently-grouped layout.
-        # A zone is included only if it has a REAL price this slot -- no
-        # API access, or accessible but not published yet, both result in
-        # the zone (and any reference line/flow arrow touching it) being
-        # left off the chart entirely, not shown as a gray or "NaN" box.
-        # Applies uniformly across all three groups so the chart doesn't
-        # mix "missing zones excluded" for Core with "missing zones shown
-        # blank" for Nordic/Baltic.
-        visible_nordic = [z for z in ZONE_POS_NORM if prices.get(z) is not None]
-        visible_baltic = [z for z in BALTIC_ZONES if prices.get(z) is not None]
-        visible_core = [z for z in CORE_ZONES
-                        if z not in missing_core and prices.get(z) is not None]
-        if not (visible_nordic or visible_baltic or visible_core):
-            ax.text(0.5, 0.5, "No zone has usable price data for this slot.",
-                    ha='center', va='center', fontsize=10, color=C_MUTED,
-                    transform=ax.transAxes, wrap=True)
+        geo = _load_bidding_zone_geo()
+        if geo is None:
+            ax.text(0.5, 0.5, "Zone boundary data (bidding_zones_europe.geojson) "
+                    "not found next to this script.", ha='center', va='center',
+                    fontsize=10, color=C_GEO_MUTED, transform=ax.transAxes, wrap=True)
             ax.axis('off')
-            ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET", fontsize=9,
-                         fontweight='bold', color=C_ACCENT, pad=8, loc='left')
-            self.fig8w.tight_layout(pad=1.5)
+            self.fig8w.tight_layout(pad=1.0)
             return
 
-        # Nordic's own band is widened vs an earlier version of this chart
-        # (was 0.62x0.42 of the canvas) -- at the old scale its own
-        # closely-spaced zones (NO5/NO1/NO2 in particular, see
-        # ZONE_POS_NORM) crowded into overlapping labels; Core/Baltic are
-        # sized to leave a clear vertical gap below Nordic's own band
-        # rather than touching it.
-        pos = {}
-        for z in visible_nordic:
-            nx, ny = ZONE_POS_NORM[z]
-            pos[z] = (0.05 + nx * 0.66, 0.045 + ny * 0.50)
-        pos.update(_schematic_circle_positions(visible_baltic, cx=0.87, cy=0.20,
-                                               rx=0.09, ry=0.11, start_angle=0))
-        # Hub-and-spoke for the same reason as the standalone Core tab --
-        # see _schematic_hub_positions' own comment.
-        pos.update(_schematic_hub_positions(visible_core, CORE_CONNECTIONS,
-                                            cx=0.5, cy=0.80, rx=0.40, ry=0.15))
-
-        # ── Reference topology (no flow data) ───────────────────────────
-        # Light and low-zorder so it recedes behind the zone boxes and
-        # flow arrows rather than competing with them.
-        for A, B in CORE_CONNECTIONS + BALTIC_CONNECTIONS:
-            if A not in pos or B not in pos:
-                continue
-            xA, yA = pos[A]; xB, yB = pos[B]
-            ax.plot([xA, xB], [yA, yB], color='#D5D3C9', linewidth=0.8,
-                    linestyle='-', zorder=1, alpha=0.75, solid_capstyle='round')
-
-        # ── Faint group captions -- purely a readability aid ────────────
-        if visible_nordic:
-            _draw_group_label(ax, "NORDIC", 0.01, 0.015)
-        if visible_baltic:
-            _draw_group_label(ax, "BALTIC", 0.78, 0.015)
-        if visible_core:
-            _draw_group_label(ax, "CORE CCR", 0.01, 0.635)
-
-        valid_prices = [prices[z] for z in (visible_nordic + visible_baltic + visible_core)]
-        p_min = min(valid_prices)
-        p_max = max(valid_prices)
+        tracked_zones = set(NORDIC_ZONES) | set(BALTIC_ZONES) | set(CORE_ZONES)
+        cmap = _price_geo_cmap()
+        valid_prices = [v for z, v in prices.items()
+                        if z in tracked_zones and z not in missing_cb and v is not None]
+        p_min = min(valid_prices) if valid_prices else 0.0
+        p_max = max(valid_prices) if valid_prices else 100.0
         p_span = max(p_max - p_min, 1.0)
-        cmap = mpl.colormaps['RdYlGn_r']
 
-        def _zone_box(zone):
-            x, y = pos[zone]
-            price = prices[zone]
-            fc = cmap((price - p_min) / p_span)
-            ax.text(x, y, f"{zone}\n{price:.1f}", ha='center', va='center',
-                    fontsize=6.1, fontweight='bold', color='white', zorder=5,
-                    bbox=dict(boxstyle='round,pad=0.3,rounding_size=0.4', facecolor=fc,
-                             edgecolor='white', linewidth=1.1, alpha=0.95))
+        label_points = {}
+        x0 = y0 = x1 = y1 = None
+        for feat in geo['features']:
+            props = feat['properties']
+            zone = props['zone']
+            tracked = props['tracked']
+            path = _geojson_geom_to_path(feat['geometry'])
+            ext = path.get_extents()
+            x0 = ext.x0 if x0 is None else min(x0, ext.x0)
+            y0 = ext.y0 if y0 is None else min(y0, ext.y0)
+            x1 = ext.x1 if x1 is None else max(x1, ext.x1)
+            y1 = ext.y1 if y1 is None else max(y1, ext.y1)
 
-        for zone in visible_nordic:
-            _zone_box(zone)
-        for zone in visible_baltic:
-            _zone_box(zone)
-        for zone in visible_core:
-            _zone_box(zone)
+            if not tracked:
+                fc = C_GEO_UNCOVERED
+            elif zone in missing_cb or prices.get(zone) is None:
+                fc = C_GEO_NODATA
+            else:
+                fc = cmap((prices[zone] - p_min) / p_span)
+            patch = PathPatch(path, facecolor=fc, edgecolor=C_GEO_BORDER,
+                              linewidth=0.5, zorder=2)
+            ax.add_patch(patch)
+            if tracked:
+                label_points[zone] = tuple(props['label_point'])
+
+        margin_x = (x1 - x0) * 0.02
+        margin_y = (y1 - y0) * 0.02
+        ax.set_xlim(x0 - margin_x, x1 + margin_x)
+        ax.set_ylim(y0 - margin_y, y1 + margin_y)
+        mean_lat = (y0 + y1) / 2
+        # Degrees of longitude cover less real ground than degrees of
+        # latitude the further from the equator -- without this, the map
+        # looks visibly stretched east-west at Nordic latitudes.
+        ax.set_aspect(1.0 / max(math.cos(math.radians(mean_lat)), 0.1))
+
+        # ── Zone labels: plain text over the shape itself, no box -- a
+        # thin dark stroke keeps it legible over both a light (orange/
+        # yellow, high price) and a dark (blue, low price) fill. ────────
+        label_stroke = [patheffects.withStroke(linewidth=1.8, foreground='#00000099')]
+        for zone, (lx, ly) in label_points.items():
+            price = prices.get(zone)
+            if zone in missing_cb or price is None:
+                label = zone
+            else:
+                label = f"{zone}\n{price:.1f}"
+            ax.text(lx, ly, label, ha='center', va='center', fontsize=5.6,
+                    fontweight='bold', color=C_GEO_TEXT, zorder=5,
+                    path_effects=label_stroke)
 
         # ── Flow arrows: Nordic-internal + cross-region (both real) ─────
         all_flow_mags = [abs(v) for v in net_flows.values()] + [abs(v) for v in cross_flows.values()]
         max_flow = max(all_flow_mags, default=1) or 1
-        pad = 0.018
+        pad = (x1 - x0) * 0.012
 
         def _draw_flow_arrow(A, B, mw):
-            if A not in pos or B not in pos:
-                return
+            if A not in label_points or B not in label_points:
+                return None
             src, dst, mw2 = (A, B, mw) if mw >= 0 else (B, A, -mw)
-            x1, y1 = pos[src]; x2, y2 = pos[dst]
+            x1a, y1a = label_points[src]; x2a, y2a = label_points[dst]
             p_src, p_dst = prices.get(src), prices.get(dst)
             counter = (p_src is not None and p_dst is not None and p_src > p_dst)
-            color = C_RED if counter else C_PRIMARY
-            dx, dy = x2 - x1, y2 - y1
+            color = C_GEO_COUNTER if counter else C_GEO_FLOW
+            dx, dy = x2a - x1a, y2a - y1a
             dist = (dx ** 2 + dy ** 2) ** 0.5 or 1
-            xs, ys = x1 + dx / dist * pad, y1 + dy / dist * pad
-            xe, ye = x2 - dx / dist * pad, y2 - dy / dist * pad
-            lw = 0.7 + 2.6 * (mw2 / max_flow)
+            xs, ys = x1a + dx / dist * pad, y1a + dy / dist * pad
+            xe, ye = x2a - dx / dist * pad, y2a - dy / dist * pad
+            lw = 0.5 + 1.6 * (mw2 / max_flow)
             ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
-                        arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=8))
+                        arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=6))
             return counter
 
-        has_counter = False
         for (A, B), mw in net_flows.items():
-            if _draw_flow_arrow(A, B, mw):
-                has_counter = True
+            _draw_flow_arrow(A, B, mw)
         for (A, B), mw in cross_flows.items():
-            if _draw_flow_arrow(A, B, mw):
-                has_counter = True
-
-        legend_handles = [
-            Line2D([0], [0], color=C_PRIMARY, lw=2, label="Flow (cheap → expensive)"),
-        ]
-        if has_counter:
-            legend_handles.append(
-                Line2D([0], [0], color=C_RED, lw=2, label="Counter-intuitive (expensive → cheap)"))
-        legend_handles.append(
-            Line2D([0], [0], color='#B8B6AE', lw=1.5,
-                   label="Core/Baltic-internal border (no flow data)"))
-        # Centered below the chart rather than inside it -- an in-axes
-        # corner legend risked sitting on top of a zone box once the Core
-        # cluster was widened to fill more of the lower band.
-        self.fig8w.legend(handles=legend_handles, loc='lower center', ncol=3,
-                          fontsize=6.3, framealpha=0.92, edgecolor=C_BORDER,
-                          facecolor=C_PANEL, labelcolor=C_TEXT,
-                          bbox_to_anchor=(0.46, -0.01))
-
-        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=p_min, vmax=p_max))
-        sm.set_array([])
-        cbar = self.fig8w.colorbar(sm, ax=ax, fraction=0.025, pad=0.02, aspect=30)
-        cbar.set_label("EUR/MWh", fontsize=8, color=C_MUTED)
-        cbar.ax.tick_params(labelsize=7, colors=C_MUTED)
-        for lbl in cbar.ax.yaxis.get_ticklabels():
-            lbl.set_color(C_MUTED)
+            _draw_flow_arrow(A, B, mw)
 
         ax.axis('off')
+
+        # ── Legend panel, bottom-left -- price gradient + flow/coverage
+        # swatches, styled after VoltPath's own legend box. ─────────────
+        lx0, ly0, lw_, lh_ = 0.015, 0.025, 0.30, 0.205
+        panel = FancyBboxPatch((lx0, ly0), lw_, lh_,
+                               boxstyle="round,pad=0.006,rounding_size=0.012",
+                               transform=ax.transAxes, facecolor=C_GEO_PANEL,
+                               edgecolor=C_GEO_BORDER, linewidth=0.8, zorder=10)
+        ax.add_patch(panel)
+        pad_in = 0.014
+        ax.text(lx0 + pad_in, ly0 + lh_ - 0.024, "Price (EUR/MWh)",
+                transform=ax.transAxes, fontsize=6.5, fontweight='bold',
+                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
+        grad_ax = ax.inset_axes(
+            [lx0 + pad_in, ly0 + lh_ - 0.058, lw_ - 2 * pad_in, 0.018],
+            transform=ax.transAxes)
+        grad_ax.imshow([[i / 255 for i in range(256)]], aspect='auto', cmap=cmap)
+        grad_ax.set_xticks([]); grad_ax.set_yticks([])
+        for spine in grad_ax.spines.values():
+            spine.set_visible(False)
+        ax.text(lx0 + pad_in, ly0 + lh_ - 0.068, f"{p_min:.0f}",
+                transform=ax.transAxes, fontsize=5.8, color=C_GEO_MUTED,
+                ha='left', va='top', zorder=11)
+        ax.text(lx0 + lw_ - pad_in, ly0 + lh_ - 0.068, f"{p_max:.0f}",
+                transform=ax.transAxes, fontsize=5.8, color=C_GEO_MUTED,
+                ha='right', va='top', zorder=11)
+
+        swatch_rows = [
+            ("line", C_GEO_COUNTER, "Counter-intuitive flow"),
+            ("line", C_GEO_FLOW, "Other flow"),
+            ("box", C_GEO_UNCOVERED, "Regions not covered"),
+            ("box", C_GEO_NODATA, "Data not available"),
+        ]
+        row_y = ly0 + lh_ - 0.092
+        for kind, color, label in swatch_rows:
+            sx = lx0 + pad_in
+            if kind == "line":
+                ax.plot([sx, sx + 0.025], [row_y, row_y], color=color, lw=1.6,
+                        transform=ax.transAxes, zorder=11, solid_capstyle='round')
+            else:
+                ax.add_patch(FancyBboxPatch(
+                    (sx, row_y - 0.006), 0.022, 0.012,
+                    boxstyle="round,pad=0.001,rounding_size=0.002",
+                    transform=ax.transAxes, facecolor=color, edgecolor='none', zorder=11))
+            ax.text(sx + 0.034, row_y, label, transform=ax.transAxes, fontsize=5.8,
+                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+            row_y -= 0.027
+
         # loc='left' -- see _draw_tab8_core_map's identical comment on why.
-        ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET  |  schematic layout",
-                     fontsize=9, fontweight='bold', color=C_ACCENT, pad=8, loc='left')
-        self.fig8w.tight_layout(pad=1.5)
+        ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET",
+                     fontsize=9, fontweight='bold', color=C_GEO_TEXT, pad=8, loc='left')
+        self.fig8w.tight_layout(pad=1.0)
 
     # ------------------------------------------------------------------
     #  TAB 9 – Maintenance Analysis  (FB_CODE integration)
