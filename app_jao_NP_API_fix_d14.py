@@ -215,22 +215,21 @@ C_GEO_BG       = '#EAF2F8'   # page/figure background -- a pale "sea" blue,
                               # visually flat -- no depth cue separating
                               # "no data here" land from "there's no land
                               # here at all")
-C_GEO_UNCOVERED = '#E4E4E7'  # a zone this app doesn't track -- background
-                              # context only, never priced ("Regions not
-                              # covered" in VoltPath's own legend). Kept
-                              # neutral gray (not blue-tinted) specifically
-                              # so it reads as distinct "land" against the
-                              # new blue C_GEO_BG "sea"
-C_GEO_NODATA   = '#AEAEB7'   # a TRACKED zone with no price THIS slot --
-                              # a visibly bigger step down from
-                              # C_GEO_UNCOVERED than an earlier version of
-                              # this token (#D2D2D7) -- the two read as
-                              # near-identical light grays side by side in
-                              # the legend at that gap, confirmed by
-                              # rendering, not just reasoned about. Still
-                              # the "lighter background, missing right now"
-                              # vs "not covered at all" distinction from
-                              # before, just with more contrast between them.
+C_GEO_NODATA   = '#C2C2C9'   # no price to show here -- either a zone this
+                              # app doesn't track at all, or one it does
+                              # but with no price THIS slot. Previously
+                              # two different grays (C_GEO_UNCOVERED vs
+                              # C_GEO_NODATA, "Regions not covered" vs
+                              # "Data not available") -- merged into one
+                              # per explicit request: with ENTSO-E now
+                              # covering most of the map (see
+                              # WHOLE_EXTRA_ZONES), the "untracked"
+                              # category shrank to a handful of edge
+                              # cases (GB, Iceland, Bosnia, ...) and the
+                              # distinction stopped earning its own color
+                              # and legend row. Kept neutral gray (not
+                              # blue-tinted) so it reads as distinct
+                              # "land" against the blue C_GEO_BG "sea".
 C_GEO_BORDER   = '#FFFFFF'   # zone outline stroke -- white "cut-paper"
                               # gaps between adjacent zones read cleaner
                               # than a gray hairline, especially now that
@@ -674,14 +673,46 @@ ENTSOE_AREA_CODE = {
     "HR": "HR", "HU": "HU", "NL": "NL", "PL": "PL", "RO": "RO",
     "SI": "SI", "SK": "SK",
     "ES": "ES",
+    # Further south/southeast European zones -- verified LIVE
+    # (2026-02-03) to have real ENTSO-E day-ahead price data, unlike a
+    # few other candidates tried the same day and genuinely excluded (see
+    # WHOLE_EXTRA_ZONES' own comment): Ireland is "IE_SEM" (the Single
+    # Electricity Market, not "IE"); Italy has SIX separate price zones
+    # here (north/central-north/central-south/south/Sardinia/Sicily),
+    # not one aggregate "IT".
+    "IE": "IE_SEM", "PT": "PT", "CH": "CH", "RS": "RS", "BG": "BG", "GR": "GR",
+    "AL": "AL", "ME": "ME", "MK": "MK",
+    "IT-NO": "IT_NORD", "IT-CNO": "IT_CNOR", "IT-CSO": "IT_CSUD", "IT-SO": "IT_SUD",
+    "IT-SAR": "IT_SARD", "IT-SIC": "IT_SICI",
 }
 
 # Zones the Whole tab's real-geography map tracks beyond Nordic/Core CCR/
-# Baltic -- currently just Spain. NOT added to CORE_ZONES itself, since
-# Spain isn't part of Core CCR and the Core tab's own schematic layout/
-# hub-and-spoke topology (CORE_CONNECTIONS) is specifically a Core CCR
-# concept that this zone shouldn't leak into.
-WHOLE_EXTRA_ZONES = ["ES"]
+# Baltic. NOT added to CORE_ZONES itself -- none of these are part of
+# Core CCR, and the Core tab's own schematic layout/hub-and-spoke
+# topology (CORE_CONNECTIONS) is specifically a Core CCR concept that
+# they shouldn't leak into.
+#
+# Every entry here was verified LIVE (2026-02-03) to have real ENTSO-E
+# day-ahead price data. Several more obvious candidates were tried the
+# same day and genuinely don't: GB (post-Brexit, no longer in EU day-
+# ahead coupling -- entsoe-py's own query raised NoMatchingDataError, not
+# a fetch bug), Bosnia (BA) and Moldova (MD) likewise NoMatchingDataError,
+# Iceland (IS, genuinely isolated -- no subsea interconnector to
+# continental Europe at all), Ukraine (UA -- entsoe-py's own internal
+# Area->timezone table uses the key "Europe/Kiev", which errors with
+# ZoneInfoNotFoundError against this sandbox's tzdata; may well work in
+# an environment with a newer/different tzdata, not reflective of
+# ENTSO-E itself lacking the data, but not safe to assume here). Belarus
+# (BY) was never tried -- not an ENTSO-E market member. Luxembourg (LU)
+# and Liechtenstein (LI) have no separate price zone of their own (LU is
+# merged into Germany's own "DE_LU", LI has no day-ahead market, informally
+# part of the Swiss/Austrian grid). All eight stay in the GeoJSON as
+# background-context-only zones (see bidding_zones_europe.geojson's own
+# "tracked": false flag for each).
+WHOLE_EXTRA_ZONES = [
+    "ES", "IE", "PT", "CH", "RS", "BG", "GR", "AL", "ME", "MK",
+    "IT-NO", "IT-CNO", "IT-CSO", "IT-SO", "IT-SAR", "IT-SIC",
+]
 
 # Every zone the Whole tab's own price/flow fetch covers, in one place --
 # used to build the ENTSO-E fetch target list and to compute `missing`
@@ -4156,15 +4187,18 @@ class App:
                   text=("Real-geography choropleth (zone shapes from a local "
                         "electricitymaps-contrib extract, AGPLv3 -- see "
                         "BIDDING_ZONE_GEOJSON_PATH's own comment). ENTSO-E is the PRIMARY "
-                        "price/flow source for every zone shown here (Nordic, Core CCR, "
-                        "Baltic, and Spain, which Nord Pool never reaches), fetched in "
-                        "parallel per zone/border; Nord Pool's own combined-request fetch "
-                        "runs too and fills in anywhere ENTSO-E itself didn't resolve this "
-                        "slot. Core-internal and Baltic-internal borders with no known "
-                        "interconnector still show no arrow, just the real shared border. "
-                        "\"Data not available\" (darker gray) is a zone this app tracks but "
-                        "with no price from either source this slot; \"Regions not covered\" "
-                        "(lighter gray) is background context only, never priced.")
+                        "price/flow source for every zone shown here -- Nordic, Core CCR, "
+                        "Baltic, plus Spain/Ireland/Portugal/Italy (6 price zones)/"
+                        "Switzerland/the Western Balkans, none of which Nord Pool reaches "
+                        "(see WHOLE_EXTRA_ZONES' own comment for the few candidates tried "
+                        "and genuinely excluded: GB, Iceland, Bosnia, Moldova, Ukraine) -- "
+                        "fetched in parallel per zone/border, including Core-internal and "
+                        "Baltic-internal borders (AT-CZ, EE-LV, ...), which never had a flow "
+                        "source at all before ENTSO-E. Nord Pool's own combined-request fetch "
+                        "still runs too and fills in anywhere ENTSO-E itself didn't resolve "
+                        "this slot. Gray (\"No price data\") covers both a zone this app "
+                        "doesn't track at all and one it does but with no price this slot -- "
+                        "one color/legend row for both now, not two.")
                   ).pack(fill=tk.X, pady=(0, 6))
 
         self.toolbar_f8w = ttk.Frame(main, style='Card.TFrame')
@@ -4371,9 +4405,7 @@ class App:
         label_points = {}
         for zinfo in geo_paths["zones"]:
             zone, tracked, path = zinfo["zone"], zinfo["tracked"], zinfo["path"]
-            if not tracked:
-                fc = C_GEO_UNCOVERED
-            elif prices.get(zone) is None:
+            if not tracked or prices.get(zone) is None:
                 fc = C_GEO_NODATA
             else:
                 fc = cmap((prices[zone] - p_min) / p_span)
@@ -4433,6 +4465,14 @@ class App:
             xs, ys = x1a + dx / dist * pad, y1a + dy / dist * pad
             xe, ye = x2a - dx / dist * pad, y2a - dy / dist * pad
             lw = 0.5 + 1.6 * (mw2 / max_flow)
+            # A white halo arrow drawn first, slightly thicker and one
+            # zorder behind the real one -- keeps the (often dark-gray or
+            # red) arrow visible against turbo's full saturated range,
+            # the same "chip, not just contrast-hoping" reasoning as the
+            # zone-label bbox above, applied to arrows instead of text.
+            ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=3,
+                        arrowprops=dict(arrowstyle='->', color='#FFFFFF',
+                                        lw=lw + 1.6, mutation_scale=6, alpha=0.85))
             ax.annotate("", xy=(xe, ye), xytext=(xs, ys), zorder=4,
                         arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=6))
 
@@ -4445,15 +4485,18 @@ class App:
 
         ax.axis('off')
 
-        # ── Legend panel, bottom-RIGHT -- price gradient + flow/coverage
-        # swatches, styled after VoltPath's own legend box. Bottom-left
-        # (the original placement) sat directly on top of Spain once
-        # Spain became a tracked, labelled zone -- bottom-right instead
-        # falls over the Balkans/Black Sea area, which this app has never
-        # tracked (background context only), so the legend can't cover a
-        # real data zone regardless of which zones are present this slot.
-        lw_, lh_ = 0.30, 0.205
-        lx0, ly0 = 1 - 0.015 - lw_, 0.025
+        # ── Legend panel, mid-LEFT -- price gradient + flow/coverage
+        # swatches, styled after VoltPath's own legend box. Every CORNER
+        # has failed in turn as the tracked-zone set grew: bottom-left sat
+        # on Spain once Spain got its own label; bottom-right then covered
+        # Montenegro/N.Macedonia once the Western Balkans were added too.
+        # The strip of open Atlantic west of Ireland/Portugal -- below the
+        # stats panel (which already owns the sea above Iceland/Norway),
+        # above Portugal/Spain's own labels, and below Great Britain's
+        # (untracked, unlabelled but still drawn) landmass -- is the one
+        # remaining gap nothing else claims at any zoom this map uses.
+        lw_, lh_ = 0.30, 0.178
+        lx0, ly0 = 0.015, 0.26
         # Soft drop shadow -- a second, slightly offset panel in a muted
         # dark tone behind the real one, zorder just below it. C_GEO_BORDER
         # is white now (see its own comment, for the zone-outline look),
@@ -4490,8 +4533,7 @@ class App:
         swatch_rows = [
             ("line", C_GEO_COUNTER, "Counter-intuitive flow"),
             ("line", C_GEO_FLOW, "Other flow"),
-            ("box", C_GEO_UNCOVERED, "Regions not covered"),
-            ("box", C_GEO_NODATA, "Data not available"),
+            ("box", C_GEO_NODATA, "No price data"),
         ]
         row_y = ly0 + lh_ - 0.092
         for kind, color, label in swatch_rows:
@@ -4508,8 +4550,68 @@ class App:
                     color=C_GEO_MUTED, ha='left', va='center', zorder=11)
             row_y -= 0.027
 
+        # ── Stats panel, top-LEFT -- average price per region + average
+        # cross-border flow magnitude, computed from this slot's own
+        # data (not a running/historical average). Top-left falls over
+        # open sea above Iceland -- no zone shape sits there regardless
+        # of which zones are present this slot, the same reasoning that
+        # put the legend in the one empty corner on the other side. ────
+        def _avg(vals):
+            vals = [v for v in vals if v is not None]
+            return sum(vals) / len(vals) if vals else None
+
+        price_rows = [
+            ("Whole", _avg(prices.get(z) for z in WHOLE_ALL_ZONES)),
+            ("Nordic", _avg(prices.get(z) for z in NORDIC_ZONES)),
+            ("Core CCR", _avg(prices.get(z) for z in CORE_ZONES)),
+            ("Baltic", _avg(prices.get(z) for z in BALTIC_ZONES)),
+        ]
+        all_flow_vals = (list(net_flows.values()) + list(cross_flows.values())
+                        + list(internal_flows.values()))
+        flow_avg = _avg(abs(v) for v in all_flow_vals)
+
+        sw_ = 0.225
+        sh_ = 0.024 + 0.0235 * len(price_rows) + 0.018 + 0.0235 + 0.012
+        sx0, sy0 = 0.015, 1 - 0.015 - sh_
+        s_shadow = FancyBboxPatch((sx0 + 0.005, sy0 - 0.005), sw_, sh_,
+                                  boxstyle="round,pad=0.006,rounding_size=0.012",
+                                  transform=ax.transAxes, facecolor='#00000020',
+                                  edgecolor='none', zorder=9)
+        ax.add_patch(s_shadow)
+        s_panel = FancyBboxPatch((sx0, sy0), sw_, sh_,
+                                 boxstyle="round,pad=0.006,rounding_size=0.012",
+                                 transform=ax.transAxes, facecolor=C_GEO_PANEL,
+                                 edgecolor=C_GEO_MUTED, linewidth=0.7, zorder=10)
+        ax.add_patch(s_panel)
+        s_pad = 0.014
+        ax.text(sx0 + s_pad, sy0 + sh_ - 0.022, "Averages this slot",
+                transform=ax.transAxes, fontsize=6.5, fontweight='bold',
+                color=C_GEO_TEXT, ha='left', va='top', zorder=11)
+        srow_y = sy0 + sh_ - 0.046
+        for label, avg in price_rows:
+            val_str = f"{avg:.1f} EUR/MWh" if avg is not None else "n/a"
+            ax.text(sx0 + s_pad, srow_y, label, transform=ax.transAxes, fontsize=5.8,
+                    color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+            ax.text(sx0 + sw_ - s_pad, srow_y, val_str, transform=ax.transAxes,
+                    fontsize=5.8, color=C_GEO_TEXT, fontweight='bold',
+                    ha='right', va='center', zorder=11)
+            srow_y -= 0.0235
+        ax.plot([sx0 + s_pad, sx0 + sw_ - s_pad], [srow_y + 0.009, srow_y + 0.009],
+                color=C_GEO_MUTED, lw=0.5, alpha=0.5, transform=ax.transAxes, zorder=11)
+        srow_y -= 0.018
+        flow_str = f"{flow_avg:.0f} MW" if flow_avg is not None else "n/a"
+        ax.text(sx0 + s_pad, srow_y, "Avg cross-border flow", transform=ax.transAxes,
+                fontsize=5.8, color=C_GEO_MUTED, ha='left', va='center', zorder=11)
+        ax.text(sx0 + sw_ - s_pad, srow_y, flow_str, transform=ax.transAxes,
+                fontsize=5.8, color=C_GEO_TEXT, fontweight='bold',
+                ha='right', va='center', zorder=11)
+
         # loc='left' -- see _draw_tab8_core_map's identical comment on why.
-        ax.set_title(f"Nordic + Core + Baltic  —  {slot_label} CET",
+        # "European" rather than "Nordic + Core + Baltic" now that
+        # WHOLE_EXTRA_ZONES reaches well past those three (Iberia, Italy,
+        # the Western Balkans) -- the old title undersold what's actually
+        # on the map once ENTSO-E became the primary source.
+        ax.set_title(f"European Flows & Prices  —  {slot_label} CET",
                      fontsize=9, fontweight='bold', color=C_GEO_TEXT, pad=8, loc='left')
         self.fig8w.tight_layout(pad=1.0)
 
