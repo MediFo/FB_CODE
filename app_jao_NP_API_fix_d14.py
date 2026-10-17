@@ -1,5 +1,6 @@
 import bisect
 import csv
+import functools
 import json
 import math
 import os
@@ -498,7 +499,12 @@ def _load_bidding_zone_geo():
     (never raises) if the file is missing next to this script, so the
     caller can show an on-chart message instead of crashing the GUI --
     the same "a missing optional asset degrades visibly, not silently"
-    posture this file already uses for a missing map.png."""
+    posture this file already uses for a missing map.png. A manual cache
+    rather than @functools.lru_cache (unlike _price_geo_cmap below) on
+    purpose: a missing-file None result is deliberately NOT cached, so a
+    later click retries os.path.exists() and will pick the file up if
+    it's added while the app is still running -- lru_cache would instead
+    cache that first None forever."""
     global _bidding_zone_geo_cache
     if _bidding_zone_geo_cache is not None:
         return _bidding_zone_geo_cache
@@ -573,9 +579,7 @@ def _load_bidding_zone_paths():
     return _bidding_zone_paths_cache
 
 
-_price_geo_cmap_cache = None
-
-
+@functools.lru_cache(maxsize=1)
 def _price_geo_cmap():
     """Blue (low) -> cyan -> yellow -> orange -> red (high) sequential
     colormap for the Whole tab's real-geography price choropleth --
@@ -588,14 +592,15 @@ def _price_geo_cmap():
     toward a muddy gray-olive in the middle of the scale -- visibly wrong
     on, e.g., DK1/DK2 at a mid-range price sitting right in that band.
     Routing through yellow keeps every step of the gradient looking like
-    a step along blue->warm rather than through gray. Cached (the stop
-    list is fixed) rather than rebuilt on every redraw."""
-    global _price_geo_cmap_cache
-    if _price_geo_cmap_cache is None:
-        _price_geo_cmap_cache = mpl.colors.LinearSegmentedColormap.from_list(
-            "voltpath_price",
-            ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
-    return _price_geo_cmap_cache
+    a step along blue->warm rather than through gray. lru_cache(1) instead
+    of a hand-rolled global -- this is a zero-argument function with a
+    fixed stop list, no "retry if the input later changes" nuance to
+    preserve (unlike _load_bidding_zone_geo's own manual cache above,
+    kept manual specifically because it DOES retry if a missing file
+    later appears)."""
+    return mpl.colors.LinearSegmentedColormap.from_list(
+        "voltpath_price",
+        ["#241763", "#1f4e8c", "#3f93c9", "#f5d76e", "#f2a93c", "#e2432f"])
 
 # ----------------------------------------------------------------------
 #  JAO DATA FETCHING — PowerShell, one whole-day batch per request
@@ -3020,52 +3025,59 @@ class App:
             self._t8_status.config(text="Stopped.", foreground=C_MUTED)
             self._add_toolbar(self.canvas8, self.toolbar_f8)
 
-    def _fetch_tab8_one_day(self, date_str, hdrs, areas_params, _diag):
+    def _fetch_tab8_one_day(self, date_str, hdrs, areas_params, _diag, fetch_prices=True):
         """Fetch NordPool DA prices + scheduled physical flows for ONE
         calendar day, bucketed per bare MTU slot ("HH:MM" -> {...}, no date
         prefix -- the caller adds that). Returns (day_prices, day_flows_raw,
         price_error, flow_error). Factored out of what used to be the
         whole fetch thread so _fetch_tab8_period_thread can call it once
         per day in a [From, To] range without duplicating the Nord Pool
-        response parsing."""
+        response parsing. `fetch_prices=False` skips the price request+
+        parse entirely (day_prices/price_error stay {}/"") -- for a caller
+        that only wants this day's flows (e.g. the Core tab's own
+        external-flow fetch, which gets its prices from a separate Core-
+        zone-only request), there's no reason to pay for an extra HTTP
+        round-trip plus a full response parse whose result would just be
+        discarded."""
         day_prices  = {}
         price_error = ""
-        try:
-            price_params = [('date', date_str), ('currency', 'EUR'),
-                            ('market', 'DayAhead')] + areas_params
-            rp = requests.get(NP_PRICE_URL, headers=hdrs,
-                              params=price_params, timeout=20)
-            _diag(f"[PRICE {date_str}] status={rp.status_code}  url={rp.url}")
-            if rp.status_code != 200:
-                price_error = f"Price API HTTP {rp.status_code} ({date_str}): {rp.text[:200]}"
-                _diag(f"[PRICE {date_str}] ERROR body: {rp.text[:400]}")
-            else:
-                raw_json = rp.json()
-                if raw_json and isinstance(raw_json, list):
-                    _diag(f"[PRICE {date_str}] top-level keys: {list(raw_json[0].keys())}")
-                    if raw_json[0].get('prices'):
-                        _diag(f"[PRICE {date_str}] prices[0] keys: "
-                              f"{list(raw_json[0]['prices'][0].keys())}")
-                for area_data in raw_json:
-                    zone = area_data.get('deliveryArea')
-                    if zone not in NORDIC_ZONES:
-                        continue
-                    for p in area_data.get('prices', []):
-                        ts = p.get('deliveryStart', '')
-                        if not ts:
+        if fetch_prices:
+            try:
+                price_params = [('date', date_str), ('currency', 'EUR'),
+                                ('market', 'DayAhead')] + areas_params
+                rp = requests.get(NP_PRICE_URL, headers=hdrs,
+                                  params=price_params, timeout=20)
+                _diag(f"[PRICE {date_str}] status={rp.status_code}  url={rp.url}")
+                if rp.status_code != 200:
+                    price_error = f"Price API HTTP {rp.status_code} ({date_str}): {rp.text[:200]}"
+                    _diag(f"[PRICE {date_str}] ERROR body: {rp.text[:400]}")
+                else:
+                    raw_json = rp.json()
+                    if raw_json and isinstance(raw_json, list):
+                        _diag(f"[PRICE {date_str}] top-level keys: {list(raw_json[0].keys())}")
+                        if raw_json[0].get('prices'):
+                            _diag(f"[PRICE {date_str}] prices[0] keys: "
+                                  f"{list(raw_json[0]['prices'][0].keys())}")
+                    for area_data in raw_json:
+                        zone = area_data.get('deliveryArea')
+                        if zone not in NORDIC_ZONES:
                             continue
-                        try:
-                            cet_dt = _utc_to_cet(ts)
-                            if cet_dt.strftime('%Y-%m-%d') != date_str:
+                        for p in area_data.get('prices', []):
+                            ts = p.get('deliveryStart', '')
+                            if not ts:
                                 continue
-                            mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
-                            day_prices.setdefault(mtu_label, {})[zone] = p.get('price')
-                        except Exception as e:
-                            _diag(f"[PRICE {date_str}] ts-parse error zone={zone} ts={ts!r}: {e}")
-                _diag(f"[PRICE {date_str}] MTU slots with data: {len(day_prices)}")
-        except Exception as e:
-            price_error = f"Price API exception ({date_str}): {e}"
-            _diag(f"[PRICE {date_str}] EXCEPTION: {e}")
+                            try:
+                                cet_dt = _utc_to_cet(ts)
+                                if cet_dt.strftime('%Y-%m-%d') != date_str:
+                                    continue
+                                mtu_label = f"{cet_dt.hour:02d}:{cet_dt.minute:02d}"
+                                day_prices.setdefault(mtu_label, {})[zone] = p.get('price')
+                            except Exception as e:
+                                _diag(f"[PRICE {date_str}] ts-parse error zone={zone} ts={ts!r}: {e}")
+                    _diag(f"[PRICE {date_str}] MTU slots with data: {len(day_prices)}")
+            except Exception as e:
+                price_error = f"Price API exception ({date_str}): {e}"
+                _diag(f"[PRICE {date_str}] EXCEPTION: {e}")
 
         # Scheduled Physical Flows, per MTU: {"HH:MM": {(area,other): MW}}.
         # `other` is kept as whatever counterpart area code Nord Pool
@@ -3630,7 +3642,7 @@ class App:
         # missing one.
         nordic_areas_params = [('areas', z) for z in NORDIC_ZONES]
         _, nordic_flows_raw, _, flow_err = self._fetch_tab8_one_day(
-            date_str, hdrs, nordic_areas_params, _diag)
+            date_str, hdrs, nordic_areas_params, _diag, fetch_prices=False)
         if flow_err:
             _diag(f"[CORE] Nordic flow fetch (for external arrows) error: {flow_err}")
         raw_at_mtu = nordic_flows_raw.get(mtu_label, {})
@@ -4007,10 +4019,14 @@ class App:
             self.fig8w.tight_layout(pad=1.0)
             return
 
-        tracked_zones = set(NORDIC_ZONES) | set(BALTIC_ZONES) | set(CORE_ZONES)
+        # No `zone in tracked_zones` filter needed here -- `prices` (built
+        # by _fetch_tab8_whole_thread from _fetch_tab8_one_day's own
+        # NORDIC_ZONES filter plus _parse_np_prices_at_mtu's own
+        # CORE_ZONES/BALTIC_ZONES filter) can never contain an untracked
+        # zone's key in the first place.
         cmap = _price_geo_cmap()
         valid_prices = [v for z, v in prices.items()
-                        if z in tracked_zones and z not in missing_cb and v is not None]
+                        if z not in missing_cb and v is not None]
         p_min = min(valid_prices) if valid_prices else 0.0
         p_max = max(valid_prices) if valid_prices else 100.0
         p_span = max(p_max - p_min, 1.0)
